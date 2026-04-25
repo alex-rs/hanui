@@ -1,0 +1,112 @@
+// card_base.slint — shared visual chrome for every Phase 1 tile.
+//
+// Provides the rounded surface, border, focus ring, and press animation
+// that wrap the content of light_tile / sensor_tile / entity_tile (TASK-013).
+// All colors are pulled from theme.slint; no inline hex literals are
+// permitted in this file (CI hex-color gate, .github/workflows/ci.yml § Gate 1).
+//
+// Performance constraints (per docs/PHASES.md "Performance budgets" and
+// src/dashboard/profiles.rs::DEFAULT_PROFILE):
+//   * Press animation duration: 150 ms (never longer than the design budget).
+//   * Animation framerate cap:  DEFAULT_PROFILE.animation_framerate_cap (60 fps
+//     desktop). Slint's `animate` block does NOT take a framerate parameter;
+//     the cap is enforced at the renderer/timer level by the Rust bridge.
+//     The constant is exposed on the AnimationBudget global so the bridge
+//     (TASK-015) can wire DEFAULT_PROFILE.animation_framerate_cap into the
+//     timer interval at runtime — it must NOT be hardcoded in this .slint file.
+//   * Active animation count gate: AnimationBudget.active-count is checked
+//     against AnimationBudget.max-simultaneous. When the budget is full,
+//     the press animation duration collapses to 0 ms so the card snaps to
+//     the end-state without animating; the global ripple budget is preserved.
+//
+// Out of scope (do not add here — see TASK-013 / Phase 3):
+//   * tap_action / hold_action / double_tap_action wiring.
+//   * Tile-specific content (icon, name, state value).
+//   * Hover effects beyond the press visual feedback.
+
+import { Theme } from "theme.slint";
+
+// AnimationBudget — global gate for the per-frame and total-concurrent
+// animation budget. The Rust bridge (TASK-015) is responsible for:
+//   1. Setting `framerate-cap` from DEFAULT_PROFILE.animation_framerate_cap
+//      and using it to derive the renderer/timer interval (1000 / cap ms).
+//   2. Setting `max-simultaneous` from DEFAULT_PROFILE.max_simultaneous_animations.
+//   3. Incrementing `active-count` when a tile begins an animation and
+//      decrementing on completion. Tiles read `active-count >= max-simultaneous`
+//      to decide whether to animate or snap to the end-state.
+//
+// All three are `in-out` so the bridge can write them and Slint expressions
+// (here and in the tile components from TASK-013) can read and mutate them.
+export global AnimationBudget {
+    // Frames-per-second ceiling for tile animations. Wired from
+    // DEFAULT_PROFILE.animation_framerate_cap by the Rust bridge (TASK-015);
+    // referenced here only via this property — never hardcoded.
+    in-out property <int> framerate-cap: 60;
+
+    // Maximum number of tile animations that may run concurrently. Wired
+    // from DEFAULT_PROFILE.max_simultaneous_animations by the Rust bridge
+    // (TASK-015). Cards check `active-count >= max-simultaneous` before
+    // starting an animation.
+    in-out property <int> max-simultaneous: 8;
+
+    // Number of tile animations currently running. Mutated by tile press
+    // handlers (TASK-013) — incremented on press start, decremented on
+    // animation completion. Initialised to 0 by the bridge at startup.
+    in-out property <int> active-count: 0;
+
+    // Convenience: true when a new animation should be skipped because the
+    // concurrent-animation budget is exhausted. Tiles read this to choose
+    // between an animated transition (150 ms) and an immediate snap (0 ms).
+    out property <bool> at-capacity: active-count >= max-simultaneous;
+}
+
+// CardBase — the chrome wrapper used by every tile. Consumers place tile
+// content inside via `@children`; CardBase handles the surface, border,
+// padding, focus ring, and press visual feedback.
+//
+// Properties:
+//   * pressed — driven by the parent tile's TouchArea (TASK-013). Drives
+//     the press visual feedback (background brighten + accent focus ring).
+//   * focused — keyboard focus indicator. Same accent ring as pressed.
+//
+// No callbacks are exposed here — tile-level interaction wiring is owned
+// by the tile components and ultimately the Phase 3 action dispatcher.
+export component CardBase inherits Rectangle {
+    // ── Public properties ───────────────────────────────────────────────────
+    in property <bool> pressed: false;
+    in property <bool> focused: false;
+
+    // ── Chrome (surface, border, radius) ────────────────────────────────────
+    // Background brightens to `elevated` while pressed for the press feedback.
+    // The border collapses into an accent-coloured focus ring when either
+    // pressed or focused, giving keyboard and touch users the same affordance.
+    background: pressed ? Theme.elevated : Theme.surface;
+    border-radius: Theme.radius-md;
+    border-width: 1px;
+    border-color: (pressed || focused) ? Theme.accent : Theme.elevated;
+
+    // ── Press animation (150 ms, gated by AnimationBudget) ──────────────────
+    // Slint resolves `duration` for each animation kick-off. When the global
+    // concurrent-animation budget is exhausted, `at-capacity` is true and the
+    // duration collapses to 0 ms — the property change still applies, but
+    // the renderer skips the interpolation. This implements the "snap to
+    // end-state without animating" requirement from TASK-012 AC #4.
+    //
+    // Cap of 150 ms is the design ceiling; do not raise without a Phase 1
+    // design review.
+    animate background {
+        duration: AnimationBudget.at-capacity ? 0ms : 150ms;
+    }
+    animate border-color {
+        duration: AnimationBudget.at-capacity ? 0ms : 150ms;
+    }
+
+    // ── Content slot ────────────────────────────────────────────────────────
+    // A VerticalLayout owns the padding so tile children inherit it without
+    // each tile re-declaring the spacing. Rectangle itself has no `padding`
+    // property in Slint; padding is a layout-container concern.
+    VerticalLayout {
+        padding: Theme.space-3;
+        @children
+    }
+}
