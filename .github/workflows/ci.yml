@@ -64,6 +64,30 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # ── System libs required by Slint transitive deps ────────────────────────
+      # yeslogic-fontconfig-sys (via font-kit → fontconfig) and several xcb/x11
+      # crates require C dev headers that ubuntu-latest does not ship. This list
+      # mirrors the packages verified on the Debian 12 dev VM in TASK-002.
+      # --no-install-recommends keeps the install lean (~70 MB vs ~300 MB).
+      # pkg-config and cmake are typically pre-installed on ubuntu-latest but
+      # listing them here is harmless and prevents silent drift if the runner
+      # image changes.
+      - name: install Slint system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-0 \
+            libxkbcommon-x11-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libxinerama-dev \
+            pkg-config \
+            cmake
+
       # Cache cargo registry + compiled deps to stay within <5 min budget.
       - name: cache cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -242,6 +266,26 @@ jobs:
       # ── Rust toolchain (pinned) ───────────────────────────────────────────────
       - name: setup Rust 1.95.0
         uses: dtolnay/rust-toolchain@1.95.0
+
+      # ── System libs required by Slint transitive deps ────────────────────────
+      # Same package set as the lint job. Repeated here because the test job
+      # runs on a fresh runner instance and cargo build will re-link against
+      # these headers. Cache restores compiled artifacts but not system libs.
+      - name: install Slint system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-0 \
+            libxkbcommon-x11-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libxinerama-dev \
+            pkg-config \
+            cmake
 
       # Cache cargo artifacts (shared key with lint job).
       - name: cache cargo artifacts
