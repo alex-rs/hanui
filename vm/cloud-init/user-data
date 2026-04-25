@@ -27,3 +27,28 @@ packages:
   - git
   - build-essential
   - vim
+  - libfontconfig1-dev
+  - libfreetype6-dev
+  - libxkbcommon-dev
+  - libxkbcommon-x11-0
+  - libxkbcommon-x11-dev
+  - libxcursor-dev
+  - libxrandr-dev
+  - libxi-dev
+  - libxinerama-dev
+  - xvfb
+  - pkg-config
+  - cmake
+
+write_files:
+  - path: /usr/local/bin/install-rustup.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain stable --profile minimal
+
+runcmd:
+  - su - dev -c /usr/local/bin/install-rustup.sh
+  - ldconfig
