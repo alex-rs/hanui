@@ -22,3 +22,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 jiff = "0.2"
 smol_str = "0.3"
+# SVG rasterization for icon resolver (TASK-010).
+# These three crates are already pulled in transitively by slint; pinning them
+# as direct deps makes the version dependency explicit and keeps cargo from
+# silently upgrading the transitive copy out from under our code.
+resvg = "0.47"
+usvg = "0.47"
+tiny-skia = "0.12"
