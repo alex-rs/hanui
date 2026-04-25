@@ -1,0 +1,29 @@
+#cloud-config
+hostname: hanui
+manage_etc_hosts: true
+
+users:
+  - name: dev
+    gecos: hanui dev
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILSoVO0UObvtZDkgonA/873kPg0j0wd8vMGrcvLkqEHi hanui-vm
+
+ssh_pwauth: false
+disable_root: true
+
+growpart:
+  mode: auto
+  devices: ['/']
+  ignore_growroot_disabled: false
+
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+  - git
+  - build-essential
+  - vim

@@ -1,0 +1,7 @@
+{
+  "_meta": {
+    "description": "Per-file coverage baseline. Ratchet: current >= baseline per file.",
+    "enforcement": "ops/checks/coverage-ratchet.js"
+  },
+  "files": {}
+}

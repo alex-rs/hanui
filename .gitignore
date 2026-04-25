@@ -1,0 +1,56 @@
+# === Rust build artifacts ===
+target/
+**/*.rs.bk
+*.pdb
+
+# === Environment / secrets ===
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+*.crt
+secrets/
+
+# === Editor / OS ===
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# === Logs ===
+*.log
+logs/
+
+# === Claude Code local files ===
+.claude/settings.local.json
+.claude/projects/
+.claude/.credentials.json
+.claude/cache/
+.claude/.cache/
+.claude/shell-snapshots/
+.claude/todos/
+
+# === opencode local files ===
+.opencode/node_modules/
+.opencode.json
+# === Local governance/planning workspace (this-machine-only dev) ===
+docs/
+ops/
+.leap/
+# === Coverage tooling outputs (coverage/baseline.json is the only tracked file) ===
+coverage/*.profraw
+coverage/lcov.info
+coverage/.coverage
+coverage/html/
+
+# === VM artifacts (large / secret) ===
+vm/base.qcow2
+vm/disk.qcow2
+vm/seed.iso
+vm/SHA512SUMS
+vm/known_hosts
+vm/keys/id_ed25519

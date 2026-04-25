@@ -1,0 +1,27 @@
+version: 1
+device_profile: rpi4
+default_view: home
+views:
+  - id: home
+    title: Home
+    layout: sections
+    sections:
+      - id: overview
+        title: Overview
+        widgets:
+          - id: hallway_temperature
+            type: sensor_tile
+            entity: sensor.hallway_temperature
+            layout:
+              preferred_columns: 2
+              preferred_rows: 1
+          - id: kitchen_light
+            type: light_tile
+            entity: light.kitchen
+            tap_action:
+              action: toggle
+            hold_action:
+              action: more-info
+            layout:
+              preferred_columns: 2
+              preferred_rows: 2
