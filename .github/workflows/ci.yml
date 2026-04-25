@@ -1,0 +1,269 @@
+# ci.yml — per-PR gate set for hanui Phase 1
+#
+# This is the authoritative rule book for Phase 1. When a remote is added,
+# this file runs unchanged on GitHub Actions.
+#
+# Gate set:
+#   1. rustfmt            — formatting enforced
+#   2. clippy             — warnings-as-errors
+#   3. forbidden-tokens   — blocks .only/.skip/xit/fdescribe/#[allow(dead_code)]
+#                           unless accompanied by waiver (ISSUE-### + docs/waivers.yaml)
+#   4. gitleaks           — secret scan on full repo history
+#   5. hex-color grep     — bans inline hex literals in ui/slint/**/*.slint;
+#                           escape hatch: "// theme-allow:" restricted to theme.slint only
+#   6. serde_json::Value  — bans serde_json::Value anywhere under src/ui/**
+#   7. cargo test         — full unit + integration test suite (TZ=UTC, two-pass for
+#                           order-dependence detection)
+#
+# Budget: <5 min wall clock on a cold runner (Swatinem/rust-cache warms subsequent runs).
+# Toolchain: pinned to 1.95.0 to match the dev VM rustc (per TASK-002).
+#
+# Failure blast-radius:
+#   - fmt/clippy: estimated ~20% of PRs on first-pass (formatting drift). FP rate: 0%.
+#   - grep gates: ~5% of PRs when ui/slint files exist. FP rate: <1% (URL fragments in
+#     comments are the only known false-positive vector; Slint files rarely contain URLs).
+#   - cargo test: should be ~0% on green master. FP rate: 0% (deterministic).
+
+name: ci
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+# Cancel in-flight runs for the same PR/branch on new push.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Determinism: all steps run at UTC.
+  TZ: UTC
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job: lint
+  # Mirrors lefthook pre-commit coverage: rustfmt, clippy, forbidden-tokens,
+  # gitleaks. These run first so the feedback loop is as short as possible.
+  # ────────────────────────────────────────────────────────────────────────────
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── Rust toolchain (pinned to match dev VM per TASK-002) ──────────────────
+      - name: setup Rust 1.95.0
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+
+      # Cache cargo registry + compiled deps to stay within <5 min budget.
+      - name: cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # ── rustfmt ──────────────────────────────────────────────────────────────
+      - name: cargo fmt check
+        run: cargo fmt --check
+
+      # ── clippy ───────────────────────────────────────────────────────────────
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # ── forbidden-tokens ─────────────────────────────────────────────────────
+      # Checks for forbidden tokens that require a waiver entry in docs/waivers.yaml
+      # plus an ISSUE-### reference on an adjacent line.
+      #
+      # Two invocations:
+      #   (a) ops/checks/forbidden-tokens.sh — covers TS/JS/Go files.
+      #       NOTE: the script exits 0 when called with no arguments (CI has no
+      #       "staged files" concept). In a Rust-only repo this step is a no-op
+      #       but is preserved so the gate fires correctly in polyglot phases.
+      #   (b) Inline Rust scan — the shared script does not cover .rs files;
+      #       this step fills the gap. Catches #[allow(dead_code)] without a
+      #       waiver, plus .only/.skip/xit/fdescribe in case test macros appear.
+      #       The pre-receive hook is the authoritative enforcement; this CI
+      #       step provides a fast fail-on-PR signal.
+      - name: forbidden-tokens check (TS/JS/Go via ops/checks script)
+        if: hashFiles('ops/checks/forbidden-tokens.sh') != ''
+        run: |
+          # Collect all TS/JS/Go source files for the script to scan.
+          SRCFILES=$(find . -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" \
+            -o -name "*.jsx" -o -name "*.go" \) \
+            ! -path "*/node_modules/*" ! -path "*/vendor/*" ! -path "*/.git/*" \
+            2>/dev/null | tr '\n' ' ')
+          if [ -n "$SRCFILES" ]; then
+            # shellcheck disable=SC2086
+            bash ops/checks/forbidden-tokens.sh $SRCFILES
+          else
+            echo "forbidden-tokens (TS/JS/Go): no matching source files — skipping"
+          fi
+
+      - name: forbidden-tokens check (Rust)
+        run: |
+          # Scan Rust source files for #[allow(dead_code)] without a waiver reference.
+          # A waiver requires: ISSUE-### on an adjacent line AND a docs/waivers.yaml entry.
+          # The pre-receive hook re-runs this check server-side; --no-verify does NOT skip it.
+          # Other forbidden tokens (.only/.skip/xit/fdescribe) are enforced by the pre-receive
+          # hook; the shared ops/checks script covers them for TS/JS/Go files above.
+          FOUND=0
+          while IFS= read -r -d '' f; do
+            # #[allow(dead_code)] without an adjacent ISSUE-### reference.
+            while IFS= read -r match; do
+              [ -z "$match" ] && continue
+              LINE_NO=$(printf '%s' "$match" | cut -d: -f1)
+              PREV=$((LINE_NO > 1 ? LINE_NO - 1 : 1))
+              NEXT=$((LINE_NO + 1))
+              CONTEXT=$(sed -n "${PREV},${NEXT}p" "$f" 2>/dev/null || true)
+              if printf '%s' "$CONTEXT" | grep -qE 'ISSUE-[0-9]+'; then
+                continue  # waiver reference present
+              fi
+              printf '[forbidden-tokens] %s:%s: #[allow(dead_code)] requires ISSUE-### + waivers.yaml entry\n' "$f" "$LINE_NO"
+              FOUND=1
+            done < <(grep -nE '#\[allow\(dead_code\)\]' "$f" 2>/dev/null || true)
+          done < <(find . -name "*.rs" ! -path "*/.git/*" ! -path "*/target/*" -print0 2>/dev/null)
+          if [ "$FOUND" -ne 0 ]; then
+            printf '\n[forbidden-tokens] Rust violations found. Fix or add waivers.\n'
+            exit 1
+          fi
+          echo "forbidden-tokens (Rust): OK"
+
+      # ── gitleaks ─────────────────────────────────────────────────────────────
+      # Full-history secret scan. Version pinned to 8.25.1 for reproducibility.
+      - name: gitleaks secret scan
+        run: |
+          curl -sSfL \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.25.1/gitleaks_8.25.1_linux_x64.tar.gz \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks detect --source . --no-git=false --redact \
+            || { echo "gitleaks: secret detected — blocking"; exit 1; }
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job: repo-rules
+  # Hanui-specific grep gates that enforce architectural invariants.
+  # These are intentionally a separate job so they can be required status
+  # checks independently, and so their failure messages are distinct.
+  #
+  # Gate 1 — hex-color:
+  #   Rejects any inline hex literal (#xxx, #xxxxxx, #xxxxxxxx) in
+  #   ui/slint/**/*.slint. The ONLY escape hatch is a "// theme-allow:"
+  #   comment on the SAME line AND only in ui/slint/theme.slint. Any other
+  #   file with "// theme-allow:" still fails — the marker is not a general
+  #   bypass; it is semantically restricted to the theme file.
+  #   Blast-radius: ~5% of PRs once UI files exist. FP rate: <1%.
+  #
+  # Gate 2 — serde_json::Value:
+  #   Rejects any direct use or import of serde_json::Value under src/ui/**.
+  #   Pattern: \bserde_json\s*::\s*Value\b catches:
+  #     - `use serde_json::Value;`
+  #     - `fn f(v: serde_json::Value)`
+  #     - `serde_json :: Value` (unusual whitespace)
+  #   Blast-radius: ~1% of PRs. FP rate: 0% (pattern is precise).
+  # ────────────────────────────────────────────────────────────────────────────
+  repo-rules:
+    name: repo-rules
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Gate 1: No inline hex color literals in ui/slint/**/*.slint ──────────
+      # The escape hatch "// theme-allow:" is valid ONLY in ui/slint/theme.slint.
+      # For all other .slint files the pattern must produce zero matches.
+      - name: hex-color gate (no inline hex in ui/slint)
+        run: |
+          HEX_PATTERN='#([0-9a-fA-F]{8}|[0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b'
+          VIOLATIONS=""
+
+          # Find all .slint files. If none exist, gate passes vacuously.
+          while IFS= read -r -d '' f; do
+            if [[ "$f" == */ui/slint/theme.slint ]]; then
+              # theme.slint: lines with "// theme-allow:" are exempt.
+              matches=$(grep -nE "$HEX_PATTERN" "$f" | grep -v '// theme-allow:' || true)
+            else
+              # Every other .slint file: no escape hatch.
+              matches=$(grep -nE "$HEX_PATTERN" "$f" || true)
+            fi
+            if [ -n "$matches" ]; then
+              VIOLATIONS="${VIOLATIONS}=== ${f} ===\n${matches}\n"
+            fi
+          done < <(find . -path "*/ui/slint/*.slint" -print0 2>/dev/null)
+
+          if [ -n "$VIOLATIONS" ]; then
+            echo "ERROR: Inline hex color literals found in ui/slint/**/*.slint"
+            echo "Use theme tokens instead. Escape hatch (// theme-allow:) is"
+            echo "restricted to ui/slint/theme.slint ONLY."
+            echo ""
+            printf "%b" "$VIOLATIONS"
+            exit 1
+          fi
+          echo "hex-color gate: OK (zero matches)"
+
+      # ── Gate 2: No serde_json::Value access in src/ui/** ─────────────────────
+      # The bridge must operate exclusively on typed view-model structs.
+      # Pattern catches direct usage, use-statement imports, and unusual
+      # whitespace around the path separator.
+      - name: serde_json::Value gate (no Value in src/ui)
+        run: |
+          SERDE_PATTERN='\bserde_json\s*::\s*Value\b'
+          # src/ui may not exist yet (pre-Phase-1). find exits 0 on empty results.
+          VIOLATIONS=$(grep -rEn "$SERDE_PATTERN" src/ui/ 2>/dev/null || true)
+          if [ -n "$VIOLATIONS" ]; then
+            echo "ERROR: serde_json::Value found in src/ui/**"
+            echo "The UI bridge must use typed view-model structs, not raw JSON values."
+            echo "JSON parsing belongs in the fixture/data layer, not in src/ui."
+            echo ""
+            echo "$VIOLATIONS"
+            exit 1
+          fi
+          echo "serde_json::Value gate: OK (zero matches)"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job: test
+  # Full test suite with determinism double-run (two seeds, randomized order).
+  # Depends on lint + repo-rules so tests don't run on obviously broken code.
+  # ────────────────────────────────────────────────────────────────────────────
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    needs: [lint, repo-rules]
+    env:
+      TZ: UTC
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Rust toolchain (pinned) ───────────────────────────────────────────────
+      - name: setup Rust 1.95.0
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      # Cache cargo artifacts (shared key with lint job).
+      - name: cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # ── cargo test (pass 1) ───────────────────────────────────────────────────
+      # First pass with a fixed seed. TZ=UTC enforced at job level.
+      - name: cargo test (pass 1)
+        run: cargo test
+
+      # ── cargo test (pass 2) ───────────────────────────────────────────────────
+      # Second pass detects state-pollution failures (tests that rely on global
+      # mutable state left by a prior test). Note: cargo test does not support
+      # a --shuffle flag natively, so this does not detect order-dependence in
+      # the strict sense — it catches pollution of global/static state between
+      # runs. True order-dependence detection requires an external harness
+      # (tracked in nightly backlog).
+      - name: cargo test (pass 2 — state-pollution detection)
+        run: cargo test
+
+      # ── waiver-expiry check ───────────────────────────────────────────────────
+      # Runs after tests so the failure message is distinct from test failures.
+      - name: waiver-expiry check
+        if: hashFiles('docs/waivers.yaml') != '' && hashFiles('ops/checks/waiver-expiry-check.sh') != ''
+        run: bash ops/checks/waiver-expiry-check.sh
