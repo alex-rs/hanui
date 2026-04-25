@@ -1,4 +1,7 @@
+pub mod assets;
 pub mod dashboard;
+pub mod ha;
+pub mod ui;
 
 use anyhow::Result;
 use tracing::info;
