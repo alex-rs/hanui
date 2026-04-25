@@ -1,0 +1,85 @@
+// theme.slint — dark-mode-first design tokens for hanui (Phase 1).
+//
+// This is the only file under ui/slint/** that is permitted to declare
+// inline hex color literals. The CI hex-color gate (.github/workflows/ci.yml,
+// "Gate 1") accepts a hex literal here ONLY when the same line carries the
+// substring `// theme-allow:`. Every other .slint file must reference these
+// tokens — no inline hex anywhere else.
+//
+// Dark mode is the Phase 1 default per docs/PHASES.md (Phase 1: "Theme module
+// mapping HA/Lovelace CSS variables to Slint tokens (dark mode first)").
+// Light mode is explicitly out of scope for this task and is deferred to
+// Phase 4 or later (see docs/backlog/TASK-011.md § Out of scope).
+//
+// Token shape:
+//   * colors  — surface / background / elevated / text-* / accent / state-*
+//   * radii   — sm / md / lg / pill (length, px units, no hex)
+//   * spacing — space-1 .. space-6, base unit 4px
+//   * fonts   — font-xs .. font-xxl, plus weight constants
+//
+// Naming follows Slint's kebab-case convention for properties.
+
+export global Theme {
+    // ── Colors: surfaces ────────────────────────────────────────────────────
+    // Three-tier surface stack maps to Lovelace's --primary-background-color
+    // (background), --card-background-color (surface), and a slightly lifted
+    // tier for hover/focus rings or modal sheets (elevated).
+    out property <color> background: #0e1118; // theme-allow: dark app background (Lovelace --primary-background-color)
+    out property <color> surface: #1a1f2e; // theme-allow: dark card surface (Lovelace --card-background-color)
+    out property <color> elevated: #242a3d; // theme-allow: dark elevated surface (hover, focus, modal sheet)
+
+    // ── Colors: text ────────────────────────────────────────────────────────
+    // text-primary: high-contrast body / titles. text-secondary: muted labels,
+    // helper text, last-changed timestamps. Both meet WCAG AA against surface.
+    out property <color> text-primary: #e6e8ef; // theme-allow: primary text on dark surface (Lovelace --primary-text-color)
+    out property <color> text-secondary: #9aa3b8; // theme-allow: muted text on dark surface (Lovelace --secondary-text-color)
+
+    // ── Colors: accent ──────────────────────────────────────────────────────
+    // Single accent for active state, focus ring, and the "on" tile glow.
+    // Deliberately one accent in Phase 1; per-card overrides are out of scope.
+    out property <color> accent: #4f8cff; // theme-allow: accent / focus / active (Lovelace --accent-color)
+
+    // ── Colors: entity state ────────────────────────────────────────────────
+    // state-on:          entity is on / active / available with a positive value.
+    // state-off:         entity is off / inactive but reachable.
+    // state-unavailable: entity is unknown, unavailable, or null.
+    out property <color> state-on: #ffb648; // theme-allow: state on (lights, switches, fans active) — warm amber to differentiate from accent
+    out property <color> state-off: #5a6378; // theme-allow: state off (inactive but reachable)
+    out property <color> state-unavailable: #3a3f4d; // theme-allow: state unavailable / unknown
+
+    // ── Radii ───────────────────────────────────────────────────────────────
+    // Token scale, not a continuum. Tiles use radius-md; pills (badges) use
+    // radius-pill. Modal sheets land on radius-lg in later phases.
+    out property <length> radius-sm: 4px;
+    out property <length> radius-md: 8px;
+    out property <length> radius-lg: 16px;
+    out property <length> radius-pill: 999px;
+
+    // ── Spacing (4px base grid) ─────────────────────────────────────────────
+    // Use multiples; do not introduce arbitrary px gaps in widgets.
+    out property <length> space-1: 4px;
+    out property <length> space-2: 8px;
+    out property <length> space-3: 12px;
+    out property <length> space-4: 16px;
+    out property <length> space-5: 24px;
+    out property <length> space-6: 32px;
+
+    // ── Font sizes ──────────────────────────────────────────────────────────
+    // xs:  metadata / timestamps
+    // sm:  secondary labels
+    // md:  body, default tile label
+    // lg:  tile primary value
+    // xl:  card heading
+    // xxl: hero numbers (e.g., temperature in a sensor tile)
+    out property <length> font-xs: 11px;
+    out property <length> font-sm: 12px;
+    out property <length> font-md: 14px;
+    out property <length> font-lg: 18px;
+    out property <length> font-xl: 22px;
+    out property <length> font-xxl: 28px;
+
+    // ── Font weights ────────────────────────────────────────────────────────
+    out property <int> font-weight-regular: 400;
+    out property <int> font-weight-medium: 500;
+    out property <int> font-weight-bold: 700;
+}
