@@ -1,0 +1,115 @@
+// sensor_tile.slint — Phase 1 tile for `type: sensor_tile` widgets.
+//
+// Renders the entity name and its state value (an arbitrary string such
+// as "21.3 °C" or "open") plus an icon, inside the shared CardBase chrome.
+// Sensors do not have a fixed enum of states the way lights do, so the
+// state string is rendered as-is in `text-primary`. No state colour
+// switching here — the icon and value both use neutral text colours.
+//
+// All colours come from theme tokens; no inline hex literals (CI hex-color
+// gate, .github/workflows/ci.yml § Gate 1).
+//
+// View-model contract:
+//   * `LightTileVM` and `SensorTileVM` share the same shape (name, state,
+//     icon-id, icon, preferred-*, placement) but are intentionally
+//     declared as separate Slint structs so the bridge (TASK-014) can
+//     have distinct typed entry points per WidgetKind without runtime
+//     downcasting. The Rust enum is `WidgetKind::SensorTile`.
+//   * `placement` is the nested `TilePlacement` struct re-declared in
+//     each tile file; declaring it once and importing across files
+//     would also work, but keeping it co-located with each VM keeps
+//     each tile file self-describing for future readers.
+//   * `icon-id` resolves through the asset layer (TASK-010); `icon`
+//     is written by the bridge (TASK-015) once decoded.
+//
+// AnimationBudget integration:
+//   * Press feedback comes from CardBase. Active-count mutation is
+//     deferred to TASK-015 (bridge wires increment/decrement around
+//     the press timer it owns).
+//   * TODO TASK-015: bridge wires AnimationBudget.active-count +=/-=.
+//
+// Out of scope (Phase 3): tap/hold action wiring, hover effects,
+// numeric formatting (the bridge produces the formatted string).
+
+import { Theme } from "theme.slint";
+import { CardBase } from "card_base.slint";
+// AnimationBudget bound in Rust (TASK-015); not imported here — see comment.
+
+// Computed grid placement, mirrors `dashboard::view_spec::Placement` in Rust.
+// Re-declared in each tile file for self-documentation; the Slint compiler
+// merges identical struct definitions in the same compilation unit.
+export struct SensorTilePlacement {
+    col: int,
+    row: int,
+    span-cols: int,
+    span-rows: int,
+}
+
+// Typed view-model for a sensor tile.
+//
+// Fields mirror LightTileVM; see light_tile.slint for the field-level
+// contract. The only behavioural difference is that `state` is rendered
+// verbatim (no on/off/unavailable switching).
+export struct SensorTileVM {
+    name: string,
+    state: string,
+    icon-id: string,
+    icon: image,
+    preferred-columns: int,
+    preferred-rows: int,
+    placement: SensorTilePlacement,
+}
+
+// SensorTile — wraps CardBase with the sensor-specific content layout.
+//
+// Layout mirrors LightTile (header row + value line) but the value uses
+// text-primary in font-xxl to make sensor readings the focal element of
+// the tile (per docs/PHASES.md "hero numbers" font-size guidance).
+export component SensorTile inherits Rectangle {
+    in property <SensorTileVM> view-model;
+
+    property <bool> pressed: touch.pressed;
+
+    touch := TouchArea {
+        // No callbacks wired in Phase 1 — see Out of scope above.
+    }
+
+    base := CardBase {
+        pressed: pressed;
+
+        VerticalLayout {
+            spacing: Theme.space-2;
+
+            // Header row: icon + entity name. Icon uses text-secondary
+            // (sensors have no on/off colour distinction).
+            HorizontalLayout {
+                spacing: Theme.space-2;
+                alignment: start;
+
+                Image {
+                    source: view-model.icon;
+                    width: Theme.font-xl;
+                    height: Theme.font-xl;
+                    colorize: Theme.text-secondary;
+                }
+
+                Text {
+                    text: view-model.name;
+                    color: Theme.text-secondary;
+                    font-size: Theme.font-sm;
+                    font-weight: Theme.font-weight-regular;
+                    vertical-alignment: center;
+                }
+            }
+
+            // State value as the hero number. text-primary + font-xxl
+            // makes the reading the visual centrepiece of the tile.
+            Text {
+                text: view-model.state;
+                color: Theme.text-primary;
+                font-size: Theme.font-xxl;
+                font-weight: Theme.font-weight-bold;
+            }
+        }
+    }
+}
