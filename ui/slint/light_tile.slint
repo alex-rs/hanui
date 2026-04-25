@@ -1,0 +1,142 @@
+// light_tile.slint — Phase 1 tile for `type: light_tile` widgets.
+//
+// Renders the entity name, current state ("on" / "off" / "unavailable"),
+// and an icon inside the shared CardBase chrome. State drives both the
+// visible label and the icon-tint colour, both pulled from theme tokens
+// (Theme.state-on / state-off / state-unavailable). No inline hex literals
+// anywhere — CI hex-color gate (.github/workflows/ci.yml § Gate 1) enforces.
+//
+// View-model contract (consumed via `in property <LightTileVM> view-model`):
+//   * The struct shape is mirrored 1:1 in Rust by the bridge (TASK-014). The
+//     Slint compiler generates a Rust struct named `LightTileVM` whose fields
+//     match these names with kebab→snake conversion (`icon-id` → `icon_id`).
+//   * `placement` is a NESTED struct (TilePlacement), chosen over a flat
+//     4-int layout because the Rust side already has `dashboard::view_spec
+//     ::Placement` with the same field names — a nested Slint struct gives
+//     a direct field-by-field mapping, no rebinding adapter required.
+//   * `icon-id` is the design-token id (e.g. "mdi:lightbulb"). The asset
+//     layer (TASK-010) resolves it to bytes, and the Slint bridge (TASK-015)
+//     writes the resolved `image` field. Until the bridge is wired, `icon`
+//     defaults to an empty Slint Image — Image elements render nothing on
+//     an empty value, so layout stays stable.
+//
+// AnimationBudget integration:
+//   * The press visual feedback lives entirely on CardBase (animate
+//     background + border-color, gated by AnimationBudget.at-capacity).
+//   * Mutating AnimationBudget.active-count from a Slint expression on
+//     touch press/release is awkward declaratively (the change wouldn't
+//     have a deterministic decrement point). The Rust bridge (TASK-015)
+//     will wire active-count increment/decrement from the press handler
+//     because Rust owns the timer that decides when an animation ends.
+//   * TODO TASK-015: bridge wires AnimationBudget.active-count +=/-=.
+//
+// Out of scope (Phase 3):
+//   * tap_action / hold_action / double_tap_action callback wiring.
+//   * Hover effects beyond CardBase's press feedback.
+
+import { Theme } from "theme.slint";
+import { CardBase } from "card_base.slint";
+// AnimationBudget is referenced via the bridge (TASK-015) — see comment
+// block above. Tiles do not import it directly because they do not mutate
+// active-count from a Slint expression in Phase 1.
+
+// Computed grid placement, mirrors `dashboard::view_spec::Placement` in Rust.
+// Nested (rather than flat ints) so the Rust ↔ Slint mapping is 1:1.
+export struct TilePlacement {
+    col: int,
+    row: int,
+    span-cols: int,
+    span-rows: int,
+}
+
+// Typed view-model for a light tile. The bridge (TASK-014) constructs one
+// of these per `light_tile` widget in the dashboard config.
+//
+// Fields:
+//   * name           — user-visible entity label (e.g. "Kitchen").
+//   * state          — canonical state string: "on", "off", "unavailable".
+//                      Anything else is treated as "unavailable" by the
+//                      ternary below (defensive: state-unavailable is the
+//                      visually neutral fallback).
+//   * icon-id        — design-token id (e.g. "mdi:lightbulb"). Bridge
+//                      resolves to bytes via the asset layer (TASK-010).
+//   * icon           — resolved Slint image. Written by the bridge once
+//                      the asset is decoded. Empty image = renders nothing.
+//   * preferred-columns / preferred-rows — author intent from YAML, used
+//                      by the grid packer (TASK-014) to compute placement.
+//   * placement      — packed grid coordinates and span. Static this phase.
+export struct LightTileVM {
+    name: string,
+    state: string,
+    icon-id: string,
+    icon: image,
+    preferred-columns: int,
+    preferred-rows: int,
+    placement: TilePlacement,
+}
+
+// LightTile — wraps CardBase with the light-specific content layout.
+//
+// Press feedback is inherited from CardBase via the local `pressed` property
+// driven by the TouchArea. Keyboard focus wiring (focused) is left for the
+// Phase 3 action dispatcher; CardBase already paints the focus ring when set.
+export component LightTile inherits Rectangle {
+    in property <LightTileVM> view-model;
+
+    // Drives CardBase's press visual. The TouchArea below sets it.
+    property <bool> pressed: touch.pressed;
+
+    // Resolved state colour. "on" → state-on (warm amber), "off" →
+    // state-off (muted slate), anything else → state-unavailable. Pulled
+    // from theme tokens; no inline hex literals.
+    property <color> state-color:
+        view-model.state == "on" ? Theme.state-on
+        : view-model.state == "off" ? Theme.state-off
+        : Theme.state-unavailable;
+
+    // Touch capture. Press/release flips `pressed`; the Phase 3 action
+    // dispatcher will subscribe to clicked/long-pressed via callbacks
+    // declared on this component (out of scope here — TASK-013 § Out of scope).
+    touch := TouchArea {
+        // No callbacks wired in Phase 1 — see Out of scope above.
+    }
+
+    base := CardBase {
+        pressed: pressed;
+
+        VerticalLayout {
+            spacing: Theme.space-2;
+
+            // Header row: icon + entity name. Icon is tinted with the
+            // resolved state colour so a glance at the tile reveals state.
+            HorizontalLayout {
+                spacing: Theme.space-2;
+                alignment: start;
+
+                Image {
+                    source: view-model.icon;
+                    width: Theme.font-xl;
+                    height: Theme.font-xl;
+                    colorize: state-color;
+                }
+
+                Text {
+                    text: view-model.name;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-medium;
+                    vertical-alignment: center;
+                }
+            }
+
+            // State value, displayed in the state colour for redundancy
+            // with the icon tint (accessibility: do not rely on colour alone).
+            Text {
+                text: view-model.state;
+                color: state-color;
+                font-size: Theme.font-lg;
+                font-weight: Theme.font-weight-bold;
+            }
+        }
+    }
+}

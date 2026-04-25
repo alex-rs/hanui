@@ -1,0 +1,109 @@
+// entity_tile.slint — Phase 1 generic-fallback tile for `type: entity_tile`.
+//
+// Used when a widget's domain has no dedicated tile component yet (i.e.
+// anything that isn't `light_tile` or `sensor_tile` in Phase 1). Renders
+// the entity name, state, and icon with no domain-specific styling — all
+// colours are neutral theme tokens. This is the catch-all rendering path
+// for Phase 6's deferred tile kinds (climate, media, graph, camera).
+//
+// All colours come from theme tokens; no inline hex literals (CI hex-color
+// gate, .github/workflows/ci.yml § Gate 1).
+//
+// View-model contract:
+//   * Same shape as LightTileVM and SensorTileVM. Distinct Slint struct
+//     so the bridge (TASK-014) has a typed entry point per WidgetKind
+//     (`WidgetKind::EntityTile` in src/dashboard/view_spec.rs).
+//   * `placement` is nested (TilePlacement) for 1:1 mapping to the
+//     Rust `dashboard::view_spec::Placement` struct.
+//   * `icon-id` resolves through the asset layer (TASK-010); `icon` is
+//     written by the bridge (TASK-015) once decoded.
+//
+// AnimationBudget integration:
+//   * Press feedback inherited from CardBase. Active-count mutation
+//     deferred to TASK-015 (bridge wires increment/decrement).
+//   * TODO TASK-015: bridge wires AnimationBudget.active-count +=/-=.
+//
+// Out of scope (Phase 3): tap/hold action wiring, domain-specific styling.
+
+import { Theme } from "theme.slint";
+import { CardBase } from "card_base.slint";
+// AnimationBudget bound in Rust (TASK-015); not imported here — see comment.
+
+// Computed grid placement, mirrors `dashboard::view_spec::Placement` in Rust.
+// Re-declared per tile file for self-documentation (see sensor_tile.slint
+// rationale).
+export struct EntityTilePlacement {
+    col: int,
+    row: int,
+    span-cols: int,
+    span-rows: int,
+}
+
+// Typed view-model for the generic entity tile.
+//
+// Fields match LightTileVM / SensorTileVM exactly; this VM exists as a
+// distinct type so the bridge can keep typed entry points per WidgetKind.
+export struct EntityTileVM {
+    name: string,
+    state: string,
+    icon-id: string,
+    icon: image,
+    preferred-columns: int,
+    preferred-rows: int,
+    placement: EntityTilePlacement,
+}
+
+// EntityTile — wraps CardBase with a neutral content layout.
+//
+// Both name and state render in text-primary / text-secondary respectively
+// (no domain-specific colour switching). This tile is the rendering
+// fallback when a domain-specific tile is not yet implemented.
+export component EntityTile inherits Rectangle {
+    in property <EntityTileVM> view-model;
+
+    property <bool> pressed: touch.pressed;
+
+    touch := TouchArea {
+        // No callbacks wired in Phase 1 — see Out of scope above.
+    }
+
+    base := CardBase {
+        pressed: pressed;
+
+        VerticalLayout {
+            spacing: Theme.space-2;
+
+            // Header row: icon + entity name. Both use neutral text colours
+            // because this tile carries no domain-specific semantics.
+            HorizontalLayout {
+                spacing: Theme.space-2;
+                alignment: start;
+
+                Image {
+                    source: view-model.icon;
+                    width: Theme.font-xl;
+                    height: Theme.font-xl;
+                    colorize: Theme.text-secondary;
+                }
+
+                Text {
+                    text: view-model.name;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-medium;
+                    vertical-alignment: center;
+                }
+            }
+
+            // State value in the secondary text colour — the entity tile
+            // does not have a privileged "state value" the way sensor tiles
+            // do, so the value is rendered as supporting metadata.
+            Text {
+                text: view-model.state;
+                color: Theme.text-secondary;
+                font-size: Theme.font-md;
+                font-weight: Theme.font-weight-regular;
+            }
+        }
+    }
+}
