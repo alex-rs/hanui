@@ -5,4 +5,5 @@
 //! This module never performs network I/O in Phase 1.
 
 pub mod entity;
+pub mod fixture;
 pub mod store;

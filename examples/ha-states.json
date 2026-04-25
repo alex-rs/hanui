@@ -1,7 +1,17 @@
 [
   {
+    "entity_id": "light.kitchen",
+    "state": "on",
+    "attributes": {
+      "friendly_name": "Kitchen Light",
+      "brightness": 180
+    },
+    "last_changed": "2026-04-24T10:00:00Z",
+    "last_updated": "2026-04-24T10:00:00Z"
+  },
+  {
     "entity_id": "sensor.hallway_temperature",
-    "state": "21.5",
+    "state": "21.3",
     "attributes": {
       "friendly_name": "Hallway Temperature",
       "unit_of_measurement": "°C",
@@ -11,13 +21,19 @@
     "last_updated": "2026-04-24T10:00:00Z"
   },
   {
-    "entity_id": "light.kitchen",
-    "state": "on",
+    "entity_id": "switch.outlet_1",
+    "state": "off",
     "attributes": {
-      "friendly_name": "Kitchen Light",
-      "brightness": 180
+      "friendly_name": "Outlet 1"
     },
-    "last_changed": "2026-04-24T10:00:00Z",
-    "last_updated": "2026-04-24T10:00:00Z"
+    "last_changed": "2026-04-24T09:00:00Z",
+    "last_updated": "2026-04-24T09:00:00Z"
+  },
+  {
+    "entity_id": "binary_sensor.foo",
+    "state": "off",
+    "attributes": {},
+    "last_changed": "2026-04-24T08:00:00Z",
+    "last_updated": "2026-04-24T08:00:00Z"
   }
 ]
