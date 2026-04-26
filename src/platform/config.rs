@@ -30,6 +30,10 @@
 //! which emits a `tracing::trace` audit row before delegating to
 //! [`secrecy::ExposeSecret::expose_secret`].  All token consumers (TASK-029
 //! and later) MUST call `Config::expose_token`, never `expose_secret` directly.
+//!
+//! The one exception is the private [`is_token_empty`] helper, which accesses
+//! the secret solely to check zero-length and emits its own audit row before
+//! doing so.  The plaintext is never returned to the caller.
 
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
@@ -74,6 +78,24 @@ impl std::fmt::Debug for Config {
     }
 }
 
+/// Check whether a secret token is empty without returning the plaintext to
+/// the caller.
+///
+/// Emits a `tracing::trace` audit row (`token_accessed = true`,
+/// `reason = "empty-check"`, message `"token-accessed"`) before accessing
+/// the secret, preserving the "every access to `expose_secret` writes one
+/// audit row" invariant introduced in TASK-028.
+///
+/// The returned `bool` carries no secret material.
+fn is_token_empty(token: &SecretString) -> bool {
+    tracing::trace!(
+        token_accessed = true,
+        reason = "empty-check",
+        "token-accessed"
+    );
+    token.expose_secret().is_empty()
+}
+
 impl Config {
     /// Load configuration from the environment.
     ///
@@ -103,7 +125,7 @@ impl Config {
         let token = SecretString::from(
             std::env::var("HA_TOKEN").map_err(|_| ConfigError::Missing { var: "HA_TOKEN" })?,
         );
-        if token.expose_secret().is_empty() {
+        if is_token_empty(&token) {
             return Err(ConfigError::Empty { var: "HA_TOKEN" });
         }
 
@@ -272,5 +294,40 @@ mod tests {
         assert!(logs_contain("token-accessed"));
         // The plaintext token must never appear.
         assert!(!logs_contain("another-secret"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Empty-check audit-row test (TASK-045)
+    // -----------------------------------------------------------------------
+
+    /// Verify that `Config::from_env` with a non-empty token emits the audit
+    /// row from `is_token_empty` (the empty-check path) and does NOT expose
+    /// the plaintext token in any captured event.
+    ///
+    /// This confirms the "every access to `expose_secret` writes one audit
+    /// row" invariant from TASK-028 extends to the empty-check performed
+    /// during construction.
+    #[test]
+    #[traced_test]
+    fn from_env_empty_check_emits_audit_row() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        set_env(
+            Some("ws://ha.local:8123/api/websocket"),
+            Some("fixture-token-not-plaintext"),
+        );
+
+        // Call from_env; internally is_token_empty runs and must emit the audit row.
+        let _cfg = Config::from_env().expect("from_env must succeed with valid env vars");
+
+        // The audit row from is_token_empty must be present.
+        assert!(
+            logs_contain("token-accessed"),
+            "is_token_empty must emit the token-accessed audit row"
+        );
+        // The plaintext fixture token must not appear in any log event.
+        assert!(
+            !logs_contain("fixture-token-not-plaintext"),
+            "plaintext token must never appear in any captured log event"
+        );
     }
 }
