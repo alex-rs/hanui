@@ -6,4 +6,5 @@
 
 pub mod entity;
 pub mod fixture;
+pub mod protocol;
 pub mod store;
