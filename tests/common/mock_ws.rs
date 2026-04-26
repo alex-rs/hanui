@@ -268,6 +268,19 @@ impl MockWsServer {
         self.state.lock().await.injected.push(raw);
     }
 
+    /// Inject a batch of raw text frames in one shared-state lock acquisition.
+    ///
+    /// Equivalent to calling [`MockWsServer::inject_event`] in a loop, but
+    /// holds the inject queue's mutex once for the whole batch.  Used by the
+    /// snapshot-buffer overflow integration test (TASK-046 finding 7) which
+    /// must shovel >`DEFAULT_PROFILE.snapshot_buffer_events` (10 000) frames
+    /// at the FSM during `Phase::Snapshotting`; per-event locking would
+    /// add ~10 000 mutex acquisitions for no benefit.
+    pub async fn inject_events_batch<I: IntoIterator<Item = String>>(&self, raws: I) {
+        let mut s = self.state.lock().await;
+        s.injected.extend(raws);
+    }
+
     /// Inject a mid-session `auth_required` re-prompt.
     pub async fn inject_auth_required(&self) {
         self.inject_event(r#"{"type":"auth_required","ha_version":"2024.4.0"}"#.to_owned())
