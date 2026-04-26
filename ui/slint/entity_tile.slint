@@ -20,14 +20,15 @@
 //
 // AnimationBudget integration:
 //   * Press feedback inherited from CardBase. Active-count mutation
-//     deferred to TASK-015 (bridge wires increment/decrement).
-//   * TODO TASK-015: bridge wires AnimationBudget.active-count +=/-=.
+//     deferred to Phase 3 (no specific ticket yet); the bridge will
+//     wire increment/decrement. See ui/slint/light_tile.slint:23-32
+//     for the canonical deferral rationale.
 //
 // Out of scope (Phase 3): tap/hold action wiring, domain-specific styling.
 
 import { Theme } from "theme.slint";
 import { CardBase } from "card_base.slint";
-// AnimationBudget bound in Rust (TASK-015); not imported here — see comment.
+// AnimationBudget bound in Rust (Phase 3); not imported here — see comment.
 
 // Computed grid placement, mirrors `dashboard::view_spec::Placement` in Rust.
 // Re-declared per tile file for self-documentation (see sensor_tile.slint

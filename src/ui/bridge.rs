@@ -538,6 +538,7 @@ pub fn split_tile_vms(
 /// `String -> SharedString` allocates exactly once per VM field (acceptable),
 /// and `Image` is `Arc`-backed so cloning is a refcount bump.
 ///
+/// See `ui/slint/light_tile.slint:23-32` for the per-tile deferral comment.
 /// `AnimationBudget.framerate-cap` and `AnimationBudget.max-simultaneous` are
 /// written here, once. `active-count` is initialised to 0 by the Slint global
 /// declaration itself; tile press handlers (Phase 3) mutate it later. We do
