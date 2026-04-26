@@ -4,6 +4,7 @@
 //! Phase 2 adds `LiveStore`, the WebSocket client, and live state subscriptions.
 //! This module never performs network I/O in Phase 1.
 
+pub mod client;
 pub mod entity;
 pub mod fixture;
 pub mod protocol;
