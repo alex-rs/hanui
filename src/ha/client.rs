@@ -70,11 +70,13 @@
 //! instance runs on constrained hardware.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
+use jiff::Timestamp;
 use rand::Rng;
 use tokio::sync::{oneshot, watch};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -84,8 +86,8 @@ use crate::dashboard::profiles::DEFAULT_PROFILE;
 use crate::ha::entity::{Entity, EntityId};
 use crate::ha::live_store::LiveStore;
 use crate::ha::protocol::{
-    AuthPayload, GetServicesPayload, GetStatesPayload, InboundMsg, OutboundMsg,
-    SubscribeEventsPayload,
+    AuthPayload, EventVariant, GetServicesPayload, GetStatesPayload, InboundMsg, OutboundMsg,
+    RawEntityState, SubscribeEventsPayload,
 };
 use crate::ha::store::EntityUpdate;
 use crate::platform::config::Config;
@@ -254,6 +256,62 @@ impl SnapshotApplier for LiveStore {
 }
 
 // ---------------------------------------------------------------------------
+// Protocol → Entity conversion
+// ---------------------------------------------------------------------------
+
+/// Convert a [`RawEntityState`] (from `get_states` / `state_changed` events)
+/// into a typed [`Entity`].
+///
+/// On timestamp parse failure the field falls back to `Timestamp::UNIX_EPOCH`
+/// and emits a `tracing::warn` row.  This matches the resilience profile of
+/// the rest of the protocol layer (better to render an entity with a stale
+/// timestamp than to drop it entirely on a single malformed field).
+pub fn raw_entity_to_entity(raw: &RawEntityState) -> Entity {
+    let last_changed = Timestamp::from_str(&raw.last_changed).unwrap_or_else(|_| {
+        tracing::warn!(
+            entity_id = %raw.entity_id,
+            "invalid last_changed timestamp; falling back to UNIX_EPOCH"
+        );
+        Timestamp::UNIX_EPOCH
+    });
+    let last_updated = Timestamp::from_str(&raw.last_updated).unwrap_or_else(|_| {
+        tracing::warn!(
+            entity_id = %raw.entity_id,
+            "invalid last_updated timestamp; falling back to UNIX_EPOCH"
+        );
+        Timestamp::UNIX_EPOCH
+    });
+
+    let attrs_map = match raw.attributes.as_object() {
+        Some(m) => m.clone(),
+        None => serde_json::Map::new(),
+    };
+
+    Entity {
+        id: EntityId::from(raw.entity_id.as_str()),
+        state: Arc::from(raw.state.as_str()),
+        attributes: Arc::new(attrs_map),
+        last_changed,
+        last_updated,
+    }
+}
+
+/// Convert a `state_changed` event payload into an [`EntityUpdate`].
+///
+/// Returns `Some(update)` when the event is a `state_changed`; returns `None`
+/// when the event variant is anything else (which the FSM ignores at the
+/// caller).  The resulting `update.entity` is `None` when `new_state` is
+/// `null` (HA's signal that the entity was removed).
+pub fn event_to_entity_update(event: &crate::ha::protocol::EventPayload) -> Option<EntityUpdate> {
+    let EventVariant::StateChanged(sc) = &event.event else {
+        return None;
+    };
+    let id = EntityId::from(sc.data.entity_id.as_str());
+    let entity = sc.data.new_state.as_ref().map(raw_entity_to_entity);
+    Some(EntityUpdate { id, entity })
+}
+
+// ---------------------------------------------------------------------------
 // Internal FSM phase
 // ---------------------------------------------------------------------------
 
@@ -336,6 +394,15 @@ impl IdCounter {
 /// Drives the HA WebSocket FSM.
 ///
 /// Construct via [`WsClient::new`] and run via [`WsClient::run`].
+///
+/// # Routing snapshots and events into a store
+///
+/// By default `WsClient` parses the protocol but does not persist anything —
+/// useful for protocol-only tests.  Call [`WsClient::with_store`] to attach an
+/// [`Arc<dyn SnapshotApplier>`][SnapshotApplier] (typically a
+/// [`LiveStore`][crate::ha::live_store::LiveStore]); the FSM will then route
+/// `get_states` snapshots and `state_changed` events into the store via the
+/// trait methods.
 pub struct WsClient {
     config: Config,
     state_tx: watch::Sender<ConnectionState>,
@@ -363,6 +430,17 @@ pub struct WsClient {
     /// Defaults to `STABLE_LIVE_DURATION` (5 s).  Tests inject a shorter
     /// duration to avoid real sleeps.
     pub(crate) stable_live_threshold: Duration,
+    /// Optional sink for `get_states` snapshots and live `state_changed`
+    /// events.
+    ///
+    /// When `None`, parsed events are dropped after the FSM consumes them
+    /// (protocol-only mode).  When `Some(store)`, the FSM:
+    ///
+    /// - applies the `get_states` snapshot via `store.apply_full_snapshot`,
+    /// - replays the buffered events through `store.apply_changed_event`,
+    /// - routes every subsequent `state_changed` event into the store via
+    ///   `store.apply_changed_event`.
+    pub(crate) store: Option<Arc<dyn SnapshotApplier>>,
 }
 
 impl WsClient {
@@ -381,7 +459,19 @@ impl WsClient {
             stable_live_since: None,
             live_event_count: 0,
             stable_live_threshold: STABLE_LIVE_DURATION,
+            store: None,
         }
+    }
+
+    /// Attach a [`SnapshotApplier`] sink so the FSM persists `get_states`
+    /// snapshots and routes live events to the store.
+    ///
+    /// Without this call, parsed snapshot/event payloads are dropped after the
+    /// FSM consumes them.  Production code in `src/lib.rs::run_with_live_store`
+    /// (TASK-034) wires a `LiveStore` here; protocol-only tests omit it.
+    pub fn with_store(mut self, store: Arc<dyn SnapshotApplier>) -> Self {
+        self.store = Some(store);
+        self
     }
 
     /// Transition the FSM to a new `ConnectionState` and publish via watch.
@@ -490,7 +580,7 @@ impl WsClient {
     /// This is called after `apply_full_snapshot` has already swapped the new
     /// snapshot into the store.  The diff runs against `old_snap` (captured
     /// before the swap) and the new snapshot returned by `store.current_snapshot()`.
-    pub fn diff_and_broadcast<S: SnapshotApplier>(
+    pub fn diff_and_broadcast<S: SnapshotApplier + ?Sized>(
         old_snap: &Arc<HashMap<EntityId, Entity>>,
         store: &S,
     ) {
@@ -752,9 +842,44 @@ impl WsClient {
                     "get_states snapshot received; replaying buffered events"
                 );
 
-                // Replay buffered events (TASK-030 will route to LiveStore).
-                for _buffered_event in event_buffer {
-                    // TASK-030: forward to LiveStore.
+                // Apply the snapshot to the attached store (if any).  On
+                // reconnect the store may already hold the previous snapshot —
+                // we capture it now so we can diff after the swap and only
+                // broadcast entities whose `last_updated` changed.
+                if let Some(store) = self.store.clone() {
+                    let old_snap = store.current_snapshot();
+                    let raw_states: Vec<RawEntityState> = match result.result {
+                        Some(v) => match serde_json::from_value(v) {
+                            Ok(states) => states,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "get_states result did not deserialize as Vec<RawEntityState>; treating as empty");
+                                Vec::new()
+                            }
+                        },
+                        None => Vec::new(),
+                    };
+                    let entities: Vec<Entity> =
+                        raw_states.iter().map(raw_entity_to_entity).collect();
+                    store.apply_full_snapshot(entities);
+
+                    // Diff the new snapshot against the previous one (if any)
+                    // and broadcast only changed entities.  On a fresh connect
+                    // the previous snapshot is empty, so every entity counts
+                    // as "new" and is broadcast.
+                    Self::diff_and_broadcast(&old_snap, store.as_ref());
+                }
+
+                // Replay buffered events into the store (if any).  Buffered
+                // events arrived during snapshot fetch; replaying them after
+                // the snapshot is applied keeps the store consistent with HA.
+                for buffered in event_buffer {
+                    if let InboundMsg::Event(ev) = buffered {
+                        if let Some(update) = event_to_entity_update(&ev) {
+                            if let Some(store) = self.store.as_ref() {
+                                store.apply_changed_event(update);
+                            }
+                        }
+                    }
                 }
 
                 self.set_state(ConnectionState::Services);
@@ -804,8 +929,14 @@ impl WsClient {
                 ))
             }
 
-            // Live events arrive here; TASK-030 will route to LiveStore.
-            (Phase::Live, InboundMsg::Event(_event)) => {
+            // Live events: route to the attached store (if any) and update
+            // the stable-Live tracker so the backoff counter can reset.
+            (Phase::Live, InboundMsg::Event(event)) => {
+                if let Some(update) = event_to_entity_update(&event) {
+                    if let Some(store) = self.store.as_ref() {
+                        store.apply_changed_event(update);
+                    }
+                }
                 self.on_live_event();
                 Ok(Phase::Live)
             }
