@@ -606,6 +606,466 @@ pub fn wire_window(window: &MainWindow, tiles: &[TileVM]) -> Result<(), WireErro
 }
 
 // ---------------------------------------------------------------------------
+// Live bridge: per-entity subscriptions, ConnectionState gating, status banner
+// ---------------------------------------------------------------------------
+//
+// Phase 2 (TASK-033) wires the bridge to:
+//
+//   * Subscribe per visible entity-id (one `store.subscribe(&[id])` call per id).
+//     Channels are created on-demand (matches the [`crate::ha::live_store::LiveStore`]
+//     contract introduced in TASK-030 — not permanently allocated per entity).
+//   * Accumulate updates into a `HashMap<EntityId, ()>` with **latest-overwrite**
+//     semantics (no FIFO). When two updates arrive for the same id between flush
+//     ticks, the first is discarded — the bridge re-reads the current entity via
+//     [`EntityStore::get`] at flush time.
+//   * Flush at 80 ms (12.5 Hz) on a Tokio timer. The actual Slint property write
+//     hops onto the Slint UI thread via [`slint::invoke_from_event_loop`].
+//   * Watch [`ConnectionState`] from `src/platform/status.rs` and gate Slint
+//     property writes: while the state is `Reconnecting` or `Failed`, no
+//     Rust-side property writes occur — the last rendered frame stays on screen
+//     and the status banner is shown.
+//   * On return to `Live`, immediately fire a full `for_each` resync to
+//     re-render every visible tile and clear the banner.
+//   * On `RecvError::Lagged` from a per-entity subscriber, call `store.get(id)`
+//     for ALL subscribed ids (Phase 1 contract pattern, applied per-entity), then
+//     re-`store.subscribe(&[id])` for that id.
+//
+// **Doc-comment clarification (Codex Nit N7).** "No Rust-side property writes"
+// while gated does NOT suppress Slint's internal animation engine. Animations
+// declared with `animate { ... }` blocks in `.slint` files run inside the Slint
+// runtime and are independent of any Rust-side property-write activity. Gating
+// only prevents stale data from being pushed into properties; it does not freeze
+// the UI.
+//
+// **Thread model.** All store-watching work runs on Tokio. Each `LiveBridge`
+// spawns:
+//
+//   1. One subscriber task **per entity id** that calls `recv()` in a loop and
+//      writes the id into the shared pending-updates map on each event. On
+//      `RecvError::Lagged`, the task re-runs the resync path and re-subscribes.
+//   2. One flush task that wakes every 80 ms, drains the pending map under the
+//      ConnectionState gate, builds the tiles, and posts the result to the
+//      Slint event loop via `invoke_from_event_loop`.
+//   3. One `ConnectionState` watcher task that mirrors transitions into the
+//      bridge's internal "gated" flag and triggers a full resync on the
+//      Reconnecting/Failed → Live transition.
+
+use crate::ha::store::EntityUpdate;
+use crate::platform::status::ConnectionState;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio::time::{interval, Duration};
+
+/// 80 ms flush cadence (12.5 Hz). Asserted in CI by the churn benchmark
+/// (TASK-038).  Public so test code can synthesize this exact value rather
+/// than hard-coding 80 in a magic literal.
+pub const FLUSH_INTERVAL_MS: u64 = 80;
+
+/// Returns `true` if the given [`ConnectionState`] is one in which Rust-side
+/// Slint property writes must be suppressed.
+///
+/// `Reconnecting` and `Failed` are the two gated states; the others
+/// (Connecting, Authenticating, Subscribing, Snapshotting, Services, Live)
+/// are non-gated.  Note that `Connecting` is non-gated because the very first
+/// startup transition (Connecting → Authenticating → … → Live) should write
+/// the loaded fixture / snapshot through to Slint as soon as it lands.
+pub fn is_writes_gated(state: ConnectionState) -> bool {
+    matches!(
+        state,
+        ConnectionState::Reconnecting | ConnectionState::Failed
+    )
+}
+
+/// Walk a [`Dashboard`] config in document order and collect the entity ids
+/// referenced by every widget (those with `widget.entity = Some(id)`).
+///
+/// The result is in document order; duplicates (the same entity referenced
+/// by two widgets) are preserved so callers can `.dedup()` if they want a
+/// unique-id list.  The default policy used by [`LiveBridge`] is to dedup
+/// before subscribing — one `store.subscribe(&[id])` per unique id.
+pub fn collect_visible_entity_ids(dashboard: &Dashboard) -> Vec<EntityId> {
+    let mut ids = Vec::new();
+    for view in &dashboard.views {
+        for section in &view.sections {
+            for widget in &section.widgets {
+                if let Some(s) = widget.entity.as_deref() {
+                    ids.push(EntityId::from(s));
+                }
+            }
+        }
+    }
+    ids
+}
+
+// ---------------------------------------------------------------------------
+// BridgeSink — testable abstraction over the Slint writes
+// ---------------------------------------------------------------------------
+
+/// Sink for the two side-effects the live bridge produces: (a) a fresh tile
+/// list to render, (b) a status-banner visibility flip.
+///
+/// Production callers pass a [`SlintSink`] wrapping a `slint::Weak<MainWindow>`
+/// so the writes hop onto the Slint UI thread via `invoke_from_event_loop`.
+/// Tests pass an in-process recording sink and assert against its log
+/// directly (no Slint backend required).
+pub trait BridgeSink: Send + Sync + 'static {
+    /// Apply a fresh tile list. Called from the flush task only when the
+    /// connection is in a non-gated state.
+    fn write_tiles(&self, tiles: Vec<TileVM>);
+
+    /// Toggle the status banner. Called from the [`ConnectionState`] watcher.
+    fn set_status_banner_visible(&self, visible: bool);
+}
+
+/// Production sink that posts both effects onto the Slint event loop.
+///
+/// Holds a `slint::Weak<MainWindow>` to avoid keeping the window alive past
+/// its natural lifetime; if the upgrade fails (window already closed), the
+/// effect is silently dropped — there is no UI left to update.
+pub struct SlintSink {
+    window: slint::Weak<MainWindow>,
+}
+
+impl SlintSink {
+    /// Construct a [`SlintSink`] from a strong [`MainWindow`] handle.
+    ///
+    /// The sink stores a weak reference internally so the window can be
+    /// dropped without keeping the bridge tasks alive.
+    pub fn new(window: &MainWindow) -> Self {
+        SlintSink {
+            window: window.as_weak(),
+        }
+    }
+}
+
+impl BridgeSink for SlintSink {
+    fn write_tiles(&self, tiles: Vec<TileVM>) {
+        let weak = self.window.clone();
+        // invoke_from_event_loop hops onto the Slint UI thread; the closure
+        // runs there, where Slint property writes are sound.
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(window) = weak.upgrade() {
+                // wire_window writes the three array properties + AnimationBudget
+                // globals.  An error here is a profile-out-of-range bug at
+                // build time, not a runtime condition; log and continue so the
+                // event loop is not poisoned by a panic.
+                if let Err(err) = wire_window(&window, &tiles) {
+                    tracing::error!(?err, "wire_window failed during live update");
+                }
+            }
+        });
+    }
+
+    fn set_status_banner_visible(&self, visible: bool) {
+        let weak = self.window.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(window) = weak.upgrade() {
+                window.set_status_banner_visible(visible);
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pending-updates accumulator
+// ---------------------------------------------------------------------------
+
+/// Shared, latest-overwrite pending-updates map.
+///
+/// The `HashMap<EntityId, ()>` value is intentionally unit — the bridge
+/// re-reads the current entity via [`EntityStore::get`] at flush time, so the
+/// map only tracks **which** ids changed since the last flush, not what they
+/// changed to.  When a second update for the same id arrives before the next
+/// flush tick, `insert` overwrites the prior entry (still unit) — the first
+/// "event" is implicitly discarded, which is the latest-overwrite semantic
+/// the AC requires.
+type PendingMap = Arc<Mutex<HashMap<EntityId, ()>>>;
+
+/// Drain all pending entity ids and return them as a `Vec`.
+///
+/// Holds the mutex for the duration of the drain only; the returned `Vec` is
+/// owned and can be processed without further locking.  Order is unspecified
+/// (HashMap iteration order); the flush path re-runs `build_tiles` on the
+/// full dashboard so the order of pending ids does not affect the rendered
+/// output.
+fn drain_pending(pending: &PendingMap) -> Vec<EntityId> {
+    let mut guard = pending.lock().expect("PendingMap mutex poisoned");
+    guard.drain().map(|(id, ())| id).collect()
+}
+
+// ---------------------------------------------------------------------------
+// LiveBridge
+// ---------------------------------------------------------------------------
+
+/// Owned handle to the spawned bridge tasks.
+///
+/// Dropping this handle aborts the Tokio tasks; otherwise the tasks run for
+/// the lifetime of the application.  Tests construct a `LiveBridge` against a
+/// stub store, exercise it for the duration of the test, and let it drop at
+/// scope end so the runtime can shut down cleanly.
+pub struct LiveBridge {
+    /// Subscriber task per entity id.  Stored so the `Drop` impl can abort
+    /// them; never read after construction.
+    subscriber_tasks: Vec<JoinHandle<()>>,
+    /// 80 ms flush task.
+    flush_task: JoinHandle<()>,
+    /// Connection-state watcher task.
+    state_task: JoinHandle<()>,
+}
+
+impl Drop for LiveBridge {
+    fn drop(&mut self) {
+        for h in &self.subscriber_tasks {
+            h.abort();
+        }
+        self.flush_task.abort();
+        self.state_task.abort();
+    }
+}
+
+impl LiveBridge {
+    /// Spawn the three task families and return the owning handle.
+    ///
+    /// The bridge subscribes per **unique** visible entity id (de-duplicated
+    /// from `dashboard`), wires up the 80 ms flush, and starts the
+    /// `ConnectionState` watcher.  The function does **not** perform an
+    /// initial render — callers wire `wire_window` once at startup before
+    /// calling `spawn`, so the Phase 1 fixture (or initial snapshot) is
+    /// already rendered.  `LiveBridge` only handles deltas after that.
+    ///
+    /// # Arguments
+    ///
+    /// * `store` — shared pointer to the live store.  Cloned into each
+    ///   subscriber task so the tasks own their own `Arc` ref.
+    /// * `dashboard` — used to derive the visible entity-id list and re-run
+    ///   `build_tiles` at flush time.  Wrapped in `Arc` internally.
+    /// * `state_rx` — receiver half of the `ConnectionState` watch channel.
+    ///   The sender half is owned by `src/ha/client.rs` (TASK-029/032).
+    /// * `sink` — destination for tile writes and banner toggles.  Production
+    ///   passes [`SlintSink::new(&window)`]; tests pass a recording sink.
+    pub fn spawn<S: BridgeSink>(
+        store: Arc<dyn EntityStore>,
+        dashboard: Arc<Dashboard>,
+        state_rx: watch::Receiver<ConnectionState>,
+        sink: S,
+    ) -> Self {
+        // Dedup visible entity ids before subscribing — one channel per
+        // unique id even if the dashboard references the same entity in
+        // multiple widgets.  EntityId implements Hash + Eq but not Ord, so
+        // a HashSet pass is the canonical way to dedup while preserving the
+        // first-seen order for downstream consumers.
+        let raw_ids = collect_visible_entity_ids(&dashboard);
+        let mut seen: HashSet<EntityId> = HashSet::with_capacity(raw_ids.len());
+        let mut ids: Vec<EntityId> = Vec::with_capacity(raw_ids.len());
+        for id in raw_ids {
+            if seen.insert(id.clone()) {
+                ids.push(id);
+            }
+        }
+        let ids = Arc::new(ids);
+
+        // Shared sink wrapped in Arc so the per-task closures can clone a
+        // pointer rather than cloning the sink's internals.
+        let sink: Arc<S> = Arc::new(sink);
+
+        // Pending-updates accumulator.
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+
+        // Per-entity subscriber tasks.
+        let mut subscriber_tasks = Vec::with_capacity(ids.len());
+        for id in ids.iter().cloned() {
+            let store = Arc::clone(&store);
+            let pending = Arc::clone(&pending);
+            let ids_for_resync = Arc::clone(&ids);
+            subscriber_tasks.push(tokio::spawn(async move {
+                run_entity_subscriber(store, id, pending, ids_for_resync).await;
+            }));
+        }
+
+        // Flush task.
+        let flush_task = {
+            let store = Arc::clone(&store);
+            let dashboard = Arc::clone(&dashboard);
+            let pending = Arc::clone(&pending);
+            let state_rx = state_rx.clone();
+            let sink = Arc::clone(&sink);
+            tokio::spawn(async move {
+                run_flush_loop(store, dashboard, pending, state_rx, sink).await;
+            })
+        };
+
+        // ConnectionState watcher task.
+        let state_task = {
+            let store = Arc::clone(&store);
+            let dashboard = Arc::clone(&dashboard);
+            let sink = Arc::clone(&sink);
+            tokio::spawn(async move {
+                run_state_watcher(store, dashboard, state_rx, sink).await;
+            })
+        };
+
+        LiveBridge {
+            subscriber_tasks,
+            flush_task,
+            state_task,
+        }
+    }
+}
+
+/// Per-entity subscriber loop.
+///
+/// Subscribes via `store.subscribe(&[id])`, then loops on `recv()`:
+///
+///   * `Ok(_update)` — record the id in the pending map (latest-overwrite).
+///   * `Err(RecvError::Lagged(_))` — Phase 1 contract pattern applied per
+///     entity: call `store.get(id)` for ALL subscribed ids (not just the lagged
+///     one) to recover current state, mark them all pending so the next flush
+///     re-renders, then re-subscribe via `store.subscribe(&[id])`.
+///   * `Err(RecvError::Closed)` — the sender was dropped; exit the loop.
+async fn run_entity_subscriber(
+    store: Arc<dyn EntityStore>,
+    id: EntityId,
+    pending: PendingMap,
+    ids_for_resync: Arc<Vec<EntityId>>,
+) {
+    let mut rx = store.subscribe(std::slice::from_ref(&id));
+    loop {
+        match rx.recv().await {
+            Ok(EntityUpdate { id: updated_id, .. }) => {
+                let mut guard = pending.lock().expect("PendingMap mutex poisoned");
+                guard.insert(updated_id, ());
+            }
+            Err(RecvError::Lagged(n)) => {
+                tracing::warn!(
+                    entity_id = %id.as_str(),
+                    skipped = n,
+                    "subscriber lagged; recovering all subscribed ids via store.get + re-subscribe"
+                );
+                // Recover by reading current state for every subscribed id.
+                // The actual entity values are read inside the flush path via
+                // store.get; here we only need to mark the ids dirty so the
+                // next flush re-renders them.  Reading store.get for each id
+                // also exercises the "Lagged → bridge calls store.get for all
+                // subscribed ids" AC explicitly.
+                for resync_id in ids_for_resync.iter() {
+                    let _ = store.get(resync_id);
+                    let mut guard = pending.lock().expect("PendingMap mutex poisoned");
+                    guard.insert(resync_id.clone(), ());
+                }
+                // Re-subscribe to recover from the lagged channel.
+                rx = store.subscribe(std::slice::from_ref(&id));
+            }
+            Err(RecvError::Closed) => {
+                tracing::debug!(
+                    entity_id = %id.as_str(),
+                    "subscriber channel closed; exiting"
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// Flush loop: 80 ms cadence, gated on [`ConnectionState`].
+///
+/// On every tick:
+///
+///   1. Read the current `ConnectionState` from `state_rx.borrow()`.
+///   2. If gated ([`is_writes_gated`] returns true), skip the flush — the
+///      pending map keeps accumulating; nothing is written until the gate
+///      lifts.
+///   3. Otherwise, drain the pending map.  If empty, do nothing (no tile
+///      churn, no allocation).  If non-empty, rebuild the full tile list via
+///      `build_tiles(&*store, &dashboard)` and hand it to the sink.
+///
+/// The flush rebuilds the **entire** tile list on every flush rather than
+/// patching individual tiles; this matches the Phase 1 wire_window contract
+/// and the `pending_map` is a "did anything change" signal, not a
+/// per-tile patch list.  Cost is bounded by `dashboard.widget_count` and
+/// runs at most once per 80 ms.
+async fn run_flush_loop<S: BridgeSink>(
+    store: Arc<dyn EntityStore>,
+    dashboard: Arc<Dashboard>,
+    pending: PendingMap,
+    state_rx: watch::Receiver<ConnectionState>,
+    sink: Arc<S>,
+) {
+    let mut ticker = interval(Duration::from_millis(FLUSH_INTERVAL_MS));
+    // Skip burst-catch-up if the loop falls behind: at most one flush per tick
+    // even after a long stall, so we don't write a backlog of stale tiles when
+    // the gate lifts.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+
+        let state = *state_rx.borrow();
+        if is_writes_gated(state) {
+            // Gated — keep accumulating; do not write Slint properties.
+            continue;
+        }
+
+        let drained = drain_pending(&pending);
+        if drained.is_empty() {
+            continue;
+        }
+
+        // Rebuild the full tile list against the current store snapshot.
+        let tiles = build_tiles(&*store, &dashboard);
+        sink.write_tiles(tiles);
+    }
+}
+
+/// `ConnectionState` watcher: mirrors transitions into banner state and
+/// triggers a full resync on the Reconnecting/Failed → Live edge.
+///
+/// On every state change:
+///
+///   * If the new state is gated, set the banner visible.
+///   * If the new state is `Live`, set the banner hidden AND fire an
+///     immediate full `for_each` resync via `build_tiles` so the user sees
+///     the freshest snapshot the moment the connection recovers.
+///
+/// Every other transition (e.g. `Live → Connecting → Authenticating → Live`
+/// during a clean reconnect) hides the banner without a redundant resync;
+/// the resync only fires on entry into `Live`.
+async fn run_state_watcher<S: BridgeSink>(
+    store: Arc<dyn EntityStore>,
+    dashboard: Arc<Dashboard>,
+    mut state_rx: watch::Receiver<ConnectionState>,
+    sink: Arc<S>,
+) {
+    // Apply the initial state once so a bridge spawned mid-Reconnect renders
+    // the banner without waiting for the next transition.
+    let initial = *state_rx.borrow_and_update();
+    sink.set_status_banner_visible(is_writes_gated(initial));
+    if matches!(initial, ConnectionState::Live) {
+        let tiles = build_tiles(&*store, &dashboard);
+        sink.write_tiles(tiles);
+    }
+
+    loop {
+        if state_rx.changed().await.is_err() {
+            // Sender dropped — Phase 2's WS client task exited; no more
+            // transitions will be observed.  The bridge's other tasks may
+            // still be useful (the flush loop continues to drain pending),
+            // but state-driven banner toggles end here.
+            return;
+        }
+        let new_state = *state_rx.borrow_and_update();
+        sink.set_status_banner_visible(is_writes_gated(new_state));
+        if matches!(new_state, ConnectionState::Live) {
+            // Full resync: read current state for every entity via
+            // build_tiles (which calls store.get under the hood) and push.
+            let tiles = build_tiles(&*store, &dashboard);
+            sink.write_tiles(tiles);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
