@@ -652,6 +652,10 @@ impl WsClient {
             // auth_invalid → Failed (no reconnect; token plaintext not logged).
             (Phase::Authenticating, InboundMsg::AuthInvalid(p)) => {
                 tracing::error!("auth_invalid received; transitioning to Failed");
+                // Clear any stability tracking before terminating the connection
+                // so that a subsequent client reuse (new run()) cannot inherit
+                // stale `stable_live_since` from a prior session.
+                self.on_disconnect();
                 self.set_state(ConnectionState::Failed);
                 Err(ClientError::AuthInvalid { reason: p.message })
             }
@@ -668,6 +672,7 @@ impl WsClient {
                         .map(|e| e.message)
                         .unwrap_or_else(|| "subscribe_events failed".to_owned());
                     tracing::error!(%reason, "subscribe_events result: failure");
+                    self.on_disconnect();
                     self.set_state(ConnectionState::Failed);
                     return Err(ClientError::AuthInvalid { reason });
                 }
@@ -705,6 +710,7 @@ impl WsClient {
                     let tripped = self.overflow_breaker.record_overflow();
                     if tripped {
                         tracing::error!("overflow circuit-breaker tripped (3 overflows in 60 s)");
+                        self.on_disconnect();
                         self.set_state(ConnectionState::Failed);
                         return Err(ClientError::OverflowCircuitBreaker);
                     }
@@ -733,6 +739,10 @@ impl WsClient {
                         .map(|e| e.message)
                         .unwrap_or_else(|| "get_states failed".to_owned());
                     tracing::error!(%reason, "get_states result: failure");
+                    // Mid-Snapshotting failure must NOT advance to Live, so the
+                    // backoff counter remains as-is — `on_disconnect` clears
+                    // only the stability window, never the backoff state.
+                    self.on_disconnect();
                     self.set_state(ConnectionState::Failed);
                     return Err(ClientError::AuthInvalid { reason });
                 }
@@ -1795,6 +1805,147 @@ mod tests {
         assert_eq!(
             client.backoff.current_window, window_before,
             "backoff window must NOT change when Snapshotting fails"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test (b) negative path through real handle_message error:
+    // a get_states result with success=false in Snapshotting must NOT reset
+    // the backoff counter (exercises the Phase::Snapshotting failure branch
+    // exactly as a real HA error would).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_b_snapshotting_get_states_failure_via_handle_message_does_not_reset_backoff() {
+        let (mut client, state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-snapshot-fail")
+        };
+        let (mut sink, _sent) = MockSink::new();
+
+        // Prime the backoff: 2 prior failures → attempts=2, window > MIN.
+        client.backoff.advance();
+        client.backoff.advance();
+        let attempts_before = client.backoff.attempts;
+        let window_before = client.backoff.current_window;
+        assert!(window_before > MIN_BACKOFF);
+
+        // Drive auth → subscribe ACK → Snapshotting.
+        let phase = client
+            .handle_message(
+                inbound(r#"{"type":"auth_required","ha_version":"2024.4.0"}"#),
+                Phase::Authenticating,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let phase = client
+            .handle_message(
+                inbound(r#"{"type":"auth_ok","ha_version":"2024.4.0"}"#),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let subscribe_id = match &phase {
+            Phase::Subscribing { subscribe_id } => *subscribe_id,
+            other => panic!("expected Subscribing; got: {other:?}"),
+        };
+        let phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{subscribe_id},"success":true,"result":null}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let get_states_id = match &phase {
+            Phase::Snapshotting { get_states_id, .. } => *get_states_id,
+            other => panic!("expected Snapshotting; got: {other:?}"),
+        };
+
+        // Real failure path: HA returns success=false on get_states.
+        // This exercises the same code path a server-side rejection produces.
+        let result = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{get_states_id},"success":false,"error":{{"code":"db_error","message":"db lock"}}}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ClientError::AuthInvalid { .. })),
+            "get_states success=false must produce a ClientError; got: {result:?}"
+        );
+        assert_eq!(
+            *state_rx.borrow(),
+            ConnectionState::Failed,
+            "state must be Failed after get_states failure"
+        );
+
+        // CRITICAL invariant (Codex I3): a resync that fails mid-Snapshotting
+        // does NOT reset the backoff counter. The window must remain elevated.
+        assert_eq!(
+            client.backoff.attempts, attempts_before,
+            "backoff.attempts must NOT reset on mid-Snapshotting failure (real handle_message path)"
+        );
+        assert_eq!(
+            client.backoff.current_window, window_before,
+            "backoff.current_window must NOT reset on mid-Snapshotting failure (real handle_message path)"
+        );
+        // stable_live_since must be cleared so a future Live transition starts fresh.
+        assert!(
+            client.stable_live_since.is_none(),
+            "stable_live_since must be cleared by on_disconnect on Failed transition"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: auth_invalid path also clears stable_live_since defensively.
+    // Prevents a stale Live timestamp from a prior session leaking into
+    // a subsequent run() call's stability tracking.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_auth_invalid_clears_stable_live_since() {
+        let (mut client, _state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-auth-invalid-clear")
+        };
+        let (mut sink, _sent) = MockSink::new();
+
+        // Inject a stale stable_live_since (as if a prior session reached Live).
+        client.stable_live_since = Some(Instant::now());
+        client.live_event_count = 7;
+
+        let _ = client
+            .handle_message(
+                inbound(r#"{"type":"auth_required","ha_version":"2024.4.0"}"#),
+                Phase::Authenticating,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let _ = client
+            .handle_message(
+                inbound(r#"{"type":"auth_invalid","message":"bad token"}"#),
+                Phase::Authenticating,
+                &mut sink,
+            )
+            .await;
+
+        assert!(
+            client.stable_live_since.is_none(),
+            "auth_invalid path must clear stable_live_since"
+        );
+        assert_eq!(
+            client.live_event_count, 0,
+            "auth_invalid path must reset live_event_count"
         );
     }
 
