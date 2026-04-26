@@ -614,6 +614,14 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Helper: build a WsClient from env
+    //
+    // The caller MUST acquire `ENV_LOCK` before calling and drop it BEFORE
+    // any subsequent `.await` to avoid `clippy::await_holding_lock`.
+    // Pattern:
+    //   let (mut client, rx) = {
+    //       let _g = ENV_LOCK.lock().unwrap();
+    //       make_client("tok")
+    //   }; // guard dropped here
     // -----------------------------------------------------------------------
 
     fn make_client(token: &str) -> (WsClient, watch::Receiver<ConnectionState>) {
@@ -637,8 +645,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_ok_happy_path_reaches_live() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let (mut client, state_rx) = make_client("test-token-happy");
+        // Guard dropped before first .await — avoids clippy::await_holding_lock.
+        let (mut client, state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-happy")
+        };
         let (mut sink, sent) = MockSink::new();
 
         let messages = vec![
@@ -693,8 +704,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_invalid_transitions_to_failed_no_reconnect() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let (mut client, state_rx) = make_client("invalid-token");
+        let (mut client, state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("invalid-token")
+        };
         let (mut sink, _sent) = MockSink::new();
 
         // auth_required → sends auth frame, stays Authenticating.
@@ -741,8 +754,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_mid_session_auth_required_triggers_reconnect() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let (mut client, state_rx) = make_client("test-token-reconnect");
+        let (mut client, state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-reconnect")
+        };
         let (mut sink, _sent) = MockSink::new();
 
         client.set_state(ConnectionState::Live);
@@ -777,8 +792,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_states_not_sent_before_subscribe_ack() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let (mut client, _state_rx) = make_client("test-token-gate");
+        let (mut client, _state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-gate")
+        };
         let (mut sink, sent) = MockSink::new();
 
         // Drive auth_required + auth_ok → Subscribing.
@@ -854,8 +871,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_ring_overflow_triggers_drop_and_increments_counter() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let (mut client, _state_rx) = make_client("test-token-overflow");
+        let (mut client, _state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-overflow")
+        };
         let (mut sink, _sent) = MockSink::new();
 
         // Pre-fill buffer to exactly the capacity limit.
@@ -898,8 +917,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_three_overflows_trip_circuit_breaker() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let (mut client, state_rx) = make_client("test-token-cb");
+        let (mut client, state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-cb")
+        };
         let (mut sink, _sent) = MockSink::new();
 
         // Pre-record 2 overflows so the next one trips the breaker.
@@ -939,8 +960,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_id_correlation_out_of_order_resolves_correctly() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let (mut client, _state_rx) = make_client("test-token-id-correlation");
+        let (mut client, _state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-id-correlation")
+        };
 
         let rx1 = client.register_pending(10);
         let rx2 = client.register_pending(20);
@@ -968,8 +991,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_id_mismatch_returns_error() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let (mut client, _state_rx) = make_client("test-token-mismatch");
+        let (mut client, _state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-mismatch")
+        };
 
         let result = client.resolve_pending(999, Ok(serde_json::Value::Null));
         assert!(
@@ -985,17 +1010,20 @@ mod tests {
     #[tokio::test]
     #[traced_test]
     async fn test_token_not_leaked_to_trace_after_auth_handshake() {
-        let _guard = ENV_LOCK.lock().unwrap();
-
+        // Guard dropped before first .await — avoids clippy::await_holding_lock.
+        let (mut client, _sink_sent) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            let plaintext_token = "UNIQUE_PLAINTEXT_TOKEN_XYZ987ABC";
+            unsafe {
+                std::env::set_var("HA_URL", "ws://ha.local:8123/api/websocket");
+                std::env::set_var("HA_TOKEN", plaintext_token);
+            }
+            let config = Config::from_env().unwrap();
+            let (tx, _rx) = status::channel();
+            (WsClient::new(config, tx), MockSink::new())
+        };
         let plaintext_token = "UNIQUE_PLAINTEXT_TOKEN_XYZ987ABC";
-        unsafe {
-            std::env::set_var("HA_URL", "ws://ha.local:8123/api/websocket");
-            std::env::set_var("HA_TOKEN", plaintext_token);
-        }
-        let config = Config::from_env().unwrap();
-        let (tx, _rx) = status::channel();
-        let mut client = WsClient::new(config, tx);
-        let (mut sink, _sent) = MockSink::new();
+        let (mut sink, _sent) = _sink_sent;
 
         // Drive auth_required → auth_ok to exercise the token exposure path.
         let phase = client
