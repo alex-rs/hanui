@@ -33,7 +33,7 @@ The UI is built in Slint (declarative domain-specific language for embedded UIs)
 - **No `serde_json::Value` access in `src/ui/**`**. The bridge operates exclusively on typed view-model structs produced by Task 11a. JSON parsing happens once at fixture load; the bridge sees only typed data. CI grep gate enforced (Task 13a).
 - **Property wiring is type-safe**: Slint component properties are strongly typed in the `.slint` definitions. Rust code that wires properties must satisfy the declared Slint type — no runtime type coercion, no `unsafe` casts.
 - **Animation loops are deterministic**: press animation uses a Timer with an interval derived from `DEFAULT_PROFILE.animation_framerate_cap`, ensuring framerate caps are met and reproducible in tests.
-- **Icon properties are never null in the UI**: every widget's icon property either displays a valid `Arc<slint::Image>` or falls back to a placeholder icon defined in the theme. Missing icon IDs are logged in the bridge, not surfaced as null.
+- **Icon properties are never null in the UI**: every widget's icon property either displays a valid `slint::Image` (Slint's own type already wraps a refcounted `SharedPixelBuffer`, so no outer Arc is needed) or falls back to a placeholder icon defined in the theme. Missing icon IDs are logged in the bridge, not surfaced as null.
 - **Every Slint component with animation or interaction carries a comment** documenting the performance constraint it respects (e.g., `// Animation capped at DEFAULT_PROFILE.animation_framerate_cap per PHASES.md:58`).
 
 ## Output format
