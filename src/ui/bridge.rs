@@ -203,20 +203,19 @@ fn default_icon_for_kind(kind: EntityKind) -> String {
 /// sanity-check walk and via [`EntityStore::get`] for per-widget entity lookup.
 /// No iterator semantics are assumed.
 ///
-/// The function is generic over `S: EntityStore` because `EntityStore::for_each`
-/// has a generic closure parameter which prevents object-safety (`dyn EntityStore`).
-/// Callers pass any concrete store type; the acceptance criterion of "bridge
-/// consumes EntityStore via for_each and get" is fully satisfied at the trait-bound
-/// level.
+/// `EntityStore` is dyn-compatible (PATH A — see `src/ha/store.rs` module doc).
+/// `store` is accepted as `&dyn EntityStore` so Phase 2 callers can pass any
+/// `Box<dyn EntityStore>` or `Arc<dyn EntityStore>` without changing this call
+/// site.  Concrete references (`&MemoryStore`) coerce automatically.
 ///
 /// See the module-level doc for the missing-entity policy and field-mapping
 /// details.
-pub fn build_tiles<S: EntityStore>(store: &S, dashboard: &Dashboard) -> Vec<TileVM> {
+pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM> {
     // Walk all entities once via the visitor to collect a count for a
     // diagnostic log / sanity check. This satisfies the AC requirement that
     // for_each is exercised on the live store path (not only in tests).
     let mut store_entity_count: usize = 0;
-    store.for_each(|_id, _entity| {
+    store.for_each(&mut |_id, _entity| {
         store_entity_count += 1;
     });
     tracing::debug!(
@@ -767,7 +766,7 @@ mod tests {
         let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
 
         let mut count = 0usize;
-        store.for_each(|_id, _entity| {
+        store.for_each(&mut |_id, _entity| {
             count += 1;
         });
         // The canonical Phase 1 fixture has exactly 4 entities.

@@ -128,8 +128,8 @@ fn exit_after_ms() -> Option<u64> {
 }
 
 /// Count entities in the store via the visitor, for a startup log line.
-fn store_entity_count(store: &impl ha::store::EntityStore) -> usize {
+fn store_entity_count(store: &dyn ha::store::EntityStore) -> usize {
     let mut n = 0usize;
-    store.for_each(|_, _| n += 1);
+    store.for_each(&mut |_, _| n += 1);
     n
 }
