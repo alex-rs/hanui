@@ -27,6 +27,27 @@
 //! to `Live`.  On ring overflow the connection is dropped; 3 overflows within
 //! 60 s trip the circuit-breaker and transition to `Failed`.
 //!
+//! # Reconnect exponential backoff
+//!
+//! When a transport error occurs the FSM transitions to `Reconnecting` and
+//! sleeps for a jittered backoff window before attempting to reconnect.
+//! Backoff window doubles on each attempt: `min(prev_window * 2, MAX_BACKOFF)`.
+//! Full jitter is applied: `actual_delay = rand::uniform(0, current_window)`.
+//!
+//! **Stable-Live invariant (Codex Important I3):**  The reconnect attempt
+//! counter and backoff window reset ONLY after a stable transition to `Live`,
+//! defined as: the `get_states` snapshot has been applied AND broadcast events
+//! are flowing for at least `STABLE_LIVE_DURATION` (5 s) with NO transport
+//! error in that window.  A resync that fails mid-`Snapshotting` does NOT
+//! reset the counter.
+//!
+//! # Reconnect snapshot diff
+//!
+//! On reconnect, a new `get_states` snapshot is compared against the previous
+//! snapshot via [`SnapshotApplier`].  Only entities whose `last_updated`
+//! timestamp changed produce broadcast `EntityUpdate` events.  The Arc swap is
+//! atomic — no per-entity churn occurs during the diff.
+//!
 //! # Security: token handling
 //!
 //! The HA access token is exposed from `Config::expose_token()` exactly once,
@@ -40,6 +61,13 @@
 //! `max_frame_size` from `DEFAULT_PROFILE.ws_payload_cap`.  A message exceeding
 //! the cap causes the transport to return an error; the FSM treats this as a
 //! transport error and drops the connection for a full resync.
+//!
+//! # Phase 4
+//!
+//! `MIN_BACKOFF`, `MAX_BACKOFF`, and `STABLE_LIVE_DURATION` are module-level
+//! constants here.  Phase 4 should surface them through `DeviceProfile` so that
+//! SBC (single-board computer) profiles can use different values if the HA
+//! instance runs on constrained hardware.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -47,17 +75,41 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
+use rand::Rng;
 use tokio::sync::{oneshot, watch};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::dashboard::profiles::DEFAULT_PROFILE;
+use crate::ha::entity::{Entity, EntityId};
+use crate::ha::live_store::LiveStore;
 use crate::ha::protocol::{
     AuthPayload, GetServicesPayload, GetStatesPayload, InboundMsg, OutboundMsg,
     SubscribeEventsPayload,
 };
+use crate::ha::store::EntityUpdate;
 use crate::platform::config::Config;
 use crate::platform::status::ConnectionState;
+
+// ---------------------------------------------------------------------------
+// Backoff constants
+// ---------------------------------------------------------------------------
+
+/// Minimum reconnect backoff window.
+///
+/// Phase 4: surface through `DeviceProfile` for SBC profiles.
+pub const MIN_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Maximum reconnect backoff window.
+///
+/// Phase 4: surface through `DeviceProfile` for SBC profiles.
+pub const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Duration a `Live` connection must remain stable (events flowing, no
+/// transport errors) before the reconnect attempt counter is reset.
+///
+/// Phase 4: surface through `DeviceProfile` for SBC profiles.
+pub const STABLE_LIVE_DURATION: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Public error type
@@ -91,6 +143,113 @@ impl From<serde_json::Error> for ClientError {
         ClientError::Transport(tokio_tungstenite::tungstenite::Error::Io(
             std::io::Error::new(std::io::ErrorKind::InvalidData, e),
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Backoff state
+// ---------------------------------------------------------------------------
+
+/// Exponential-backoff state for the reconnect loop.
+///
+/// The counter and window reset ONLY after a stable `Live` transition (see
+/// module-level doc on the stable-Live invariant).
+///
+/// `pub` so TASK-034's reconnect loop and external observers can read the
+/// state.  Fields are also `pub` for the same reason.
+#[derive(Debug, Clone)]
+pub struct BackoffState {
+    /// Number of reconnect attempts since the last successful stable `Live`.
+    pub attempts: u32,
+    /// Current backoff window (doubles each attempt up to `MAX_BACKOFF`).
+    pub current_window: Duration,
+}
+
+impl BackoffState {
+    fn new() -> Self {
+        BackoffState {
+            attempts: 0,
+            current_window: MIN_BACKOFF,
+        }
+    }
+
+    /// Record one more failed attempt and advance the window.
+    ///
+    /// Returns the new window (before jitter is applied).
+    pub fn advance(&mut self) -> Duration {
+        // Window doubles each attempt, capped at MAX_BACKOFF.
+        if self.attempts > 0 {
+            self.current_window = Duration::min(self.current_window.saturating_mul(2), MAX_BACKOFF);
+        }
+        self.attempts = self.attempts.saturating_add(1);
+        self.current_window
+    }
+
+    /// Reset the counter and window after a stable `Live` transition.
+    pub fn reset(&mut self) {
+        self.attempts = 0;
+        self.current_window = MIN_BACKOFF;
+    }
+}
+
+/// Apply full jitter to a backoff window: returns a random duration in
+/// `[0, window]` using the provided RNG.
+///
+/// Full jitter is used (not equal jitter) per AWS exponential-backoff guidance,
+/// as it distributes reconnect storms most evenly under simultaneous-failure
+/// scenarios.
+pub fn full_jitter<R: Rng>(window: Duration, rng: &mut R) -> Duration {
+    let millis = window.as_millis() as u64;
+    if millis == 0 {
+        return Duration::ZERO;
+    }
+    let jittered = rng.gen_range(0..=millis);
+    Duration::from_millis(jittered)
+}
+
+// ---------------------------------------------------------------------------
+// SnapshotApplier trait
+// ---------------------------------------------------------------------------
+
+/// Minimal store interface used by [`WsClient`] during reconnect snapshot diff.
+///
+/// Only entities whose `last_updated` timestamp changed produce broadcast
+/// `EntityUpdate` events.  The Arc swap is atomic — no per-entity churn.
+///
+/// `pub` so TASK-034's reconnect loop can wire `LiveStore` into this trait
+/// without re-exporting it.  The blanket impl for `LiveStore` is below.
+pub trait SnapshotApplier: Send + Sync {
+    /// Return the current snapshot as an `Arc<HashMap>`.
+    fn current_snapshot(&self) -> Arc<HashMap<EntityId, Entity>>;
+
+    /// Replace the snapshot atomically with a new entity list.
+    ///
+    /// Does NOT broadcast any `EntityUpdate` events — the diff step is
+    /// performed by the caller via `apply_changed_event`.
+    fn apply_full_snapshot(&self, entities: Vec<Entity>);
+
+    /// Broadcast an incremental update for a single entity.
+    ///
+    /// Called by the diff step for each entity whose `last_updated` changed
+    /// across the reconnect snapshot.
+    fn apply_changed_event(&self, update: EntityUpdate);
+}
+
+/// Blanket impl of [`SnapshotApplier`] for [`LiveStore`].
+///
+/// This wires the production `LiveStore` into the reconnect diff path without
+/// modifying `live_store.rs`.
+impl SnapshotApplier for LiveStore {
+    fn current_snapshot(&self) -> Arc<HashMap<EntityId, Entity>> {
+        self.snapshot()
+    }
+
+    fn apply_full_snapshot(&self, entities: Vec<Entity>) {
+        self.apply_snapshot(entities);
+    }
+
+    fn apply_changed_event(&self, update: EntityUpdate) {
+        self.apply_event(update);
     }
 }
 
@@ -185,6 +344,25 @@ pub struct WsClient {
     pending: HashMap<u32, PendingSender>,
     /// Circuit-breaker for snapshot-buffer overflows.
     pub overflow_breaker: OverflowBreaker,
+    /// Exponential-backoff state for the reconnect loop.
+    pub(crate) backoff: BackoffState,
+    /// When the FSM entered the `Live` state on the current connection.
+    ///
+    /// `None` if not currently `Live` or not yet reached `Live`.
+    /// Reset to `None` on disconnect; set to `Some(Instant::now())` on `Live`
+    /// entry.  The stability window begins from this timestamp.
+    pub(crate) stable_live_since: Option<Instant>,
+    /// Number of `Live` events received since `stable_live_since` was set.
+    ///
+    /// At least one event is required during the stability window for the
+    /// stable-Live invariant to be satisfied (events must be "flowing").
+    pub(crate) live_event_count: u64,
+    /// How long the connection must remain `Live` with events flowing before
+    /// the backoff counter resets.
+    ///
+    /// Defaults to `STABLE_LIVE_DURATION` (5 s).  Tests inject a shorter
+    /// duration to avoid real sleeps.
+    pub(crate) stable_live_threshold: Duration,
 }
 
 impl WsClient {
@@ -199,6 +377,10 @@ impl WsClient {
             id_counter: IdCounter::new(),
             pending: HashMap::new(),
             overflow_breaker: OverflowBreaker::new(),
+            backoff: BackoffState::new(),
+            stable_live_since: None,
+            live_event_count: 0,
+            stable_live_threshold: STABLE_LIVE_DURATION,
         }
     }
 
@@ -239,6 +421,104 @@ impl WsClient {
                 Ok(())
             }
             None => Err(ClientError::IdMismatch { received: id }),
+        }
+    }
+
+    /// Record that the FSM has entered the `Live` state.
+    ///
+    /// Resets the stability window.  Call this whenever the FSM transitions
+    /// to `Phase::Live`.
+    pub(crate) fn on_live_entered(&mut self) {
+        self.stable_live_since = Some(Instant::now());
+        self.live_event_count = 0;
+    }
+
+    /// Record one `Live` event arrival.
+    ///
+    /// Also checks whether the stable-Live invariant is now satisfied and, if
+    /// so, resets the backoff counter.  Returns `true` if the counter was just
+    /// reset (i.e. the stability window was satisfied by this event).
+    pub(crate) fn on_live_event(&mut self) -> bool {
+        self.live_event_count = self.live_event_count.saturating_add(1);
+        self.check_and_maybe_reset_backoff()
+    }
+
+    /// Check the stable-Live invariant and reset backoff if satisfied.
+    ///
+    /// Returns `true` if the backoff was reset on this call.  Idempotent —
+    /// after the first reset, subsequent calls return `false` (the counter is
+    /// already 0 and window is already `MIN_BACKOFF`).
+    pub(crate) fn check_and_maybe_reset_backoff(&mut self) -> bool {
+        // Already at baseline — nothing to reset.
+        if self.backoff.attempts == 0 && self.backoff.current_window == MIN_BACKOFF {
+            return false;
+        }
+
+        let Some(since) = self.stable_live_since else {
+            return false;
+        };
+
+        // Stable if: elapsed >= threshold AND at least one event arrived.
+        if since.elapsed() >= self.stable_live_threshold && self.live_event_count > 0 {
+            tracing::info!(
+                attempts_before_reset = self.backoff.attempts,
+                "stable-Live invariant satisfied; resetting backoff counter"
+            );
+            self.backoff.reset();
+            return true;
+        }
+
+        false
+    }
+
+    /// Reset reconnect-related state on disconnect.
+    ///
+    /// Must be called before each reconnect attempt so that stale stability
+    /// state from the previous connection does not interfere.
+    pub(crate) fn on_disconnect(&mut self) {
+        self.stable_live_since = None;
+        self.live_event_count = 0;
+    }
+
+    /// Diff two entity snapshots and broadcast `EntityUpdate` for changed entities.
+    ///
+    /// "Changed" means the entity's `last_updated` timestamp differs between
+    /// `old_snap` and the new snapshot.  New entities (not in `old_snap`) and
+    /// removed entities (in `old_snap` but not in new snapshot) are always
+    /// broadcast.
+    ///
+    /// This is called after `apply_full_snapshot` has already swapped the new
+    /// snapshot into the store.  The diff runs against `old_snap` (captured
+    /// before the swap) and the new snapshot returned by `store.current_snapshot()`.
+    pub fn diff_and_broadcast<S: SnapshotApplier>(
+        old_snap: &Arc<HashMap<EntityId, Entity>>,
+        store: &S,
+    ) {
+        let new_snap = store.current_snapshot();
+
+        // Entities in new snapshot — broadcast if last_updated changed or new.
+        for (id, new_entity) in new_snap.iter() {
+            let changed = old_snap
+                .get(id)
+                .map(|old| old.last_updated != new_entity.last_updated)
+                .unwrap_or(true); // new entity → always broadcast
+
+            if changed {
+                store.apply_changed_event(EntityUpdate {
+                    id: id.clone(),
+                    entity: Some(new_entity.clone()),
+                });
+            }
+        }
+
+        // Entities removed (in old but not in new) → broadcast removal.
+        for id in old_snap.keys() {
+            if !new_snap.contains_key(id) {
+                store.apply_changed_event(EntityUpdate {
+                    id: id.clone(),
+                    entity: None,
+                });
+            }
         }
     }
 
@@ -495,6 +775,7 @@ impl WsClient {
                 }
                 self.set_state(ConnectionState::Live);
                 tracing::info!("FSM reached Live");
+                self.on_live_entered();
                 Ok(Phase::Live)
             }
 
@@ -506,6 +787,7 @@ impl WsClient {
                     "auth_required received in Live state; \
                      treating as transport disconnect → Reconnecting"
                 );
+                self.on_disconnect();
                 self.set_state(ConnectionState::Reconnecting);
                 Err(ClientError::Transport(
                     tokio_tungstenite::tungstenite::Error::ConnectionClosed,
@@ -513,7 +795,10 @@ impl WsClient {
             }
 
             // Live events arrive here; TASK-030 will route to LiveStore.
-            (Phase::Live, InboundMsg::Event(_event)) => Ok(Phase::Live),
+            (Phase::Live, InboundMsg::Event(_event)) => {
+                self.on_live_event();
+                Ok(Phase::Live)
+            }
 
             // ── Result correlation (any phase) ───────────────────────────────
             (phase, InboundMsg::Result(result)) => {
@@ -552,7 +837,10 @@ impl WsClient {
 mod tests {
     use super::*;
     use crate::platform::status;
+    use rand::rngs::SmallRng;
+    use rand::SeedableRng;
     use std::pin::Pin;
+    use std::sync::Mutex;
     use std::task::{Context, Poll};
     use tracing_test::traced_test;
 
@@ -607,6 +895,55 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Mock SnapshotApplier for diff tests
+    // -----------------------------------------------------------------------
+
+    /// Test double for `SnapshotApplier` that records which entity IDs had
+    /// `apply_changed_event` called, and holds an in-memory snapshot.
+    struct MockStore {
+        snapshot: Mutex<Arc<HashMap<EntityId, Entity>>>,
+        events: Mutex<Vec<EntityUpdate>>,
+    }
+
+    impl MockStore {
+        fn new() -> Self {
+            MockStore {
+                snapshot: Mutex::new(Arc::new(HashMap::new())),
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_snapshot(entities: Vec<Entity>) -> Self {
+            let map: HashMap<EntityId, Entity> =
+                entities.into_iter().map(|e| (e.id.clone(), e)).collect();
+            MockStore {
+                snapshot: Mutex::new(Arc::new(map)),
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn recorded_events(&self) -> Vec<EntityUpdate> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl SnapshotApplier for MockStore {
+        fn current_snapshot(&self) -> Arc<HashMap<EntityId, Entity>> {
+            Arc::clone(&self.snapshot.lock().unwrap())
+        }
+
+        fn apply_full_snapshot(&self, entities: Vec<Entity>) {
+            let new_map: HashMap<EntityId, Entity> =
+                entities.into_iter().map(|e| (e.id.clone(), e)).collect();
+            *self.snapshot.lock().unwrap() = Arc::new(new_map);
+        }
+
+        fn apply_changed_event(&self, update: EntityUpdate) {
+            self.events.lock().unwrap().push(update);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Env serialization mutex
     // -----------------------------------------------------------------------
 
@@ -637,6 +974,22 @@ mod tests {
 
     fn inbound(json: &str) -> InboundMsg {
         serde_json::from_str(json).unwrap_or_else(|e| panic!("bad test JSON: {e}: {json}"))
+    }
+
+    /// Build a minimal entity with the given `last_updated` timestamp string.
+    fn make_entity_ts(id: &str, state: &str, last_updated: &str) -> crate::ha::entity::Entity {
+        use jiff::Timestamp;
+        use serde_json::Map;
+        use std::sync::Arc;
+        crate::ha::entity::Entity {
+            id: EntityId::from(id),
+            state: Arc::from(state),
+            attributes: Arc::new(Map::new()),
+            last_changed: Timestamp::UNIX_EPOCH,
+            last_updated: last_updated
+                .parse::<Timestamp>()
+                .unwrap_or(Timestamp::UNIX_EPOCH),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1080,5 +1433,620 @@ mod tests {
         let tripped = breaker.record_overflow();
         assert!(!tripped);
         assert_eq!(breaker.recent.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: BackoffState — unit coverage for the counter and window logic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn backoff_state_initial_window_is_min() {
+        let bs = BackoffState::new();
+        assert_eq!(bs.attempts, 0);
+        assert_eq!(bs.current_window, MIN_BACKOFF);
+    }
+
+    #[test]
+    fn backoff_state_first_advance_returns_min() {
+        // First advance: attempts was 0, window stays at MIN_BACKOFF.
+        let mut bs = BackoffState::new();
+        let w = bs.advance();
+        assert_eq!(w, MIN_BACKOFF, "first advance must return MIN_BACKOFF");
+        assert_eq!(bs.attempts, 1);
+    }
+
+    #[test]
+    fn backoff_state_second_advance_doubles_window() {
+        let mut bs = BackoffState::new();
+        bs.advance(); // 1s, attempts=1
+        let w = bs.advance(); // 2s, attempts=2
+        assert_eq!(w, MIN_BACKOFF * 2, "second advance must double window");
+        assert_eq!(bs.attempts, 2);
+    }
+
+    #[test]
+    fn backoff_state_saturates_at_max() {
+        let mut bs = BackoffState::new();
+        // Advance enough times to saturate at MAX_BACKOFF.
+        for _ in 0..10 {
+            bs.advance();
+        }
+        assert_eq!(
+            bs.current_window, MAX_BACKOFF,
+            "window must cap at MAX_BACKOFF"
+        );
+    }
+
+    #[test]
+    fn backoff_state_saturated_window_stays_at_max() {
+        let mut bs = BackoffState::new();
+        for _ in 0..10 {
+            bs.advance();
+        }
+        let w1 = bs.advance();
+        let w2 = bs.advance();
+        assert_eq!(w1, MAX_BACKOFF);
+        assert_eq!(
+            w2, MAX_BACKOFF,
+            "window must not exceed MAX_BACKOFF after saturation"
+        );
+    }
+
+    #[test]
+    fn backoff_state_reset_restores_initial() {
+        let mut bs = BackoffState::new();
+        bs.advance();
+        bs.advance();
+        bs.advance();
+        bs.reset();
+        assert_eq!(bs.attempts, 0);
+        assert_eq!(bs.current_window, MIN_BACKOFF);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test (a): three successive Snapshotting failures → monotonically
+    // increasing backoff window; counter does NOT reset on connect/auth steps.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_a_snapshotting_failures_produce_monotonically_increasing_backoff() {
+        let (mut client, _state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-backoff-a")
+        };
+        let (mut sink, _sent) = MockSink::new();
+
+        // Helper: drive through auth + subscribe + receive snapshot failure.
+        // This simulates the server closing connection right after sending
+        // get_states reply with success=false (or a transport close mid-snapshot).
+        //
+        // We simulate "fails during Snapshotting" by driving to Snapshotting
+        // and then returning a transport error — which advances the backoff.
+        //
+        // The key invariant being tested: the backoff counter increments each
+        // time we fail in Snapshotting, and the window grows monotonically.
+        // The counter does NOT reset just because we reached Subscribing or
+        // Snapshotting again — it only resets after stable Live (5s + events).
+
+        let mut windows: Vec<Duration> = Vec::new();
+
+        for _ in 0..3 {
+            // Advance backoff BEFORE the reconnect attempt (simulating what the
+            // reconnect loop does on each failed attempt), then record the
+            // resulting window (the delay used for THIS attempt).
+            let window = client.backoff.advance();
+
+            // Drive auth/subscribe portion (does NOT reset backoff).
+            let phase = client
+                .handle_message(
+                    inbound(r#"{"type":"auth_required","ha_version":"2024.4.0"}"#),
+                    Phase::Authenticating,
+                    &mut sink,
+                )
+                .await
+                .unwrap();
+            let phase = client
+                .handle_message(
+                    inbound(r#"{"type":"auth_ok","ha_version":"2024.4.0"}"#),
+                    phase,
+                    &mut sink,
+                )
+                .await
+                .unwrap();
+
+            // Get subscribe_id so we can ACK it.
+            let subscribe_id = match &phase {
+                Phase::Subscribing { subscribe_id } => *subscribe_id,
+                other => panic!("expected Subscribing; got: {other:?}"),
+            };
+
+            let phase = client
+                .handle_message(
+                    inbound(&format!(
+                        r#"{{"type":"result","id":{subscribe_id},"success":true,"result":null}}"#
+                    )),
+                    phase,
+                    &mut sink,
+                )
+                .await
+                .unwrap();
+
+            // Verify we're in Snapshotting.
+            assert!(
+                matches!(phase, Phase::Snapshotting { .. }),
+                "expected Snapshotting; got: {phase:?}"
+            );
+
+            // Simulate server closing connection mid-Snapshotting (before
+            // get_states reply) — we expect no backoff reset.
+            let _ = phase;
+
+            // Simulate disconnect: on_disconnect() clears stable_live_since.
+            client.on_disconnect();
+
+            windows.push(window);
+        }
+
+        // The advance() sequence: attempts 0→1 (returns MIN_BACKOFF=1s),
+        //                         attempts 1→2 (returns 2s),
+        //                         attempts 2→3 (returns 4s).
+        // Windows must be monotonically increasing: 1s < 2s < 4s.
+        assert_eq!(
+            windows[0], MIN_BACKOFF,
+            "first window must be MIN_BACKOFF (1s)"
+        );
+        assert!(
+            windows[1] > windows[0],
+            "second window must be larger than first; got {:?} vs {:?}",
+            windows[1],
+            windows[0]
+        );
+        assert!(
+            windows[2] > windows[1],
+            "third window must be larger than second; got {:?} vs {:?}",
+            windows[2],
+            windows[1]
+        );
+        assert_eq!(
+            windows[1],
+            Duration::from_secs(2),
+            "second window must be 2s"
+        );
+        assert_eq!(
+            windows[2],
+            Duration::from_secs(4),
+            "third window must be 4s"
+        );
+
+        // Backoff counter must be 3, not reset.
+        assert_eq!(
+            client.backoff.attempts, 3,
+            "backoff counter must be 3 after 3 Snapshotting failures"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test (b): stable Live for ≥ threshold → backoff resets; next reconnect
+    // starts from MIN_BACKOFF.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_b_stable_live_resets_backoff_counter() {
+        let (mut client, _state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-backoff-b")
+        };
+        let (mut sink, _sent) = MockSink::new();
+
+        // Simulate 3 failed attempts so backoff is elevated.
+        client.backoff.advance();
+        client.backoff.advance();
+        client.backoff.advance();
+        assert_eq!(client.backoff.attempts, 3);
+        assert!(client.backoff.current_window > MIN_BACKOFF);
+
+        // Drive FSM to Live.
+        let phase = client
+            .handle_message(
+                inbound(r#"{"type":"auth_required","ha_version":"2024.4.0"}"#),
+                Phase::Authenticating,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let phase = client
+            .handle_message(
+                inbound(r#"{"type":"auth_ok","ha_version":"2024.4.0"}"#),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let subscribe_id = match &phase {
+            Phase::Subscribing { subscribe_id } => *subscribe_id,
+            other => panic!("expected Subscribing; got: {other:?}"),
+        };
+        let phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{subscribe_id},"success":true,"result":null}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let get_states_id = match &phase {
+            Phase::Snapshotting { get_states_id, .. } => *get_states_id,
+            other => panic!("expected Snapshotting; got: {other:?}"),
+        };
+        let phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{get_states_id},"success":true,"result":[]}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let get_services_id = match &phase {
+            Phase::Services { get_services_id } => *get_services_id,
+            other => panic!("expected Services; got: {other:?}"),
+        };
+        let phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{get_services_id},"success":true,"result":{{}}}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(phase, Phase::Live),
+            "expected Live; got: {phase:?}"
+        );
+        assert!(
+            client.stable_live_since.is_some(),
+            "stable_live_since must be set on Live entry"
+        );
+
+        // Inject a short threshold so we don't wait 5 real seconds.
+        client.stable_live_threshold = Duration::from_millis(1);
+
+        // Advance clock past threshold via a tiny sleep.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // Deliver a Live event — this triggers the stability check.
+        let _phase = client
+            .handle_message(
+                inbound(r#"{"type":"event","id":1,"event":{"event_type":"state_changed","data":{"entity_id":"light.x","new_state":null,"old_state":null},"origin":"LOCAL","time_fired":"2024-01-01T00:00:00+00:00"}}"#),
+                Phase::Live,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+
+        // Backoff must now be reset.
+        assert_eq!(
+            client.backoff.attempts, 0,
+            "backoff.attempts must be 0 after stable-Live reset"
+        );
+        assert_eq!(
+            client.backoff.current_window, MIN_BACKOFF,
+            "backoff.current_window must return to MIN_BACKOFF after stable-Live reset"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test (b) complement: failed Snapshotting does NOT reset backoff.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_b_snapshotting_failure_does_not_reset_backoff() {
+        let (mut client, _state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-backoff-no-reset")
+        };
+        let (mut sink, _sent) = MockSink::new();
+
+        // Simulate 2 prior failures.
+        client.backoff.advance();
+        client.backoff.advance();
+        let window_before = client.backoff.current_window;
+        let attempts_before = client.backoff.attempts;
+
+        // Drive to Snapshotting.
+        let phase = client
+            .handle_message(
+                inbound(r#"{"type":"auth_required","ha_version":"2024.4.0"}"#),
+                Phase::Authenticating,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let phase = client
+            .handle_message(
+                inbound(r#"{"type":"auth_ok","ha_version":"2024.4.0"}"#),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let subscribe_id = match &phase {
+            Phase::Subscribing { subscribe_id } => *subscribe_id,
+            other => panic!("expected Subscribing; got: {other:?}"),
+        };
+        let phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{subscribe_id},"success":true,"result":null}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+
+        // Arrived in Snapshotting — simulate failure by calling on_disconnect
+        // without ever reaching Live.
+        assert!(matches!(phase, Phase::Snapshotting { .. }));
+        client.on_disconnect();
+
+        // Backoff state must be unchanged (no reset happened).
+        assert_eq!(
+            client.backoff.attempts, attempts_before,
+            "backoff attempts must NOT change when Snapshotting fails"
+        );
+        assert_eq!(
+            client.backoff.current_window, window_before,
+            "backoff window must NOT change when Snapshotting fails"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test (c): window saturates at MAX_BACKOFF; jitter stays in [0, MAX].
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_c_backoff_window_saturates_at_max_and_jitter_bounded() {
+        let mut bs = BackoffState::new();
+        // Drive many failures to saturate.
+        for _ in 0..20 {
+            bs.advance();
+        }
+        assert_eq!(
+            bs.current_window, MAX_BACKOFF,
+            "window must saturate at MAX_BACKOFF (30s)"
+        );
+
+        // Verify jitter is bounded in [0, MAX_BACKOFF] using a seeded RNG
+        // for determinism (required by "Determinism: seeded RNG" testing rule).
+        let mut rng = SmallRng::seed_from_u64(0xDEAD_BEEF_CAFE_1234);
+        for _ in 0..1000 {
+            let j = full_jitter(bs.current_window, &mut rng);
+            assert!(
+                j <= MAX_BACKOFF,
+                "jitter must not exceed MAX_BACKOFF; got: {j:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_c_consecutive_saturation_does_not_exceed_max() {
+        let mut bs = BackoffState::new();
+        for _ in 0..30 {
+            let w = bs.advance();
+            assert!(
+                w <= MAX_BACKOFF,
+                "window must never exceed MAX_BACKOFF; got: {w:?} at attempt {}",
+                bs.attempts
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: full_jitter is always in [0, window].
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn full_jitter_is_bounded_within_window() {
+        let mut rng = SmallRng::seed_from_u64(42);
+        let window = Duration::from_secs(10);
+        for _ in 0..1000 {
+            let j = full_jitter(window, &mut rng);
+            assert!(j <= window, "jitter {j:?} exceeds window {window:?}");
+        }
+    }
+
+    #[test]
+    fn full_jitter_zero_window_returns_zero() {
+        let mut rng = SmallRng::seed_from_u64(1);
+        let j = full_jitter(Duration::ZERO, &mut rng);
+        assert_eq!(j, Duration::ZERO);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: diff_and_broadcast — only changed last_updated produces events.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_diff_broadcast_only_changed_last_updated() {
+        // Build an old snapshot with 3 entities.
+        // light.a: unchanged (same last_updated)
+        // light.b: changed last_updated
+        // light.c: removed in new snapshot
+        // light.d: new in new snapshot
+
+        let ts_old = "2024-01-01T00:00:00Z";
+        let ts_new = "2024-01-01T01:00:00Z";
+
+        let old_entities = vec![
+            make_entity_ts("light.a", "on", ts_old),
+            make_entity_ts("light.b", "off", ts_old),
+            make_entity_ts("light.c", "on", ts_old),
+        ];
+        let old_snap: Arc<HashMap<EntityId, Entity>> = Arc::new(
+            old_entities
+                .into_iter()
+                .map(|e| (e.id.clone(), e))
+                .collect(),
+        );
+
+        // New snapshot: light.a unchanged, light.b updated, light.c removed, light.d new.
+        let new_entities = vec![
+            make_entity_ts("light.a", "on", ts_old), // same ts → no event
+            make_entity_ts("light.b", "on", ts_new), // updated ts → event
+            make_entity_ts("light.d", "off", ts_new), // new → event
+        ];
+
+        let store = MockStore::new();
+        store.apply_full_snapshot(new_entities);
+
+        WsClient::diff_and_broadcast(&old_snap, &store);
+
+        let events = store.recorded_events();
+
+        // Collect entity IDs of events.
+        let mut changed_ids: Vec<&str> = events.iter().map(|e| e.id.as_str()).collect();
+        changed_ids.sort();
+
+        assert_eq!(
+            changed_ids,
+            vec!["light.b", "light.c", "light.d"],
+            "only changed/new/removed entities must produce events"
+        );
+
+        // light.c must be a removal event (entity = None).
+        let c_event = events.iter().find(|e| e.id.as_str() == "light.c").unwrap();
+        assert!(
+            c_event.entity.is_none(),
+            "removed entity must produce EntityUpdate {{ entity: None }}"
+        );
+
+        // light.b must be an update event (entity = Some).
+        let b_event = events.iter().find(|e| e.id.as_str() == "light.b").unwrap();
+        assert!(
+            b_event.entity.is_some(),
+            "updated entity must produce EntityUpdate {{ entity: Some }}"
+        );
+
+        // light.d must be a new-entity event (entity = Some).
+        let d_event = events.iter().find(|e| e.id.as_str() == "light.d").unwrap();
+        assert!(
+            d_event.entity.is_some(),
+            "new entity must produce EntityUpdate {{ entity: Some }}"
+        );
+
+        // light.a must NOT appear — its last_updated didn't change.
+        assert!(
+            !changed_ids.contains(&"light.a"),
+            "unchanged entity must NOT produce an event"
+        );
+    }
+
+    #[test]
+    fn test_diff_broadcast_empty_snapshots_produce_no_events() {
+        let old_snap: Arc<HashMap<EntityId, Entity>> = Arc::new(HashMap::new());
+        let store = MockStore::new();
+        // New snapshot is also empty.
+        store.apply_full_snapshot(vec![]);
+
+        WsClient::diff_and_broadcast(&old_snap, &store);
+
+        assert!(
+            store.recorded_events().is_empty(),
+            "empty-to-empty diff must produce no events"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: FSM transitions don't include token plaintext in trace.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_fsm_transitions_do_not_log_token_plaintext() {
+        let fixture_token = "SECRET_FSM_TOKEN_TRACE_CHECK_7654";
+        let (mut client, _state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            unsafe {
+                std::env::set_var("HA_URL", "ws://ha.local:8123/api/websocket");
+                std::env::set_var("HA_TOKEN", fixture_token);
+            }
+            let config = Config::from_env().unwrap();
+            let (tx, rx) = status::channel();
+            (WsClient::new(config, tx), rx)
+        };
+        let (mut sink, _sent) = MockSink::new();
+
+        // Drive through the full happy-path FSM.
+        let phase = client
+            .handle_message(
+                inbound(r#"{"type":"auth_required","ha_version":"2024.4.0"}"#),
+                Phase::Authenticating,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let phase = client
+            .handle_message(
+                inbound(r#"{"type":"auth_ok","ha_version":"2024.4.0"}"#),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let subscribe_id = match &phase {
+            Phase::Subscribing { subscribe_id } => *subscribe_id,
+            other => panic!("expected Subscribing; got: {other:?}"),
+        };
+        let phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{subscribe_id},"success":true,"result":null}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let get_states_id = match &phase {
+            Phase::Snapshotting { get_states_id, .. } => *get_states_id,
+            other => panic!("expected Snapshotting; got: {other:?}"),
+        };
+        let phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{get_states_id},"success":true,"result":[]}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let get_services_id = match &phase {
+            Phase::Services { get_services_id } => *get_services_id,
+            other => panic!("expected Services; got: {other:?}"),
+        };
+        let _phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{get_services_id},"success":true,"result":{{}}}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+
+        // No trace line must contain the plaintext token.
+        assert!(
+            !logs_contain(fixture_token),
+            "plaintext token must not appear in FSM trace output"
+        );
     }
 }

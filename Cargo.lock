@@ -1384,6 +1384,7 @@ dependencies = [
  "anyhow",
  "futures",
  "jiff",
+ "rand",
  "resvg",
  "secrecy",
  "serde",
