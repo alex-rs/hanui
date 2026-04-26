@@ -78,8 +78,6 @@ pub enum ScriptedReply {
         body: String,
         forward_id: bool,
     },
-    /// Drop the connection cleanly when a request matching `match_type` arrives.
-    DisconnectOn { match_type: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -98,9 +96,6 @@ struct SharedState {
     /// Frames to inject mid-session (sent on the next connection's loop tick
     /// after a delay).  Each entry is sent once and removed.
     injected: Vec<String>,
-    /// If true, the next connection's accept loop will drop the connection
-    /// without sending any further frames after processing the next request.
-    force_disconnect: bool,
 }
 
 impl SharedState {
@@ -109,7 +104,6 @@ impl SharedState {
             replies: Vec::new(),
             recorded: Vec::new(),
             injected: Vec::new(),
-            force_disconnect: false,
         }
     }
 }
@@ -128,7 +122,6 @@ pub struct MockWsServer {
     pub ws_url: String,
     state: Arc<Mutex<SharedState>>,
     accept_task: JoinHandle<()>,
-    seq_counter: Arc<AtomicU32>,
 }
 
 impl MockWsServer {
@@ -149,16 +142,14 @@ impl MockWsServer {
         let seq_counter = Arc::new(AtomicU32::new(0));
 
         let accept_state = Arc::clone(&state);
-        let accept_seq = Arc::clone(&seq_counter);
         let accept_task = tokio::spawn(async move {
-            run_accept_loop(listener, accept_state, accept_seq).await;
+            run_accept_loop(listener, accept_state, seq_counter).await;
         });
 
         MockWsServer {
             ws_url,
             state,
             accept_task,
-            seq_counter,
         }
     }
 
@@ -251,12 +242,6 @@ impl MockWsServer {
             .await;
     }
 
-    /// Force the next active connection to drop after processing the next
-    /// inbound request.  Tests use this to verify reconnect behaviour.
-    pub async fn force_disconnect(&self) {
-        self.state.lock().await.force_disconnect = true;
-    }
-
     /// Snapshot of all recorded inbound frames in receipt order.
     pub async fn recorded_requests(&self) -> Vec<RecordedFrame> {
         self.state.lock().await.recorded.clone()
@@ -271,32 +256,6 @@ impl MockWsServer {
             .iter()
             .filter(|r| r.kind == kind)
             .count()
-    }
-
-    /// Wait until at least `n` frames matching `kind` have been recorded, or
-    /// the timeout elapses.  Returns true if the count was reached.
-    pub async fn wait_for_request(&self, kind: &str, n: usize, timeout: Duration) -> bool {
-        let start = std::time::Instant::now();
-        loop {
-            if self.recorded_request_count(kind).await >= n {
-                return true;
-            }
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
-    /// Snapshot all recorded frames (for debugging assertions).
-    #[allow(dead_code)]
-    pub async fn dump_recorded(&self) -> String {
-        let recorded = self.recorded_requests().await;
-        recorded
-            .iter()
-            .map(|r| format!("[{}] {} {}", r.seq, r.kind, r.body))
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 }
 
@@ -341,21 +300,22 @@ async fn run_connection(
     let (mut write, mut read) = ws_stream.split();
 
     // Send all leading Immediate replies, draining them from the queue.
-    {
-        let mut s = state.lock().await;
-        let mut idx = 0;
-        while idx < s.replies.len() {
-            if let ScriptedReply::Immediate(body) = &s.replies[idx] {
-                let body = body.clone();
-                drop(s);
-                if write.send(Message::Text(body)).await.is_err() {
-                    return;
+    loop {
+        let body = {
+            let mut s = state.lock().await;
+            match s.replies.first() {
+                Some(ScriptedReply::Immediate(_)) => {
+                    if let ScriptedReply::Immediate(b) = s.replies.remove(0) {
+                        b
+                    } else {
+                        unreachable!()
+                    }
                 }
-                s = state.lock().await;
-                s.replies.remove(idx);
-                continue;
+                _ => break,
             }
-            break;
+        };
+        if write.send(Message::Text(body)).await.is_err() {
+            return;
         }
     }
 
@@ -432,18 +392,11 @@ async fn run_connection(
                         to_remove = Some(i);
                         break;
                     }
-                    ScriptedReply::DisconnectOn { match_type } if match_type == &kind => {
-                        to_remove = Some(i);
-                        break;
-                    }
                     _ => {}
                 }
             }
             if let Some(idx) = to_remove {
-                let removed = s.replies.remove(idx);
-                if matches!(removed, ScriptedReply::DisconnectOn { .. }) {
-                    return;
-                }
+                s.replies.remove(idx);
             }
             found
         };
@@ -452,19 +405,6 @@ async fn run_connection(
             if write.send(Message::Text(body)).await.is_err() {
                 return;
             }
-        }
-
-        // Honor force_disconnect after handling the request.
-        let should_disconnect = {
-            let mut s = state.lock().await;
-            let f = s.force_disconnect;
-            if f {
-                s.force_disconnect = false;
-            }
-            f
-        };
-        if should_disconnect {
-            return;
         }
     }
 }
