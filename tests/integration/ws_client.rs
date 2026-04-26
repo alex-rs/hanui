@@ -185,24 +185,50 @@ async fn scenario_subscribe_ack_before_snapshot_ordering() {
 
     let recorded = server.recorded_requests().await;
 
-    let sub_seq = recorded
+    let sub_frame = recorded
         .iter()
         .find(|r| r.kind == "subscribe_events")
-        .expect("subscribe_events must be recorded")
-        .seq;
-    let snap_seq = recorded
+        .expect("subscribe_events must be recorded");
+    let snap_frame = recorded
         .iter()
         .find(|r| r.kind == "get_states")
-        .expect("get_states must be recorded")
-        .seq;
+        .expect("get_states must be recorded");
 
-    // get_states arrives strictly AFTER subscribe_events at the mock — and
-    // because the mock sends the ACK only on receipt of subscribe_events,
-    // the client must have processed the ACK before sending get_states.
-    // This is the TASK-029 sequencing gate AC.
+    // (Coarser, original assertion — kept as a sanity check.)  get_states
+    // arrives strictly AFTER subscribe_events at the mock — and because the
+    // mock sends the ACK only on receipt of subscribe_events, the client
+    // must have processed the ACK before sending get_states.  This is the
+    // TASK-029 sequencing gate AC.
+    let sub_seq = sub_frame.seq;
+    let snap_seq = snap_frame.seq;
     assert!(
         snap_seq > sub_seq,
         "get_states (seq {snap_seq}) must arrive after subscribe_events (seq {sub_seq})"
+    );
+
+    // (Tighter, TASK-046 finding 6 assertion.)  Codex's audit observed that
+    // the seq-based check above would still pass if the client sent
+    // `get_states` optimistically before the ACK had physically left the
+    // mock, as long as the mock happened to record the two inbound frames
+    // in the canonical order.  The real invariant is: the FSM gates
+    // `get_states` on actual ACK arrival.
+    //
+    // The mock now records the wall-clock instant at which it finished
+    // sending the `subscribe_events` ACK reply (see
+    // `tests/common/mock_ws.rs::SharedState::subscribe_ack_sent_at`).
+    // Asserting `get_states_received_at > subscribe_ack_sent_at` proves
+    // the client could not have sent `get_states` before the ACK had
+    // left the mock — i.e. the ACK gate is real, not optimistic.
+    let ack_sent_at = server
+        .subscribe_ack_sent_at()
+        .await
+        .expect("mock must have recorded a subscribe_ack send by the time Live is reached");
+    assert!(
+        snap_frame.received_at > ack_sent_at,
+        "get_states received_at ({:?}) must be strictly AFTER subscribe_events ACK \
+         sent_at ({:?}); FSM ACK gate is not real",
+        snap_frame.received_at,
+        ack_sent_at,
     );
 }
 
@@ -680,24 +706,149 @@ async fn scenario_oversized_payload_drops_connection() {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario: consecutive-overflow circuit-breaker
+// Scenario: consecutive-overflow circuit-breaker via the FSM's natural path
+//
+// TASK-046 finding 7: codex's audit found the previous version of this test
+// drove the breaker via `OverflowBreaker::record_overflow` calls directly,
+// which only proves the breaker's internal counter logic — it does NOT
+// prove that real snapshot-buffer overflow events trigger the breaker.
+// The unit test in `src/ha/client.rs::tests::test_three_overflows_trip_circuit_breaker`
+// already covers the FSM-level transition for the third (tripping) overflow,
+// but uses pre-recorded `record_overflow` calls for the first two.  This
+// test closes the gap end-to-end: ALL THREE overflows are driven by the
+// mock injecting > `DEFAULT_PROFILE.snapshot_buffer_events` state_changed
+// events while the FSM is in `Phase::Snapshotting`, and the third overflow
+// must surface as `ClientError::OverflowCircuitBreaker` with the FSM in
+// `ConnectionState::Failed`.
+//
+// Re-using the SAME `WsClient` across all three reconnect attempts is
+// what allows the `OverflowBreaker.recent` Vec to accumulate the three
+// overflow timestamps; constructing a fresh client per attempt would
+// reset the breaker every time.
 // ---------------------------------------------------------------------------
+
+/// Drive a single FSM-natural snapshot-buffer overflow against `server`,
+/// re-using `client` across calls so its `OverflowBreaker` accumulates.
+///
+/// Returns the `ClientError` that caused `client.run()` to terminate.
+///
+/// 1. Scripts auth_ok + subscribe_ack on `server` (NOT `get_states_reply`,
+///    so the FSM stays in `Phase::Snapshotting` waiting for a snapshot
+///    that never comes).
+/// 2. Concurrently runs `client.run()` and a driver future that waits for
+///    the FSM to send `get_states` (recorded by the mock) then batch-injects
+///    `snapshot_buffer_events + 1` state_changed frames so the cap-th
+///    incoming event hits the overflow branch in `handle_message`.
+/// 3. Returns the error from `run()`.
+async fn drive_one_fsm_overflow(server: &MockWsServer, client: &mut WsClient) -> ClientError {
+    use hanui::dashboard::profiles::DEFAULT_PROFILE;
+
+    server.script_auth_ok().await;
+    server.script_subscribe_ack().await;
+    // Intentionally NO get_states_reply — keeps the FSM in Snapshotting so
+    // the injected events accumulate in `event_buffer` until the cap.
+
+    // Snapshot the get_states count BEFORE this iteration; the driver must
+    // wait for it to INCREMENT (the new reconnect's get_states), not just
+    // be `>= 1` (cumulative count from prior iterations of the same test).
+    let get_states_count_before = server.recorded_request_count("get_states").await;
+
+    let driver = async {
+        // Wait until the FSM has sent get_states (i.e. reached Snapshotting).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if server.recorded_request_count("get_states").await > get_states_count_before {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("FSM did not reach Snapshotting (no new get_states recorded) within 5 s");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Batch-inject cap+1 state_changed frames; the cap-th push hits the
+        // overflow branch in handle_message.  Use a unique entity_id per
+        // index so the test exercises the full event_buffer.push path (the
+        // cap check is `len() >= cap`, not "id repeats").
+        let cap = DEFAULT_PROFILE.snapshot_buffer_events;
+        let frames: Vec<String> = (0..=cap)
+            .map(|i| {
+                state_changed_event_json(
+                    1,
+                    &format!("light.spam_{i}"),
+                    Some((
+                        "on",
+                        "2024-01-01T00:00:00+00:00",
+                        "2024-01-01T00:00:00+00:00",
+                    )),
+                    None,
+                )
+            })
+            .collect();
+        server.inject_events_batch(frames).await;
+    };
+
+    // Race the run future against the driver.  `client.run()` must terminate
+    // with an error after the cap-th injected event (Transport(ConnectionClosed)
+    // for overflows 1 and 2, OverflowCircuitBreaker for overflow 3).  The
+    // driver future completes once the injection has been queued; the run
+    // future drives the actual overflow.
+    let (run_result, _) = tokio::join!(client.run(), driver);
+    run_result.expect_err("overflow must surface as a ClientError")
+}
 
 #[tokio::test]
 async fn scenario_consecutive_overflow_circuit_breaker_trips() {
-    // Drives the circuit-breaker via the public OverflowBreaker API.  The
-    // FSM-level Failed transition for this exact case is covered by the
-    // unit test in `src/ha/client.rs::tests::test_three_overflows_trip_circuit_breaker`.
-    let config = make_config("ws://127.0.0.1:1/api/websocket", "tok-cb");
-    let (state_tx, _state_rx) = status::channel();
+    let server = MockWsServer::start().await;
+
+    let config = make_config(&server.ws_url, "tok-cb-fsm");
+    let (state_tx, state_rx) = status::channel();
     let mut client = WsClient::new(config, state_tx);
 
-    assert!(!client.overflow_breaker.record_overflow());
-    assert!(!client.overflow_breaker.record_overflow());
-    let tripped = client.overflow_breaker.record_overflow();
+    // Overflow #1 — Transport error, breaker counter increments to 1.
+    let err1 = drive_one_fsm_overflow(&server, &mut client).await;
     assert!(
-        tripped,
-        "third consecutive overflow within 60s must trip the circuit-breaker"
+        matches!(err1, ClientError::Transport(_)),
+        "first FSM overflow must surface as Transport(ConnectionClosed); got: {err1:?}"
+    );
+    assert_ne!(
+        *state_rx.borrow(),
+        ConnectionState::Failed,
+        "FSM must NOT be Failed after the first overflow"
+    );
+
+    // Overflow #2 — Transport error, breaker counter increments to 2.
+    let err2 = drive_one_fsm_overflow(&server, &mut client).await;
+    assert!(
+        matches!(err2, ClientError::Transport(_)),
+        "second FSM overflow must surface as Transport(ConnectionClosed); got: {err2:?}"
+    );
+    assert_ne!(
+        *state_rx.borrow(),
+        ConnectionState::Failed,
+        "FSM must NOT be Failed after the second overflow"
+    );
+
+    // Overflow #3 — circuit breaker trips, FSM transitions to Failed.
+    let err3 = drive_one_fsm_overflow(&server, &mut client).await;
+    assert!(
+        matches!(err3, ClientError::OverflowCircuitBreaker),
+        "third FSM overflow must trip the circuit breaker; got: {err3:?}"
+    );
+    assert_eq!(
+        *state_rx.borrow(),
+        ConnectionState::Failed,
+        "FSM must be in Failed state after circuit breaker trips"
+    );
+
+    // The error's Display impl carries the canonical "HA instance too large"
+    // message documented in `src/ha/client.rs::ClientError`.  Asserting on
+    // the message proves the user-visible failure path is wired end-to-end.
+    let msg = format!("{err3}");
+    assert!(
+        msg.contains("HA instance too large for current profile"),
+        "circuit-breaker error message must mention 'HA instance too large for current profile'; \
+         got: {msg:?}"
     );
 }
 

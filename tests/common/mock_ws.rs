@@ -40,7 +40,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
@@ -58,12 +58,18 @@ use tokio_tungstenite::tungstenite::Message;
 /// `"subscribe_events"`, `"get_states"`); `body` is the raw text frame so tests
 /// can inspect ids and other fields.  `seq` is a monotonic counter assigned at
 /// receipt time, used by the subscribe-ACK ordering test to assert receipt
-/// order across two different message kinds.
+/// order across two different message kinds.  `received_at` is the wall-clock
+/// instant at which the mock pulled the frame off the WebSocket; the
+/// subscribe-ACK timestamp test (TASK-046 finding 6) compares this against
+/// [`MockWsServer::subscribe_ack_sent_at`] to prove the client's `get_states`
+/// frame was sent strictly AFTER the mock's ACK send completed (not merely
+/// recorded out-of-order at the seq layer).
 #[derive(Debug, Clone)]
 pub struct RecordedFrame {
     pub seq: u64,
     pub kind: String,
     pub body: String,
+    pub received_at: Instant,
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +113,14 @@ struct SharedState {
     /// Frames to inject mid-session (sent on the next connection's loop tick
     /// after a delay).  Each entry is sent once and removed.
     injected: Vec<String>,
+    /// Timestamp at which the mock most recently FINISHED sending a reply that
+    /// matched on `subscribe_events`.  Populated by the connection task after
+    /// `write.send(...).await` returns successfully — i.e. after the ACK has
+    /// been handed to tungstenite for transmission.  TASK-046 finding 6 uses
+    /// this to assert that the client's `get_states` frame was received
+    /// strictly AFTER the ACK was sent (proving the FSM gates `get_states` on
+    /// real ACK arrival, not on optimistic send-and-pretend).
+    subscribe_ack_sent_at: Option<Instant>,
 }
 
 impl SharedState {
@@ -115,6 +129,7 @@ impl SharedState {
             replies: Vec::new(),
             recorded: Vec::new(),
             injected: Vec::new(),
+            subscribe_ack_sent_at: None,
         }
     }
 }
@@ -253,6 +268,19 @@ impl MockWsServer {
         self.state.lock().await.injected.push(raw);
     }
 
+    /// Inject a batch of raw text frames in one shared-state lock acquisition.
+    ///
+    /// Equivalent to calling [`MockWsServer::inject_event`] in a loop, but
+    /// holds the inject queue's mutex once for the whole batch.  Used by the
+    /// snapshot-buffer overflow integration test (TASK-046 finding 7) which
+    /// must shovel >`DEFAULT_PROFILE.snapshot_buffer_events` (10 000) frames
+    /// at the FSM during `Phase::Snapshotting`; per-event locking would
+    /// add ~10 000 mutex acquisitions for no benefit.
+    pub async fn inject_events_batch<I: IntoIterator<Item = String>>(&self, raws: I) {
+        let mut s = self.state.lock().await;
+        s.injected.extend(raws);
+    }
+
     /// Inject a mid-session `auth_required` re-prompt.
     pub async fn inject_auth_required(&self) {
         self.inject_event(r#"{"type":"auth_required","ha_version":"2024.4.0"}"#.to_owned())
@@ -273,6 +301,19 @@ impl MockWsServer {
             .iter()
             .filter(|r| r.kind == kind)
             .count()
+    }
+
+    /// Wall-clock instant at which the mock most recently FINISHED sending a
+    /// `result` reply matched on `subscribe_events`.  `None` if no such reply
+    /// has been sent yet on this server.
+    ///
+    /// Used by the subscribe-ACK ordering test (TASK-046 finding 6) to assert
+    /// that the client's `get_states` frame was received strictly AFTER the
+    /// ACK send completed — a tighter invariant than the seq-based
+    /// `snap_seq > sub_seq` check, which only proves *receipt order* of the
+    /// two inbound frames at the mock.
+    pub async fn subscribe_ack_sent_at(&self) -> Option<Instant> {
+        self.state.lock().await.subscribe_ack_sent_at
     }
 
     /// Force the currently-connected client to be disconnected by sending a
@@ -402,12 +443,14 @@ async fn run_connection(
 
         // Record the frame with a monotonically increasing seq number.
         let seq = seq_counter.fetch_add(1, Ordering::Relaxed) as u64;
+        let received_at = Instant::now();
         {
             let mut s = state.lock().await;
             s.recorded.push(RecordedFrame {
                 seq,
                 kind: kind.clone(),
                 body: text.clone(),
+                received_at,
             });
         }
 
@@ -445,6 +488,14 @@ async fn run_connection(
         if let Some(body) = reply_body {
             if write.send(Message::Text(body)).await.is_err() {
                 return;
+            }
+            // After the matched reply has been handed to tungstenite, record
+            // the wall-clock send-completion time for the subscribe_events
+            // ACK specifically (TASK-046 finding 6).  Other reply kinds do
+            // not need this hook.  Captured AFTER the send to surface any
+            // tungstenite-side queuing in the comparison.
+            if kind == "subscribe_events" {
+                state.lock().await.subscribe_ack_sent_at = Some(Instant::now());
             }
         }
     }
