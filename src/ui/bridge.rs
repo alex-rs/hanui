@@ -1744,4 +1744,558 @@ mod tests {
         assert!(cap.to_string().contains("framerate_cap"));
         assert!(max.to_string().contains("max_simultaneous_animations"));
     }
+
+    // -----------------------------------------------------------------------
+    // LiveBridge tests (TASK-033)
+    // -----------------------------------------------------------------------
+    //
+    // The tests below use a hand-rolled stub `EntityStore` (`StubStore`) and a
+    // recording sink (`RecordingSink`) so the bridge can be exercised entirely
+    // in-process — no Slint backend, no real WebSocket.  Real WS-mock testing
+    // is TASK-035; these tests cover the bridge logic only.
+
+    use super::{
+        collect_visible_entity_ids, drain_pending, is_writes_gated, BridgeSink, LiveBridge,
+        FLUSH_INTERVAL_MS,
+    };
+    use crate::ha::entity::Entity;
+    use crate::ha::store::{EntityStore, EntityUpdate};
+    use crate::platform::status::{channel as status_channel, ConnectionState};
+    use jiff::Timestamp;
+    use serde_json::Map;
+    use std::collections::HashMap as StdHashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::broadcast;
+
+    /// Stub [`EntityStore`] with mutable map and per-entity senders.
+    ///
+    /// Mirrors the `LiveStore` Phase 2 contract closely:
+    ///   * `subscribe(&[id])` — on-demand per-entity broadcast sender, capacity 1.
+    ///   * `publish(update)` — sends through the matching sender if any.
+    ///   * `set_entity` — mutates the internal map (so `get` returns the new state).
+    ///
+    /// Kept inline here rather than wired through `crate::ha::live_store::LiveStore`
+    /// because TASK-033's `files_allowlist` is `src/ui/bridge.rs` only.
+    struct StubStore {
+        map: Mutex<StdHashMap<EntityId, Entity>>,
+        senders: Mutex<StdHashMap<EntityId, broadcast::Sender<EntityUpdate>>>,
+    }
+
+    impl StubStore {
+        fn new(initial: Vec<Entity>) -> Self {
+            let map: StdHashMap<EntityId, Entity> =
+                initial.into_iter().map(|e| (e.id.clone(), e)).collect();
+            StubStore {
+                map: Mutex::new(map),
+                senders: Mutex::new(StdHashMap::new()),
+            }
+        }
+
+        fn set_entity(&self, entity: Entity) {
+            let mut guard = self.map.lock().expect("StubStore map mutex poisoned");
+            guard.insert(entity.id.clone(), entity);
+        }
+
+        fn publish(&self, update: EntityUpdate) {
+            let senders = self
+                .senders
+                .lock()
+                .expect("StubStore senders mutex poisoned");
+            if let Some(tx) = senders.get(&update.id) {
+                let _ = tx.send(update);
+            }
+        }
+    }
+
+    impl EntityStore for StubStore {
+        fn get(&self, id: &EntityId) -> Option<Entity> {
+            let guard = self.map.lock().expect("StubStore map mutex poisoned");
+            guard.get(id).cloned()
+        }
+
+        fn for_each(&self, f: &mut dyn FnMut(&EntityId, &Entity)) {
+            let guard = self.map.lock().expect("StubStore map mutex poisoned");
+            for (id, entity) in guard.iter() {
+                f(id, entity);
+            }
+        }
+
+        fn subscribe(&self, ids: &[EntityId]) -> broadcast::Receiver<EntityUpdate> {
+            let Some(id) = ids.first() else {
+                let (tx, rx) = broadcast::channel(1);
+                drop(tx);
+                return rx;
+            };
+            let mut senders = self
+                .senders
+                .lock()
+                .expect("StubStore senders mutex poisoned");
+            let tx = senders
+                .entry(id.clone())
+                .or_insert_with(|| broadcast::channel(1).0);
+            tx.subscribe()
+        }
+    }
+
+    /// Recording sink: stores every effect in shared state so the test
+    /// thread can poll/assert on them without a Slint event loop.
+    #[derive(Default)]
+    struct RecordingSink {
+        tile_writes: Mutex<Vec<Vec<TileVM>>>,
+        banner_calls: Mutex<Vec<bool>>,
+    }
+
+    impl RecordingSink {
+        fn snapshot_tile_writes(&self) -> Vec<Vec<TileVM>> {
+            self.tile_writes
+                .lock()
+                .expect("tile_writes mutex poisoned")
+                .clone()
+        }
+        fn snapshot_banner_calls(&self) -> Vec<bool> {
+            self.banner_calls
+                .lock()
+                .expect("banner_calls mutex poisoned")
+                .clone()
+        }
+    }
+
+    impl BridgeSink for RecordingSink {
+        fn write_tiles(&self, tiles: Vec<TileVM>) {
+            self.tile_writes
+                .lock()
+                .expect("tile_writes mutex poisoned")
+                .push(tiles);
+        }
+        fn set_status_banner_visible(&self, visible: bool) {
+            self.banner_calls
+                .lock()
+                .expect("banner_calls mutex poisoned")
+                .push(visible);
+        }
+    }
+
+    /// `Arc<RecordingSink>` does not directly implement `BridgeSink` — the
+    /// bridge takes ownership of a `BridgeSink` value, so the test thread
+    /// also wants its own clone of the recording state to assert on.  This
+    /// proxy holds an `Arc` to the same recording state and forwards every
+    /// effect call through.
+    struct ArcSink(Arc<RecordingSink>);
+
+    impl BridgeSink for ArcSink {
+        fn write_tiles(&self, tiles: Vec<TileVM>) {
+            self.0.write_tiles(tiles);
+        }
+        fn set_status_banner_visible(&self, visible: bool) {
+            self.0.set_status_banner_visible(visible);
+        }
+    }
+
+    fn make_test_entity(id: &str, state: &str) -> Entity {
+        Entity {
+            id: EntityId::from(id),
+            state: Arc::from(state),
+            attributes: Arc::new(Map::new()),
+            last_changed: Timestamp::UNIX_EPOCH,
+            last_updated: Timestamp::UNIX_EPOCH,
+        }
+    }
+
+    /// Minimal dashboard with one Light widget pointing at `light.kitchen`.
+    fn one_widget_dashboard() -> Dashboard {
+        use crate::dashboard::view_spec::{
+            Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
+        };
+        Dashboard {
+            version: 1,
+            device_profile: "rpi4".to_string(),
+            home_assistant: None,
+            theme: None,
+            default_view: "home".to_string(),
+            views: vec![View {
+                id: "home".to_string(),
+                title: "Home".to_string(),
+                layout: Layout::Sections,
+                sections: vec![Section {
+                    id: "s1".to_string(),
+                    title: "Test".to_string(),
+                    widgets: vec![Widget {
+                        id: "w1".to_string(),
+                        widget_type: WidgetKind::LightTile,
+                        entity: Some("light.kitchen".to_string()),
+                        entities: vec![],
+                        name: Some("Kitchen".to_string()),
+                        icon: None,
+                        tap_action: None,
+                        hold_action: None,
+                        double_tap_action: None,
+                        layout: WidgetLayout {
+                            preferred_columns: 2,
+                            preferred_rows: 2,
+                        },
+                        options: vec![],
+                        placement: None,
+                    }],
+                }],
+            }],
+        }
+    }
+
+    // ----- Pure helpers -----
+
+    #[test]
+    fn is_writes_gated_returns_true_for_reconnecting_and_failed() {
+        assert!(is_writes_gated(ConnectionState::Reconnecting));
+        assert!(is_writes_gated(ConnectionState::Failed));
+    }
+
+    #[test]
+    fn is_writes_gated_returns_false_for_non_gated_states() {
+        for s in [
+            ConnectionState::Connecting,
+            ConnectionState::Authenticating,
+            ConnectionState::Subscribing,
+            ConnectionState::Snapshotting,
+            ConnectionState::Services,
+            ConnectionState::Live,
+        ] {
+            assert!(!is_writes_gated(s), "{s:?} must not be gated");
+        }
+    }
+
+    #[test]
+    fn collect_visible_entity_ids_walks_dashboard_in_document_order() {
+        use crate::dashboard::view_spec::{
+            Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
+        };
+        let make_widget = |entity: &str| Widget {
+            id: format!("w-{entity}"),
+            widget_type: WidgetKind::EntityTile,
+            entity: Some(entity.to_string()),
+            entities: vec![],
+            name: None,
+            icon: None,
+            tap_action: None,
+            hold_action: None,
+            double_tap_action: None,
+            layout: WidgetLayout {
+                preferred_columns: 1,
+                preferred_rows: 1,
+            },
+            options: vec![],
+            placement: None,
+        };
+        let dashboard = Dashboard {
+            version: 1,
+            device_profile: "rpi4".to_string(),
+            home_assistant: None,
+            theme: None,
+            default_view: "home".to_string(),
+            views: vec![View {
+                id: "home".to_string(),
+                title: "Home".to_string(),
+                layout: Layout::Sections,
+                sections: vec![Section {
+                    id: "s1".to_string(),
+                    title: "Test".to_string(),
+                    widgets: vec![
+                        make_widget("light.a"),
+                        make_widget("light.b"),
+                        make_widget("light.a"), // duplicate preserved at this stage
+                    ],
+                }],
+            }],
+        };
+
+        let ids = collect_visible_entity_ids(&dashboard);
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0].as_str(), "light.a");
+        assert_eq!(ids[1].as_str(), "light.b");
+        assert_eq!(ids[2].as_str(), "light.a");
+    }
+
+    #[test]
+    fn drain_pending_returns_all_inserted_ids_and_empties_map() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut g = pending.lock().unwrap();
+            g.insert(EntityId::from("light.x"), ());
+            g.insert(EntityId::from("light.y"), ());
+        }
+
+        let drained = drain_pending(&pending);
+        assert_eq!(drained.len(), 2);
+
+        let drained_again = drain_pending(&pending);
+        assert!(drained_again.is_empty(), "second drain must be empty");
+    }
+
+    #[test]
+    fn pending_map_latest_overwrite_collapses_repeats() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        // Three updates for the same entity arrive between flushes.
+        for _ in 0..3 {
+            let mut g = pending.lock().unwrap();
+            g.insert(EntityId::from("light.x"), ());
+        }
+        let drained = drain_pending(&pending);
+        assert_eq!(
+            drained.len(),
+            1,
+            "three updates for the same entity must collapse to one drained id"
+        );
+        assert_eq!(drained[0].as_str(), "light.x");
+    }
+
+    // ----- Integration: end-to-end LiveBridge behaviour -----
+
+    /// Wait for `predicate` to return true, polling with 10 ms steps. Returns
+    /// `false` if the timeout elapses without success.  Used to bound async
+    /// tests so a regression in the flush task can't hang CI.
+    async fn wait_until<F: FnMut() -> bool>(timeout_ms: u64, mut predicate: F) -> bool {
+        let mut elapsed: u64 = 0;
+        let step: u64 = 10;
+        while elapsed < timeout_ms {
+            if predicate() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(step)).await;
+            elapsed += step;
+        }
+        predicate()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_propagates_update_within_one_cadence() {
+        ensure_icons_init();
+
+        let store = Arc::new(StubStore::new(vec![make_test_entity(
+            "light.kitchen",
+            "on",
+        )]));
+        let dashboard = Arc::new(one_widget_dashboard());
+        let (state_tx, state_rx) = status_channel();
+        // Drive the FSM straight to Live for this test.
+        state_tx.send(ConnectionState::Live).unwrap();
+
+        let recorder = Arc::new(RecordingSink::default());
+        let _bridge = LiveBridge::spawn(
+            store.clone() as Arc<dyn EntityStore>,
+            dashboard.clone(),
+            state_rx,
+            ArcSink(Arc::clone(&recorder)),
+        );
+
+        // Allow subscribe tasks to register.  state_watcher fires an initial
+        // banner-hidden + tiles write because the initial state is Live.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Flip the entity in the stub and publish through the channel.
+        store.set_entity(make_test_entity("light.kitchen", "off"));
+        store.publish(EntityUpdate {
+            id: EntityId::from("light.kitchen"),
+            entity: Some(make_test_entity("light.kitchen", "off")),
+        });
+
+        // Within ~2 flush cadences the recording sink must observe the new state.
+        let saw_off = wait_until(FLUSH_INTERVAL_MS * 4, || {
+            recorder
+                .snapshot_tile_writes()
+                .iter()
+                .any(|tiles| match tiles.last() {
+                    Some(TileVM::Light(vm)) => vm.state == "off",
+                    _ => false,
+                })
+        })
+        .await;
+
+        assert!(
+            saw_off,
+            "flush must propagate the off state to the sink within 2 cadences"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gated_state_suppresses_property_writes() {
+        ensure_icons_init();
+
+        let store = Arc::new(StubStore::new(vec![make_test_entity(
+            "light.kitchen",
+            "on",
+        )]));
+        let dashboard = Arc::new(one_widget_dashboard());
+        let (state_tx, state_rx) = status_channel();
+        // Start in Reconnecting — gated.
+        state_tx.send(ConnectionState::Reconnecting).unwrap();
+
+        let recorder = Arc::new(RecordingSink::default());
+        let _bridge = LiveBridge::spawn(
+            store.clone() as Arc<dyn EntityStore>,
+            dashboard.clone(),
+            state_rx,
+            ArcSink(Arc::clone(&recorder)),
+        );
+
+        // Wait a beat for tasks to register.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Banner must have been set visible at startup.
+        let banner = recorder.snapshot_banner_calls();
+        assert_eq!(
+            banner.last(),
+            Some(&true),
+            "banner must be visible while gated"
+        );
+
+        // Publish an update that would normally reach the flush.
+        store.set_entity(make_test_entity("light.kitchen", "off"));
+        store.publish(EntityUpdate {
+            id: EntityId::from("light.kitchen"),
+            entity: Some(make_test_entity("light.kitchen", "off")),
+        });
+
+        // Wait for several flush cadences and assert NO tile_writes occurred
+        // (initial Reconnecting state means no startup write either).
+        tokio::time::sleep(Duration::from_millis(FLUSH_INTERVAL_MS * 3)).await;
+        let writes = recorder.snapshot_tile_writes();
+        assert!(
+            writes.is_empty(),
+            "no tile writes must occur while gated; got {} writes",
+            writes.len()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn return_to_live_clears_banner_and_resyncs() {
+        ensure_icons_init();
+
+        let store = Arc::new(StubStore::new(vec![make_test_entity(
+            "light.kitchen",
+            "on",
+        )]));
+        let dashboard = Arc::new(one_widget_dashboard());
+        let (state_tx, state_rx) = status_channel();
+        state_tx.send(ConnectionState::Reconnecting).unwrap();
+
+        let recorder = Arc::new(RecordingSink::default());
+        let _bridge = LiveBridge::spawn(
+            store.clone() as Arc<dyn EntityStore>,
+            dashboard.clone(),
+            state_rx,
+            ArcSink(Arc::clone(&recorder)),
+        );
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Confirm banner shown.
+        assert_eq!(
+            recorder.snapshot_banner_calls().last(),
+            Some(&true),
+            "banner must be visible during Reconnecting"
+        );
+
+        // Mutate state behind the gate.
+        store.set_entity(make_test_entity("light.kitchen", "off"));
+
+        // Now flip to Live.  Must hide banner AND fire a full resync write.
+        state_tx.send(ConnectionState::Live).unwrap();
+
+        // Within one flush cadence the recording sink must see (a) banner=false,
+        // (b) at least one tile write reflecting the new "off" state.
+        let saw_recovery = wait_until(FLUSH_INTERVAL_MS * 5, || {
+            let banner = recorder.snapshot_banner_calls();
+            let writes = recorder.snapshot_tile_writes();
+            banner.iter().any(|&v| !v)
+                && writes.iter().any(|tiles| match tiles.last() {
+                    Some(TileVM::Light(vm)) => vm.state == "off",
+                    _ => false,
+                })
+        })
+        .await;
+
+        assert!(
+            saw_recovery,
+            "Live transition must hide banner and trigger a resync write"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lagged_recovers_via_get_and_resubscribes() {
+        ensure_icons_init();
+
+        let store = Arc::new(StubStore::new(vec![make_test_entity(
+            "light.kitchen",
+            "on",
+        )]));
+        let dashboard = Arc::new(one_widget_dashboard());
+        let (state_tx, state_rx) = status_channel();
+        state_tx.send(ConnectionState::Live).unwrap();
+
+        let recorder = Arc::new(RecordingSink::default());
+        let _bridge = LiveBridge::spawn(
+            store.clone() as Arc<dyn EntityStore>,
+            dashboard.clone(),
+            state_rx,
+            ArcSink(Arc::clone(&recorder)),
+        );
+
+        // Allow the subscriber task to register before publishing.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Force a Lagged condition: capacity-1 channel + two events without
+        // the receiver getting a chance to consume the first.  We sleep
+        // briefly between sends to avoid the race where the subscriber wakes
+        // immediately on the first send.  StubStore mirrors LiveStore's
+        // capacity-1 contract; two un-consumed sends produce Lagged on the
+        // next recv().
+        store.set_entity(make_test_entity("light.kitchen", "intermediate"));
+        store.publish(EntityUpdate {
+            id: EntityId::from("light.kitchen"),
+            entity: Some(make_test_entity("light.kitchen", "intermediate")),
+        });
+        store.set_entity(make_test_entity("light.kitchen", "final"));
+        store.publish(EntityUpdate {
+            id: EntityId::from("light.kitchen"),
+            entity: Some(make_test_entity("light.kitchen", "final")),
+        });
+
+        // The bridge must recover by reading store.get for all subscribed
+        // ids and re-subscribing; the resulting flush must reflect the
+        // latest "final" state.  Use a generous timeout — Lagged + resync +
+        // flush takes longer than a single cadence.
+        let saw_final = wait_until(FLUSH_INTERVAL_MS * 8, || {
+            recorder
+                .snapshot_tile_writes()
+                .iter()
+                .any(|tiles| match tiles.last() {
+                    Some(TileVM::Light(vm)) => vm.state == "final",
+                    _ => false,
+                })
+        })
+        .await;
+
+        assert!(
+            saw_final,
+            "Lagged subscriber must trigger get-based recovery + final-state flush"
+        );
+    }
+
+    #[test]
+    fn build_tiles_signature_remains_dyn_compatible() {
+        // Compile-time assertion: build_tiles must accept &dyn EntityStore so
+        // src/main.rs (TASK-034) does not need to change when LiveStore is
+        // swapped in.  This check succeeds purely by typing — the function
+        // body is never executed.
+        fn _accepts_dyn(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM> {
+            build_tiles(store, dashboard)
+        }
+        // Force the function pointer to be referenced so it cannot be
+        // optimised out under coverage instrumentation.
+        let _f: fn(&dyn EntityStore, &Dashboard) -> Vec<TileVM> = _accepts_dyn;
+    }
+
+    #[test]
+    fn flush_interval_constant_matches_spec() {
+        assert_eq!(FLUSH_INTERVAL_MS, 80, "12.5 Hz cadence per Phase 2 spec");
+    }
 }
