@@ -2098,20 +2098,34 @@ mod tests {
             client.live_event_count
         );
 
-        // Mirror the spec's "force disconnect" step.  on_disconnect clears the
-        // stability window but MUST NOT touch the backoff counter — without
-        // a successful stable-Live reset, the elevated counter must survive.
-        client.on_disconnect();
-
-        // Backoff state must be byte-for-byte unchanged from before the
-        // (failed) stability check.
+        // Backoff state must be unchanged BEFORE the disconnect step — this
+        // is the load-bearing assertion (closes the codex-review observation
+        // that b1 could pass vacuously if `on_disconnect` ever started
+        // resetting backoff itself).  The Live event handler invokes
+        // `check_and_maybe_reset_backoff`; with elapsed << threshold, that
+        // function must return false without mutating backoff state.
         assert_eq!(
             client.backoff.attempts, attempts_before,
-            "backoff.attempts must NOT change when events flow but elapsed < threshold"
+            "backoff.attempts must NOT change after a Live event when elapsed < threshold"
         );
         assert_eq!(
             client.backoff.current_window, window_before,
-            "backoff.current_window must NOT change when events flow but elapsed < threshold"
+            "backoff.current_window must NOT change after a Live event when elapsed < threshold"
+        );
+
+        // Mirror the spec's "force disconnect" step.  on_disconnect clears
+        // the stability window but MUST NOT touch the backoff counter; the
+        // pre-disconnect assertion above already proved the event-handler
+        // didn't reset, so any post-disconnect change here would be
+        // attributable to on_disconnect itself.
+        client.on_disconnect();
+        assert_eq!(
+            client.backoff.attempts, attempts_before,
+            "backoff.attempts must NOT change after on_disconnect either"
+        );
+        assert_eq!(
+            client.backoff.current_window, window_before,
+            "backoff.current_window must NOT change after on_disconnect either"
         );
     }
 
@@ -2237,17 +2251,28 @@ mod tests {
             "check_and_maybe_reset_backoff must NOT report a reset when no events have arrived"
         );
 
-        // Mirror the spec's "force disconnect" step.
-        client.on_disconnect();
-
-        // Backoff state must be byte-for-byte unchanged.
+        // Pre-disconnect: backoff must be unchanged after the
+        // check_and_maybe_reset_backoff call (this is the load-bearing
+        // assertion; closes the codex-review observation that b2 could pass
+        // vacuously if `on_disconnect` ever began resetting backoff itself).
         assert_eq!(
             client.backoff.attempts, attempts_before,
-            "backoff.attempts must NOT change when elapsed >= threshold but live_event_count == 0"
+            "backoff.attempts must NOT change after a no-event stability check when elapsed >= threshold"
         );
         assert_eq!(
             client.backoff.current_window, window_before,
-            "backoff.current_window must NOT change when elapsed >= threshold but live_event_count == 0"
+            "backoff.current_window must NOT change after a no-event stability check when elapsed >= threshold"
+        );
+
+        // Mirror the spec's "force disconnect" step.
+        client.on_disconnect();
+        assert_eq!(
+            client.backoff.attempts, attempts_before,
+            "backoff.attempts must NOT change after on_disconnect either"
+        );
+        assert_eq!(
+            client.backoff.current_window, window_before,
+            "backoff.current_window must NOT change after on_disconnect either"
         );
     }
 
