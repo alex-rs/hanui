@@ -305,7 +305,7 @@ pub fn default_dashboard() -> Dashboard {
                     Widget {
                         id: "living_room_entity".to_string(),
                         widget_type: WidgetKind::EntityTile,
-                        entity: Some("switch.living_room".to_string()),
+                        entity: Some("switch.outlet_1".to_string()),
                         entities: vec![],
                         name: Some("Living Room".to_string()),
                         icon: None,
