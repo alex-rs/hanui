@@ -490,6 +490,18 @@ impl WsClient {
     /// Phase 3's command dispatcher reads from this accessor before issuing a
     /// `call_service` frame so it can validate the service exists and surface
     /// schema-aware errors instead of letting HA reject the call.
+    ///
+    /// # Concurrency contract
+    ///
+    /// Read-only access via `&self`.  The registry is mutated exactly once
+    /// during the `Phase::Services → Live` transition inside the same
+    /// `WsClient::run` async fn that the dispatcher must call from.  Phase 3
+    /// MUST invoke `services()` from the same task that owns `WsClient` (i.e.
+    /// the reconnect-loop task in `lib.rs::run_ws_client`); concurrent
+    /// dispatch from a separate task would require wrapping the field in an
+    /// `Arc<RwLock<_>>` or `Arc<Mutex<_>>` first.  Documented here per the
+    /// opencode self-review on TASK-044 so the next consumer doesn't trip
+    /// over a silent data-race risk.
     pub fn services(&self) -> &ServiceRegistry {
         &self.services
     }
