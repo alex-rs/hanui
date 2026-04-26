@@ -714,7 +714,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // EntityTileVM field correctness (switch.living_room)
+    // EntityTileVM field correctness (switch.outlet_1 — present in fixture)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -734,16 +734,15 @@ mod tests {
             })
             .expect("expected at least one EntityTileVM");
 
-        // default_dashboard() has widget.name = Some("Living Room") for the entity tile.
+        // default_dashboard() has widget.name = Some("Living Room") for the entity tile;
+        // explicit widget name always takes precedence over the fixture friendly_name.
         assert_eq!(
             entity_vm.name, "Living Room",
             "explicit widget name takes precedence"
         );
-        // switch.living_room is not in the fixture → unavailable.
-        assert_eq!(
-            entity_vm.state, "unavailable",
-            "missing entity state must be 'unavailable'"
-        );
+        // switch.outlet_1 is present in the fixture with state "off".
+        assert_eq!(entity_vm.state, "off", "fixture entity state must be 'off'");
+        // EntityKind::from(&entity.id) for a switch returns Other → falls through to mdi:help-circle.
         assert_eq!(entity_vm.icon_id, "mdi:help-circle");
         assert_eq!(entity_vm.preferred_columns, 2);
         assert_eq!(entity_vm.preferred_rows, 1);
@@ -780,23 +779,56 @@ mod tests {
 
     #[test]
     fn missing_entity_produces_entity_tile_vm_with_unavailable() {
+        use crate::dashboard::view_spec::{
+            Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
+        };
+
         let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
-        let dashboard = default_dashboard();
+
+        // Build a dashboard that deliberately references an entity ID not present
+        // in the fixture, so we can assert the unavailable fallback independent of
+        // whatever default_dashboard() points at.
+        let dashboard = Dashboard {
+            version: 1,
+            device_profile: "rpi4".to_string(),
+            home_assistant: None,
+            theme: None,
+            default_view: "home".to_string(),
+            views: vec![View {
+                id: "home".to_string(),
+                title: "Home".to_string(),
+                layout: Layout::Sections,
+                sections: vec![Section {
+                    id: "s1".to_string(),
+                    title: "Test".to_string(),
+                    widgets: vec![Widget {
+                        id: "w1".to_string(),
+                        widget_type: WidgetKind::EntityTile,
+                        entity: Some("switch.does_not_exist_xyz".to_string()),
+                        entities: vec![],
+                        name: Some("Ghost Switch".to_string()),
+                        icon: None,
+                        tap_action: None,
+                        hold_action: None,
+                        double_tap_action: None,
+                        layout: WidgetLayout {
+                            preferred_columns: 2,
+                            preferred_rows: 1,
+                        },
+                        options: vec![],
+                        placement: None,
+                    }],
+                }],
+            }],
+        };
 
         let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1);
 
-        // switch.living_room is not in the fixture (which only has outlet_1).
-        // The EntityTile widget references switch.living_room → must be unavailable.
-        let entity_vm = tiles
-            .iter()
-            .find_map(|t| {
-                if let TileVM::Entity(vm) = t {
-                    Some(vm)
-                } else {
-                    None
-                }
-            })
-            .expect("must have an EntityTileVM");
+        let entity_vm = match &tiles[0] {
+            TileVM::Entity(vm) => vm,
+            other => panic!("expected EntityTileVM, got {:?}", other),
+        };
 
         assert_eq!(
             entity_vm.state, "unavailable",
