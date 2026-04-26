@@ -42,6 +42,11 @@ on:
   push:
     branches: [master, main]
   workflow_dispatch:
+  # Nightly at 02:00 UTC — runs sbc-cpu-smoke (and any future nightly-only jobs).
+  # PR jobs are filtered out via `if: github.event_name != 'schedule'`
+  # (the sbc-cpu-smoke job is the inverse: only runs on schedule/dispatch).
+  schedule:
+    - cron: '0 2 * * *'
 
 # Cancel in-flight runs for the same PR/branch on new push.
 concurrency:
@@ -363,3 +368,130 @@ jobs:
       - name: waiver-expiry check
         if: hashFiles('docs/waivers.yaml') != '' && hashFiles('ops/checks/waiver-expiry-check.sh') != ''
         run: bash ops/checks/waiver-expiry-check.sh
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job: sbc-cpu-smoke
+  #
+  # Nightly (and manual) aarch64 QEMU CPU smoke for the WS + LiveStore hot path.
+  # Gate: average CPU% during 60 s / 50 ev/s churn ≤ DEFAULT_PROFILE.cpu_smoke_budget_pct (30 %).
+  #
+  # NOT required on PR — run only on schedule or workflow_dispatch.
+  # The 60 s churn window plus QEMU startup adds ~75 s to the runner; placing
+  # this in the nightly budget keeps the PR wall-clock target (<5 min) intact.
+  #
+  # Blast-radius: nightly only. FP rate: <1% (budget is deliberately generous
+  # at 30%; flaps only on gross regressions or runner resource contention).
+  #
+  # Toolchain: same pinned 1.95.0 as PR jobs. The cross target
+  # (aarch64-unknown-linux-gnu) and QEMU user-static are installed fresh each
+  # run; no additional cache layer is required because these are apt packages.
+  # ────────────────────────────────────────────────────────────────────────────
+  sbc-cpu-smoke:
+    name: sbc-cpu-smoke (aarch64 QEMU)
+    runs-on: ubuntu-latest
+    # Run on nightly schedule and on manual dispatch; explicitly NOT on
+    # pull_request or push so this job is never a PR required check.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    env:
+      TZ: UTC
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Rust toolchain (pinned to match dev VM per TASK-002) ──────────────────
+      - name: setup Rust 1.95.0
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      # ── System libs for host build (Slint transitive deps) ───────────────────
+      # Required so `cargo build --target aarch64-unknown-linux-gnu` can link
+      # the host-side procedural macros and build scripts without errors.
+      # The cross-linker (gcc-aarch64-linux-gnu) also lives here.
+      - name: install cross-build system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            libc6-dev-arm64-cross \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-0 \
+            libxkbcommon-x11-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libxinerama-dev \
+            pkg-config \
+            cmake
+
+      # ── QEMU user-mode emulation ──────────────────────────────────────────────
+      # qemu-user-static provides qemu-aarch64-static: a statically-linked
+      # aarch64 user-mode emulator that runs aarch64 ELF binaries on x86_64.
+      # binfmt-support + qemu-user-static together register the binfmt_misc
+      # handler so the kernel automatically invokes qemu-aarch64-static for
+      # aarch64 ELF executables — `./aarch64-binary` just works without an
+      # explicit qemu invocation.
+      - name: install QEMU user-static + binfmt
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            qemu-user-static \
+            binfmt-support
+          # Confirm binfmt registration for aarch64.
+          update-binfmts --display qemu-aarch64 || true
+
+      # ── cargo cache ──────────────────────────────────────────────────────────
+      - name: cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-sbc-smoke
+
+      # ── Cross-build the sbc_smoke test binary ────────────────────────────────
+      # --no-default-features is NOT set — we want the full feature set because
+      # the smoke test exercises the real WsClient + LiveStore path, which
+      # depends on tokio-tungstenite with TLS and Slint with software renderer.
+      # The aarch64 linker is specified via CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER.
+      - name: cross-build sbc_smoke binary (aarch64)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          cargo build --target aarch64-unknown-linux-gnu --test sbc_smoke
+
+      # ── Locate the compiled test binary ──────────────────────────────────────
+      # The binary name contains a hash suffix (cargo's test binary naming).
+      # We find it by looking for executables whose name starts with "sbc_smoke-".
+      - name: locate sbc_smoke binary
+        id: find-binary
+        run: |
+          BIN=$(find target/aarch64-unknown-linux-gnu/debug -maxdepth 1 \
+                  -name 'sbc_smoke-*' -executable -type f | head -1)
+          if [ -z "$BIN" ]; then
+            echo "ERROR: could not find sbc_smoke test binary under \
+target/aarch64-unknown-linux-gnu/debug/"
+            exit 1
+          fi
+          echo "bin=$BIN" >> "$GITHUB_OUTPUT"
+
+      # ── Run sbc_smoke under QEMU ──────────────────────────────────────────────
+      # binfmt_misc handles the qemu-aarch64-static invocation automatically
+      # when binfmt-support is installed and updated (done above).  We pass
+      # the aarch64 sysroot so shared libs resolve correctly.
+      #
+      # Flags:
+      #   --test-threads 1  — prevent concurrent test runs from inflating CPU%.
+      #   --nocapture       — emit eprintln! measurements to the runner log.
+      #
+      # The 60 s churn window means this step takes ~75–90 s; that is well within
+      # the 20 min nightly budget.
+      - name: run sbc_smoke under QEMU (aarch64)
+        env:
+          TZ: UTC
+          QEMU_LD_PREFIX: /usr/aarch64-linux-gnu
+        run: |
+          "${{ steps.find-binary.outputs.bin }}" \
+            --test-threads 1 \
+            --nocapture \
+            sbc_cpu_smoke_50evs_60s_below_budget
