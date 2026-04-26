@@ -46,6 +46,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::ha::entity::{Entity, EntityId};
 use crate::ha::protocol::OutboundMsg;
+use crate::ha::services::{ServiceMeta, ServiceRegistry, ServiceRegistryHandle};
 use crate::ha::store::{EntityStore, EntityUpdate};
 
 // ---------------------------------------------------------------------------
@@ -79,10 +80,31 @@ pub struct LiveStore {
     /// client task.  Using `Option` avoids dead-code while reserving the field
     /// — Phase 3 will not need a struct reshape.
     pub command_tx: Option<mpsc::Sender<OutboundMsg>>,
+
+    /// Shared handle to the populated service registry (TASK-048).
+    ///
+    /// Constructed in `src/lib.rs::build_ws_client_with_store` and shared via
+    /// `Arc` clone with the [`WsClient`] that populates it during the
+    /// `Phase::Services → Live` transition.  Phase 3 dispatchers that hold an
+    /// `Arc<LiveStore>` call [`LiveStore::services_lookup`] to validate
+    /// `(domain, service)` pairs without touching the `WsClient`.
+    ///
+    /// The `Arc` is constructed once; `LiveStore` owns a clone and `WsClient`
+    /// owns a clone — the same backing `RwLock<ServiceRegistry>` is shared.
+    ///
+    /// [`WsClient`]: crate::ha::client::WsClient
+    pub services_handle: ServiceRegistryHandle,
 }
 
 impl LiveStore {
     /// Construct a new, empty `LiveStore`.
+    ///
+    /// Initialises `services_handle` with a fresh `ServiceRegistryHandle` via
+    /// [`ServiceRegistry::new_handle`].  When `LiveStore` is wired into
+    /// `WsClient` via `src/lib.rs::run_with_live_store`, the shared handle
+    /// from that callsite replaces this default via
+    /// [`LiveStore::with_services_handle`] so both ends point at the same
+    /// backing lock.
     ///
     /// The snapshot starts empty; call `apply_snapshot` after the initial
     /// `get_states` reply arrives.
@@ -91,7 +113,62 @@ impl LiveStore {
             snapshot: RwLock::new(Arc::new(HashMap::new())),
             senders: RwLock::new(HashMap::new()),
             command_tx: None,
+            services_handle: ServiceRegistry::new_handle(),
         }
+    }
+
+    /// Replace the default `services_handle` with a shared one.
+    ///
+    /// Builder companion to [`LiveStore::new`].  Production wiring in
+    /// `src/lib.rs::run_with_live_store` constructs the handle once and
+    /// clones it into both this `LiveStore` and the [`WsClient`] via
+    /// [`WsClient::with_registry`], so a single `Arc<RwLock<_>>` backs both
+    /// the WS-task writer and the read-side accessor.
+    ///
+    /// Returns `Self` so it composes with `Arc::new(...)` at the call site:
+    ///
+    /// ```ignore
+    /// let registry = ServiceRegistry::new_handle();
+    /// let store = Arc::new(LiveStore::new().with_services_handle(registry.clone()));
+    /// let client = WsClient::new(config, state_tx)
+    ///     .with_store(store.clone())
+    ///     .with_registry(registry);
+    /// ```
+    ///
+    /// [`WsClient`]: crate::ha::client::WsClient
+    /// [`WsClient::with_registry`]: crate::ha::client::WsClient::with_registry
+    pub fn with_services_handle(mut self, services_handle: ServiceRegistryHandle) -> Self {
+        self.services_handle = services_handle;
+        self
+    }
+
+    /// Return a clone of the shared `ServiceRegistryHandle`.
+    ///
+    /// The returned handle is an `Arc` clone — cheap and `Send + Sync`.
+    /// Phase 3 code that holds `Arc<LiveStore>` uses this to share the same
+    /// registry reference, or calls [`services_lookup`] directly.
+    ///
+    /// [`services_lookup`]: LiveStore::services_lookup
+    pub fn services_handle(&self) -> ServiceRegistryHandle {
+        Arc::clone(&self.services_handle)
+    }
+
+    /// Look up a `(domain, service)` pair in the shared registry.
+    ///
+    /// Acquires the registry read-lock, performs the lookup, clones the result
+    /// if found, then releases the lock.  Returns `None` if the domain or
+    /// service is not present, or if the registry has not yet been populated
+    /// (i.e. the FSM has not completed `Phase::Services → Live`).
+    ///
+    /// Callers in Phase 3 command dispatchers use this to validate a tap-action
+    /// target before issuing a `call_service` frame, without needing a handle to
+    /// the `WsClient`.
+    pub fn services_lookup(&self, domain: &str, service: &str) -> Option<ServiceMeta> {
+        let guard = self
+            .services_handle
+            .read()
+            .expect("ServiceRegistry RwLock poisoned");
+        guard.lookup(domain, service).cloned()
     }
 
     /// Replace the entire entity map atomically.

@@ -89,10 +89,19 @@ use crate::ha::protocol::{
     AuthPayload, EventVariant, GetServicesPayload, GetStatesPayload, InboundMsg, OutboundMsg,
     RawEntityState, SubscribeEventsPayload,
 };
-use crate::ha::services::ServiceRegistry;
+use crate::ha::services::{ServiceRegistry, ServiceRegistryHandle};
 use crate::ha::store::EntityUpdate;
 use crate::platform::config::Config;
 use crate::platform::status::ConnectionState;
+
+// Compile-time assertion: ServiceRegistryHandle is Send + Sync + Clone.
+// Arc<RwLock<_>> satisfies all three by construction; this is here to make the
+// import visibly used before the struct definition below and to surface any
+// regression immediately if ServiceRegistry ever gains a non-Send/Sync field.
+const _: fn() = || {
+    fn _assert<T: Send + Sync + Clone>() {}
+    _assert::<ServiceRegistryHandle>();
+};
 
 // ---------------------------------------------------------------------------
 // Backoff constants
@@ -442,21 +451,30 @@ pub struct WsClient {
     /// - routes every subsequent `state_changed` event into the store via
     ///   `store.apply_changed_event`.
     pub(crate) store: Option<Arc<dyn SnapshotApplier>>,
-    /// In-memory cache of HA service definitions, populated from a successful
-    /// `get_services` reply.
+    /// Shared, thread-safe handle to the service-definition registry.
     ///
-    /// BLOCKER 3 fix (TASK-044): codex's post-shipment audit found that
-    /// `ServiceRegistry::from_get_services_result` was never called from
-    /// production code, leaving the registry empty for Phase 3's dispatcher
-    /// to inherit.  The `Services → Live` transition now parses the reply
-    /// `result` map into this field; consumers reach it via
-    /// [`WsClient::services`].
+    /// BLOCKER 3 fix (TASK-044) populated this on the `Services → Live`
+    /// transition.  TASK-048 reshaped the field from an owned
+    /// `ServiceRegistry` into a `ServiceRegistryHandle`
+    /// (`Arc<RwLock<ServiceRegistry>>`) so the populated registry is
+    /// reachable from a task OTHER than the WS reconnect-loop task.
     ///
-    /// Defaults to an empty registry; remains empty if `get_services` fails
-    /// (the FSM still proceeds to `Live`, matching the pre-existing tolerance
-    /// contract — Phase 2 must not refuse to render just because the service
-    /// catalogue is unavailable).
-    pub(crate) services: ServiceRegistry,
+    /// Constructed in `src/lib.rs::run_with_live_store` and shared via `Arc`
+    /// clone with the [`LiveStore`] passed to [`WsClient::with_store`].  The
+    /// FSM's `Phase::Services` arm acquires the write-lock and bulk-replaces
+    /// the inner registry; Phase 3 dispatchers acquire the read-lock through
+    /// [`LiveStore::services_lookup`] (or directly via the handle returned
+    /// by [`WsClient::services_handle`]) to validate `(domain, service)`
+    /// pairs before issuing a `call_service` frame.
+    ///
+    /// Defaults to a fresh, empty registry; remains empty if `get_services`
+    /// fails (the FSM still proceeds to `Live`, matching the pre-existing
+    /// tolerance contract — Phase 2 must not refuse to render just because
+    /// the service catalogue is unavailable).
+    ///
+    /// [`LiveStore`]: crate::ha::live_store::LiveStore
+    /// [`LiveStore::services_lookup`]: crate::ha::live_store::LiveStore::services_lookup
+    pub(crate) services: ServiceRegistryHandle,
 }
 
 impl WsClient {
@@ -476,34 +494,31 @@ impl WsClient {
             live_event_count: 0,
             stable_live_threshold: STABLE_LIVE_DURATION,
             store: None,
-            services: ServiceRegistry::new(),
+            services: ServiceRegistry::new_handle(),
         }
     }
 
-    /// Read-only access to the populated service registry.
+    /// Return a clone of the shared [`ServiceRegistryHandle`].
     ///
-    /// Returns an empty registry until the FSM has reached `Phase::Live` with
-    /// a successful `get_services` reply.  After that the registry contains
-    /// every `(domain, service)` pair HA reported, and lookups via
-    /// [`ServiceRegistry::lookup`] return `Some` for known services.
+    /// The returned handle is an `Arc` clone — cheap and `Send + Sync`.  After
+    /// the FSM has completed `Phase::Services → Live`, callers can acquire a
+    /// read-lock and look up `(domain, service)` pairs:
     ///
-    /// Phase 3's command dispatcher reads from this accessor before issuing a
-    /// `call_service` frame so it can validate the service exists and surface
-    /// schema-aware errors instead of letting HA reject the call.
+    /// ```ignore
+    /// let handle = client.services_handle();
+    /// let guard = handle.read().unwrap();
+    /// let meta = guard.lookup("light", "turn_on");
+    /// ```
     ///
-    /// # Concurrency contract
+    /// Phase 3's command dispatcher should prefer
+    /// [`LiveStore::services_lookup`] (which already encapsulates the
+    /// read-lock) over reaching through `WsClient`; this accessor exists so
+    /// integration tests can assert the shared-Arc invariant via
+    /// `Arc::ptr_eq` between this handle and the one held by `LiveStore`.
     ///
-    /// Read-only access via `&self`.  The registry is mutated exactly once
-    /// during the `Phase::Services → Live` transition inside the same
-    /// `WsClient::run` async fn that the dispatcher must call from.  Phase 3
-    /// MUST invoke `services()` from the same task that owns `WsClient` (i.e.
-    /// the reconnect-loop task in `lib.rs::run_ws_client`); concurrent
-    /// dispatch from a separate task would require wrapping the field in an
-    /// `Arc<RwLock<_>>` or `Arc<Mutex<_>>` first.  Documented here per the
-    /// opencode self-review on TASK-044 so the next consumer doesn't trip
-    /// over a silent data-race risk.
-    pub fn services(&self) -> &ServiceRegistry {
-        &self.services
+    /// [`LiveStore::services_lookup`]: crate::ha::live_store::LiveStore::services_lookup
+    pub fn services_handle(&self) -> ServiceRegistryHandle {
+        Arc::clone(&self.services)
     }
 
     /// Attach a [`SnapshotApplier`] sink so the FSM persists `get_states`
@@ -514,6 +529,23 @@ impl WsClient {
     /// (TASK-034) wires a `LiveStore` here; protocol-only tests omit it.
     pub fn with_store(mut self, store: Arc<dyn SnapshotApplier>) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// Attach a shared [`ServiceRegistryHandle`] so the FSM populates the
+    /// same registry the [`LiveStore`] (and Phase 3 dispatchers) read from.
+    ///
+    /// Without this call the client owns a private handle constructed in
+    /// `WsClient::new`; the registry is still populated by the
+    /// `Services → Live` transition but no other task can observe the result.
+    /// Production wiring in `src/lib.rs::run_with_live_store` constructs the
+    /// handle once, clones it into both the [`LiveStore`] and the
+    /// [`WsClient`] via this builder, so a single `Arc<RwLock<_>>` backs both
+    /// endpoints.
+    ///
+    /// [`LiveStore`]: crate::ha::live_store::LiveStore
+    pub fn with_registry(mut self, services: ServiceRegistryHandle) -> Self {
+        self.services = services;
         self
     }
 
@@ -958,7 +990,21 @@ impl WsClient {
                                     id = get_services_id,
                                     "get_services reply received; ServiceRegistry populated"
                                 );
-                                self.services = registry;
+                                // Acquire the registry write-lock and bulk-replace
+                                // the inner `ServiceRegistry`.  The lock is held
+                                // only for the duration of this single assignment
+                                // — readers in other tasks (e.g. the bridge / a
+                                // Phase 3 dispatcher) may briefly observe an empty
+                                // registry between handshake start and this point,
+                                // but never a torn registry.
+                                //
+                                // `expect` (not `unwrap`) so a poisoned lock
+                                // surfaces a clear panic message rather than the
+                                // generic "called Result::unwrap on Err".
+                                *self
+                                    .services
+                                    .write()
+                                    .expect("ServiceRegistry RwLock poisoned") = registry;
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -2885,9 +2931,15 @@ mod tests {
         };
         let (mut sink, _sent) = MockSink::new();
 
-        // Pre-condition: registry starts empty.
+        // Pre-condition: registry starts empty.  Acquire the read-lock through
+        // the shared handle to mirror the production read path.
         assert!(
-            client.services().lookup("light", "turn_on").is_none(),
+            client
+                .services
+                .read()
+                .expect("ServiceRegistry RwLock poisoned")
+                .lookup("light", "turn_on")
+                .is_none(),
             "registry must be empty before get_services reply"
         );
 
@@ -2967,32 +3019,35 @@ mod tests {
 
         // Post-condition: every (domain, service) the payload listed is
         // present, and an unknown lookup returns None (registry is bounded by
-        // the payload).
+        // the payload).  Hold a single read-lock for the batch so the test
+        // exercises the same lock-acquisition shape a Phase 3 dispatcher
+        // would use when checking multiple services in one frame.
+        let guard = client
+            .services
+            .read()
+            .expect("ServiceRegistry RwLock poisoned");
         assert!(
-            client.services().lookup("light", "turn_on").is_some(),
+            guard.lookup("light", "turn_on").is_some(),
             "ServiceRegistry must contain light.turn_on after get_services parse"
         );
         assert!(
-            client.services().lookup("light", "turn_off").is_some(),
+            guard.lookup("light", "turn_off").is_some(),
             "ServiceRegistry must contain light.turn_off"
         );
         assert!(
-            client.services().lookup("switch", "turn_on").is_some(),
+            guard.lookup("switch", "turn_on").is_some(),
             "ServiceRegistry must contain switch.turn_on"
         );
         assert!(
-            client.services().lookup("switch", "toggle").is_some(),
+            guard.lookup("switch", "toggle").is_some(),
             "ServiceRegistry must contain switch.toggle"
         );
         assert!(
-            client.services().lookup("nonexistent", "x").is_none(),
+            guard.lookup("nonexistent", "x").is_none(),
             "ServiceRegistry must return None for unknown (domain, service) pairs"
         );
         assert!(
-            client
-                .services()
-                .lookup("light", "unknown_service")
-                .is_none(),
+            guard.lookup("light", "unknown_service").is_none(),
             "ServiceRegistry must return None for unknown service in known domain"
         );
     }

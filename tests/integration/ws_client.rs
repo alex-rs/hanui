@@ -948,3 +948,129 @@ async fn scenario_run_with_live_store_routes_events_into_store() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// TASK-048: ServiceRegistry reachability across tasks.
+//
+// Codex's post-rescue audit (2026-04-27) flagged that `WsClient::services()`
+// was only callable from the same task that owned the `WsClient` —
+// specifically the WS reconnect-loop task spawned by `run_ws_client`.  No UI
+// or command path could observe the populated registry without holding a
+// `WsClient` handle, which the bridge does not get.
+//
+// The fix wraps the `ServiceRegistry` in an `Arc<RwLock<_>>` (the
+// `ServiceRegistryHandle` type alias) shared with the `LiveStore`, and
+// exposes a read accessor on `LiveStore` (`services_lookup`) so any task
+// holding `Arc<LiveStore>` (which the bridge does) can validate
+// `(domain, service)` pairs.
+//
+// This scenario proves the cross-task invariant: the WS task populates the
+// registry through the `Phase::Services → Live` write site, and the test
+// task — which is a *different* tokio task — observes the population via
+// `LiveStore::services_lookup`.  This is the proof that the lock is genuinely
+// shared (not just two Arcs to identical initial state).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn scenario_services_registry_visible_from_test_task_via_live_store() {
+    let server = MockWsServer::start().await;
+    server.script_auth_ok().await;
+    server.script_subscribe_ack().await;
+    // Empty get_states reply — this scenario is about the services registry,
+    // not entity snapshots; an empty entity list keeps the test focused.
+    server.script_get_states_reply("[]").await;
+    // 2-domain x 2-service get_services payload.  The payload mirrors
+    // ServiceRegistry::from_get_services_result's contract (verified by
+    // src/ha/services.rs unit tests).
+    server
+        .script_get_services_reply(
+            r#"{
+                "light":{
+                    "turn_on":{"name":"Turn on","fields":{}},
+                    "turn_off":{"name":"Turn off","fields":{}}
+                },
+                "switch":{
+                    "turn_on":{"name":"Switch on","fields":{}},
+                    "turn_off":{"name":"Switch off","fields":{}}
+                }
+            }"#,
+        )
+        .await;
+
+    // Construct the registry once and clone it into BOTH the LiveStore and
+    // the WsClient — replicating the production wiring in
+    // `src/lib.rs::run_with_live_store`.  Without this shared Arc the WS
+    // task's mutation would land in a private registry the test task could
+    // never see.
+    let services_handle = hanui::ha::services::ServiceRegistry::new_handle();
+    let store: Arc<LiveStore> =
+        Arc::new(LiveStore::new().with_services_handle(services_handle.clone()));
+    let store_for_ws: Arc<dyn hanui::ha::client::SnapshotApplier> = store.clone();
+
+    let config = make_config(&server.ws_url, "tok-task-048-cross-task");
+    let (state_tx, mut state_rx) = status::channel();
+    let mut client = WsClient::new(config, state_tx)
+        .with_store(store_for_ws)
+        .with_registry(services_handle.clone());
+
+    // Spawn the WS task.  This is a DIFFERENT tokio task from the test task;
+    // the lookup-from-test-task assertion below is what proves cross-task
+    // reachability.
+    let ws_task = tokio::spawn(async move { client.run().await });
+
+    assert!(
+        wait_for_state(&mut state_rx, ConnectionState::Live, Duration::from_secs(5)).await,
+        "client must reach Live before the populated services registry can be observed"
+    );
+
+    // Cross-task proof: the WS task above mutated the registry; this test
+    // task reads it via the LiveStore-side accessor.  If the registry weren't
+    // genuinely shared (e.g. if `with_registry` cloned the inner
+    // ServiceRegistry by value), this assertion would fail.
+    let light_turn_on = store.services_lookup("light", "turn_on");
+    assert!(
+        light_turn_on.is_some(),
+        "TASK-048 regression: WS task populated the registry but the test \
+         task could not observe `light.turn_on` via LiveStore::services_lookup; \
+         the shared `ServiceRegistryHandle` is not actually shared"
+    );
+    assert_eq!(
+        light_turn_on.expect("checked is_some above").name,
+        "Turn on",
+        "service metadata must round-trip through the cross-task shared registry"
+    );
+    assert!(
+        store.services_lookup("light", "turn_off").is_some(),
+        "all (domain, service) pairs from the get_services payload must be visible"
+    );
+    assert!(
+        store.services_lookup("switch", "turn_on").is_some(),
+        "switch domain entries must also be visible across tasks"
+    );
+    assert!(
+        store.services_lookup("switch", "turn_off").is_some(),
+        "all switch entries must round-trip"
+    );
+
+    // Negative co-assertion: the registry is bounded by the payload.  This
+    // protects against a regression where `services_lookup` returns Some for
+    // every input (e.g., a stub that always says "yes").
+    assert!(
+        store.services_lookup("nonexistent", "turn_on").is_none(),
+        "services_lookup must return None for domains not in the payload"
+    );
+    assert!(
+        store.services_lookup("light", "unknown_service").is_none(),
+        "services_lookup must return None for unknown services in known domains"
+    );
+
+    // Ptr-equality proof: the LiveStore's handle and the original handle we
+    // wired in are the same Arc (no copy, no rebuild).
+    assert!(
+        Arc::ptr_eq(&services_handle, &store.services_handle()),
+        "LiveStore must hold the same Arc we passed to with_services_handle; \
+         a divergent handle here would mean the WS-side write went elsewhere"
+    );
+
+    ws_task.abort();
+}

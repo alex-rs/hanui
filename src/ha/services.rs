@@ -28,10 +28,30 @@
 //! [`lookup`]: ServiceRegistry::lookup
 
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use thiserror::Error;
 
 use crate::ha::protocol::ParseError;
+
+// ---------------------------------------------------------------------------
+// ServiceRegistryHandle
+// ---------------------------------------------------------------------------
+
+/// Shared, thread-safe handle to a [`ServiceRegistry`].
+///
+/// Constructed once in `src/lib.rs::build_ws_client_with_store` (TASK-048),
+/// then cloned into both the [`WsClient`] (which writes via the `Services →
+/// Live` transition) and the [`LiveStore`] (which exposes a read accessor so
+/// Phase 3 dispatchers can validate `(domain, service)` pairs without holding a
+/// `WsClient` handle).
+///
+/// `Arc<RwLock<_>>` gives `Send + Sync + Clone` for free; see the compile-time
+/// assertion in [`ServiceRegistry`]'s test module.
+///
+/// [`WsClient`]: crate::ha::client::WsClient
+/// [`LiveStore`]: crate::ha::live_store::LiveStore
+pub type ServiceRegistryHandle = Arc<RwLock<ServiceRegistry>>;
 
 // ---------------------------------------------------------------------------
 // ParseError re-export (services uses the same error type as protocol)
@@ -117,6 +137,16 @@ impl ServiceRegistry {
     /// Create a new, empty registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a new, empty registry wrapped in a [`ServiceRegistryHandle`].
+    ///
+    /// Convenience constructor used by `src/lib.rs::run_with_live_store` and by
+    /// the integration tests so callers don't need to import `Arc` and `RwLock`
+    /// just to wire a fresh, empty handle.  Preferred over inlining
+    /// `Arc::new(RwLock::new(ServiceRegistry::new()))` at every call site.
+    pub fn new_handle() -> ServiceRegistryHandle {
+        Arc::new(RwLock::new(Self::new()))
     }
 
     /// Parse a `get_services` result payload into a populated registry.
