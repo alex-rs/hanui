@@ -41,7 +41,7 @@ use tracing::info;
 
 use crate::dashboard::profiles::DEFAULT_PROFILE;
 use crate::dashboard::view_spec::default_dashboard;
-use crate::ha::client::{full_jitter, ClientError, WsClient};
+use crate::ha::client::{full_jitter, ClientError, SnapshotApplier, WsClient};
 use crate::ha::live_store::LiveStore;
 use crate::ha::store::EntityStore;
 use crate::platform::config::Config;
@@ -277,7 +277,16 @@ fn run_with_live_store(runtime: &tokio::runtime::Runtime) -> Result<()> {
     // Spawn the WS reconnect loop.  The handle is dropped on scope exit, but
     // tokio keeps the task alive until the runtime is dropped (after the Slint
     // event loop returns).  Ownership of `state_tx` moves into the task.
-    let ws_handle = runtime.spawn(run_ws_client(config, state_tx));
+    //
+    // BLOCKER 1 fix (TASK-044): the WS task is given an `Arc<dyn SnapshotApplier>`
+    // pointing at the same `LiveStore` instance the bridge reads from.  Without
+    // this wiring, `get_states` snapshots and `state_changed` events would be
+    // parsed by the FSM and then dropped — which is the production-path bug
+    // codex's post-shipment audit caught.  The store reference is shared (Arc),
+    // so the same backing snapshot is mutated by `WsClient` and read by
+    // `LiveBridge`.
+    let store_for_ws: Arc<dyn SnapshotApplier> = store.clone();
+    let ws_handle = runtime.spawn(run_ws_client(config, state_tx, store_for_ws));
 
     // Spawn the bridge.  The returned handle is held until window.run() exits;
     // dropping it aborts the bridge's tasks (per LiveBridge::Drop).  This is
@@ -311,11 +320,23 @@ fn run_with_live_store(runtime: &tokio::runtime::Runtime) -> Result<()> {
 /// loops on the WS read until an error; we still pattern-match it for
 /// totality (and to make the no-reconnect-on-clean-exit semantics explicit
 /// if `run`'s contract ever changes).
-async fn run_ws_client(config: Config, state_tx: tokio::sync::watch::Sender<ConnectionState>) {
+///
+/// # BLOCKER 1 (TASK-044)
+///
+/// Takes an `Arc<dyn SnapshotApplier>` (typically a [`LiveStore`]) and wires
+/// it into the [`WsClient`] via [`WsClient::with_store`].  Without this, the
+/// FSM parses snapshots and events but never persists them — the bug codex's
+/// post-shipment audit found.  The store ref is shared with [`LiveBridge`],
+/// so a single snapshot drives both the WS write side and the UI read side.
+async fn run_ws_client(
+    config: Config,
+    state_tx: tokio::sync::watch::Sender<ConnectionState>,
+    store: Arc<dyn SnapshotApplier>,
+) {
     use rand::rngs::SmallRng;
     use rand::SeedableRng;
 
-    let mut client = WsClient::new(config, state_tx);
+    let mut client = WsClient::new(config, state_tx).with_store(store);
     let mut rng = SmallRng::from_entropy();
 
     loop {
