@@ -47,6 +47,12 @@ export global Theme {
     out property <color> state-off: #5a6378; // theme-allow: state off (inactive but reachable)
     out property <color> state-unavailable: #3a3f4d; // theme-allow: state unavailable / unknown
 
+    // ── Colors: banner / system status ──────────────────────────────────────
+    // banner-bg: warning-attention background for the connection status banner
+    // (Reconnecting / Failed). Used by the inline `MainWindow` declaration in
+    // `src/ui/bridge.rs`. WCAG AA contrast against `text-primary`.
+    out property <color> banner-bg: #c45a00; // theme-allow: status banner background (Reconnecting/Failed) — saturated orange for attention
+
     // ── Radii ───────────────────────────────────────────────────────────────
     // Token scale, not a continuum. Tiles use radius-md; pills (badges) use
     // radius-pill. Modal sheets land on radius-lg in later phases.
