@@ -913,15 +913,6 @@ mod tests {
             }
         }
 
-        fn with_snapshot(entities: Vec<Entity>) -> Self {
-            let map: HashMap<EntityId, Entity> =
-                entities.into_iter().map(|e| (e.id.clone(), e)).collect();
-            MockStore {
-                snapshot: Mutex::new(Arc::new(map)),
-                events: Mutex::new(Vec::new()),
-            }
-        }
-
         fn recorded_events(&self) -> Vec<EntityUpdate> {
             self.events.lock().unwrap().clone()
         }
