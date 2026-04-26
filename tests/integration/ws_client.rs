@@ -1,8 +1,10 @@
 //! Phase 2 integration tests for `WsClient` against the canonical mock WS server.
 //!
-//! See `tests/integration/mock_ws.rs` for the harness; this file contains the
-//! TASK-035 scenario tests.  All tests run inside `cargo test`; no external
-//! HA instance is required.
+//! See `tests/common/mock_ws.rs` for the harness (the single canonical
+//! location post TASK-042; re-exposed inside this binary as `super::mock_ws`
+//! via the `#[path]` directive in `tests/integration/mod.rs`).  This file
+//! contains the TASK-035 scenario tests.  All tests run inside `cargo test`;
+//! no external HA instance is required.
 //!
 //! # Test isolation
 //!
