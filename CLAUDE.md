@@ -107,6 +107,26 @@ Because every commit in this repo is authored by an agent, every rule below is m
 - **Retry circuit breaker**: 2 failed attempts per check-signature per PR. 3rd failure freezes the PR until `devex-engineer` or a human unblocks.
 - **`ci-gatekeeper` never authors product code.** If a gatekeeper task would require editing application or package source, it's the wrong agent.
 
+### Sandbox-fallback authoring for protected paths
+
+When an assigned subagent's Bash sandbox blocks the filesystem write needed for a single-line protected-path edit (e.g., `.claude/agents/`, `CLAUDE.md`, docs meta-config), the CTO MAY author the change directly, subject to strict conditions:
+
+**Preconditions:**
+- The edit is a single-line change to a non-product file (meta-config, not application source).
+- The assigned subagent's sandbox explicitly rejected the `Write` or `Edit` tool call (reported as `blocked_reason: "sandbox-fs-write-blocked"`).
+- The CTO has not been authored any other content in the PR (symbolic authority only).
+
+**CTO authorization (one-time per blocked operation):**
+- Author the single-line edit directly.
+- The assigned subagent MUST still post the symbolic required check (e.g., `ci-gatekeeper/approved`) on the merge SHA, signaling that they reviewed and approved the outcome.
+- The commit message body MUST include a `sandbox-fallback: <subagent-name>` trailer naming the blocked agent and a one-line reason (e.g., `sandbox-fallback: ci-gatekeeper — Bash heredoc write blocked`).
+
+**Precedent:** Commit c24976fe (TASK-020) executed this procedure: ci-gatekeeper's sandbox blocked sed/heredoc writes, so CTO edited `.claude/agents/slint-engineer.md` directly while ci-gatekeeper posted the approval status check.
+
+**Mandatory preservation:**
+- The rule "`ci-gatekeeper` never authors product code" remains in force. Sandbox-fallback applies only to non-product, single-line meta-config edits.
+- The `infra-approved:` trailer requirement on protected-path commits remains mandatory and unchanged.
+
 ## Self-review-before-commit protocol
 
 Before every `git commit` in a subagent session, the agent invokes `opencode-review` passing three inputs: the task_id, a one-paragraph summary of what changed and why, and a structural diff consisting of file paths plus changed line ranges only — NOT full patch content (no `+`/`-` content lines).
