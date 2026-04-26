@@ -14,15 +14,25 @@
 #   6. serde_json::Value  — bans serde_json::Value anywhere under src/ui/**
 #   7. cargo test         — full unit + integration test suite (TZ=UTC, two-pass for
 #                           order-dependence detection)
+#   8. coverage ratchet   — per-file line coverage must not drop below coverage/baseline.json;
+#                           cargo-llvm-cov@0.8.5 generates coverage/current.json, then
+#                           ops/checks/coverage-ratchet.js enforces per-file pct >= baseline.
+#                           Ratchet regression tests run first so a broken ratchet script
+#                           does not silently pass.
+#                           Blast-radius: ~5% of PRs that reduce test coverage for changed
+#                           files. FP rate: <1% (floating-point epsilon handled by script).
 #
-# Budget: <5 min wall clock on a cold runner (Swatinem/rust-cache warms subsequent runs).
+# Budget: <5 min wall clock on a cold runner (Swatenim/rust-cache warms subsequent runs).
+# cargo-llvm-cov binary cached via taiki-e/install-action; adds ~30s on first run.
 # Toolchain: pinned to 1.95.0 to match the dev VM rustc (per TASK-002).
+# llvm-tools-preview component added to test job only (required by cargo-llvm-cov).
 #
 # Failure blast-radius:
 #   - fmt/clippy: estimated ~20% of PRs on first-pass (formatting drift). FP rate: 0%.
 #   - grep gates: ~5% of PRs when ui/slint files exist. FP rate: <1% (URL fragments in
 #     comments are the only known false-positive vector; Slint files rarely contain URLs).
 #   - cargo test: should be ~0% on green master. FP rate: 0% (deterministic).
+#   - coverage ratchet: ~5% of PRs that reduce per-file coverage. FP rate: <1%.
 
 name: ci
 
@@ -264,8 +274,11 @@ jobs:
       - uses: actions/checkout@v4
 
       # ── Rust toolchain (pinned) ───────────────────────────────────────────────
+      # llvm-tools-preview is required by cargo-llvm-cov to instrument binaries.
       - name: setup Rust 1.95.0
         uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: llvm-tools-preview
 
       # ── System libs required by Slint transitive deps ────────────────────────
       # Same package set as the lint job. Repeated here because the test job
@@ -305,6 +318,34 @@ jobs:
       # (tracked in nightly backlog).
       - name: cargo test (pass 2 — state-pollution detection)
         run: cargo test
+
+      # ── coverage ratchet ─────────────────────────────────────────────────────
+      # Enforces per-file line coverage >= coverage/baseline.json.
+      # Steps:
+      #   (1) install cargo-llvm-cov@0.8.5 — pinned to match the version used to
+      #       seed coverage/baseline.json (TASK-017). taiki-e/install-action caches
+      #       the binary between runs; avoids cold `cargo install` cost (~2 min).
+      #   (2) run coverage-ratchet regression tests — verifies the ratchet script
+      #       itself before trusting its output. A broken script silently passing
+      #       is more dangerous than a broken script failing loudly.
+      #   (3) generate coverage/current.json from the instrumented test run.
+      #   (4) invoke ops/checks/coverage-ratchet.js — fails if any baseline file's
+      #       current pct < baseline pct (with epsilon=0.05 for FP noise).
+      #       A file absent from current (deleted) does not fail the ratchet.
+
+      - name: install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.8.5
+
+      - name: coverage-ratchet regression tests
+        run: node ops/checks/__tests__/coverage-ratchet.test.js
+
+      - name: generate coverage report
+        run: cargo llvm-cov --json --output-path coverage/current.json
+
+      - name: coverage ratchet
+        run: node ops/checks/coverage-ratchet.js
 
       # ── waiver-expiry check ───────────────────────────────────────────────────
       # Runs after tests so the failure message is distinct from test failures.
