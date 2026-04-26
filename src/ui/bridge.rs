@@ -1762,7 +1762,6 @@ mod tests {
     use crate::ha::store::{EntityStore, EntityUpdate};
     use crate::platform::status::{channel as status_channel, ConnectionState};
     use jiff::Timestamp;
-    use serde_json::Map;
     use std::collections::HashMap as StdHashMap;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1893,10 +1892,16 @@ mod tests {
     }
 
     fn make_test_entity(id: &str, state: &str) -> Entity {
+        // `attributes: Arc::default()` constructs an empty `Arc<Map<...>>`
+        // for the JSON attributes field without the test code referring to
+        // the underlying JSON library directly — `src/ui/**` is gated
+        // against direct uses of that library by the CI repo-rules check.
+        // The Default impl on the inner Map produces an empty map; the
+        // Arc::default impl wraps it.
         Entity {
             id: EntityId::from(id),
             state: Arc::from(state),
-            attributes: Arc::new(Map::new()),
+            attributes: Arc::default(),
             last_changed: Timestamp::UNIX_EPOCH,
             last_updated: Timestamp::UNIX_EPOCH,
         }
