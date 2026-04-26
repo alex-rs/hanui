@@ -2413,4 +2413,275 @@ mod tests {
             "plaintext token must not appear in FSM trace output"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // BLOCKER 2 (TASK-044): auth_invalid received in Live → Failed, no reconnect.
+    //
+    // Codex's audit found that the FSM only handled `auth_invalid` in
+    // `Phase::Authenticating`.  If HA revokes the token while the connection is
+    // live, the FSM must transition to `Failed` with no reconnect attempt — same
+    // semantics as auth_invalid during Authenticating.  The complementary
+    // contract (auth_required mid-Live → Reconnecting) is asserted by the
+    // existing `test_mid_session_auth_required_triggers_reconnect`.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_auth_invalid_during_live_transitions_to_failed() {
+        let (mut client, state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-mid-live-revoked")
+        };
+        let (mut sink, _sent) = MockSink::new();
+
+        // Prime the backoff so we can verify it does NOT advance on auth_invalid
+        // (auth_invalid is terminal — the reconnect loop bails on it).
+        client.backoff.advance();
+        client.backoff.advance();
+        let attempts_before = client.backoff.attempts;
+        let window_before = client.backoff.current_window;
+
+        // Drive the FSM through the full handshake to Live so the test exercises
+        // the production code path, not a hand-constructed phase.
+        let phase = client
+            .handle_message(
+                inbound(r#"{"type":"auth_required","ha_version":"2024.4.0"}"#),
+                Phase::Authenticating,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let phase = client
+            .handle_message(
+                inbound(r#"{"type":"auth_ok","ha_version":"2024.4.0"}"#),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let subscribe_id = match &phase {
+            Phase::Subscribing { subscribe_id } => *subscribe_id,
+            other => panic!("expected Subscribing; got: {other:?}"),
+        };
+        let phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{subscribe_id},"success":true,"result":null}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let get_states_id = match &phase {
+            Phase::Snapshotting { get_states_id, .. } => *get_states_id,
+            other => panic!("expected Snapshotting; got: {other:?}"),
+        };
+        let phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{get_states_id},"success":true,"result":[]}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let get_services_id = match &phase {
+            Phase::Services { get_services_id } => *get_services_id,
+            other => panic!("expected Services; got: {other:?}"),
+        };
+        let phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{get_services_id},"success":true,"result":{{}}}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(phase, Phase::Live),
+            "test must reach Live before injecting auth_invalid; got: {phase:?}"
+        );
+        assert_eq!(*state_rx.borrow(), ConnectionState::Live);
+
+        // Inject auth_invalid in Live → Failed, no reconnect, plaintext message
+        // surfaced (token NOT echoed).
+        let result = client
+            .handle_message(
+                inbound(r#"{"type":"auth_invalid","message":"Token revoked"}"#),
+                phase,
+                &mut sink,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ClientError::AuthInvalid { .. })),
+            "auth_invalid in Live must yield ClientError::AuthInvalid; got: {result:?}"
+        );
+        assert_eq!(
+            *state_rx.borrow(),
+            ConnectionState::Failed,
+            "state must be Failed after mid-Live auth_invalid"
+        );
+
+        if let Err(ClientError::AuthInvalid { reason }) = result {
+            assert_eq!(reason, "Token revoked");
+            assert!(
+                !reason.contains("test-token-mid-live-revoked"),
+                "token plaintext must never appear in error reason; got: {reason}"
+            );
+        }
+
+        // Backoff state untouched — the AuthInvalid contract is "no reconnect".
+        // The reconnect loop in lib.rs bails out on this variant, so any
+        // changes here would be invisible side-effects; assert they don't
+        // happen so a future refactor can't quietly start advancing the
+        // counter on a terminal failure.
+        assert_eq!(
+            client.backoff.attempts, attempts_before,
+            "auth_invalid must not advance backoff (no reconnect)"
+        );
+        assert_eq!(
+            client.backoff.current_window, window_before,
+            "auth_invalid must not advance backoff window"
+        );
+
+        // stable_live_since must be cleared so a future client reuse does not
+        // inherit a Live timestamp from this dead session.
+        assert!(
+            client.stable_live_since.is_none(),
+            "auth_invalid must clear stable_live_since"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // BLOCKER 3 (TASK-044): get_services result populates ServiceRegistry.
+    //
+    // Codex's audit found the FSM logged the reply and discarded it.  This test
+    // drives the FSM through `Services` with a 2-domain × 2-service mock result
+    // and asserts the `services()` accessor returns Some(_) for known
+    // (domain, service) pairs and None for unknown ones.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_services_result_populates_registry() {
+        let (mut client, _state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-registry")
+        };
+        let (mut sink, _sent) = MockSink::new();
+
+        // Pre-condition: registry starts empty.
+        assert!(
+            client.services().lookup("light", "turn_on").is_none(),
+            "registry must be empty before get_services reply"
+        );
+
+        // Drive FSM auth → subscribe ACK → snapshot → Services.
+        let phase = client
+            .handle_message(
+                inbound(r#"{"type":"auth_required","ha_version":"2024.4.0"}"#),
+                Phase::Authenticating,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let phase = client
+            .handle_message(
+                inbound(r#"{"type":"auth_ok","ha_version":"2024.4.0"}"#),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let subscribe_id = match &phase {
+            Phase::Subscribing { subscribe_id } => *subscribe_id,
+            other => panic!("expected Subscribing; got: {other:?}"),
+        };
+        let phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{subscribe_id},"success":true,"result":null}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let get_states_id = match &phase {
+            Phase::Snapshotting { get_states_id, .. } => *get_states_id,
+            other => panic!("expected Snapshotting; got: {other:?}"),
+        };
+        let phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{get_states_id},"success":true,"result":[]}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let get_services_id = match &phase {
+            Phase::Services { get_services_id } => *get_services_id,
+            other => panic!("expected Services; got: {other:?}"),
+        };
+
+        // Deliver a 2-domain × 2-service result map.  The shape matches
+        // ServiceRegistry::from_get_services_result's contract (verified by
+        // src/ha/services.rs unit tests).
+        let services_payload = format!(
+            r#"{{"type":"result","id":{get_services_id},"success":true,"result":{{
+                "light":{{
+                    "turn_on":{{"name":"Turn on","fields":{{}}}},
+                    "turn_off":{{"name":"Turn off","fields":{{}}}}
+                }},
+                "switch":{{
+                    "turn_on":{{"name":"Turn on","fields":{{}}}},
+                    "toggle":{{"name":"Toggle","fields":{{}}}}
+                }}
+            }}}}"#
+        );
+        let phase = client
+            .handle_message(inbound(&services_payload), phase, &mut sink)
+            .await
+            .unwrap();
+        assert!(
+            matches!(phase, Phase::Live),
+            "FSM must reach Live after services reply; got: {phase:?}"
+        );
+
+        // Post-condition: every (domain, service) the payload listed is
+        // present, and an unknown lookup returns None (registry is bounded by
+        // the payload).
+        assert!(
+            client.services().lookup("light", "turn_on").is_some(),
+            "ServiceRegistry must contain light.turn_on after get_services parse"
+        );
+        assert!(
+            client.services().lookup("light", "turn_off").is_some(),
+            "ServiceRegistry must contain light.turn_off"
+        );
+        assert!(
+            client.services().lookup("switch", "turn_on").is_some(),
+            "ServiceRegistry must contain switch.turn_on"
+        );
+        assert!(
+            client.services().lookup("switch", "toggle").is_some(),
+            "ServiceRegistry must contain switch.toggle"
+        );
+        assert!(
+            client.services().lookup("nonexistent", "x").is_none(),
+            "ServiceRegistry must return None for unknown (domain, service) pairs"
+        );
+        assert!(
+            client
+                .services()
+                .lookup("light", "unknown_service")
+                .is_none(),
+            "ServiceRegistry must return None for unknown service in known domain"
+        );
+    }
 }
