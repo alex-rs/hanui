@@ -185,24 +185,50 @@ async fn scenario_subscribe_ack_before_snapshot_ordering() {
 
     let recorded = server.recorded_requests().await;
 
-    let sub_seq = recorded
+    let sub_frame = recorded
         .iter()
         .find(|r| r.kind == "subscribe_events")
-        .expect("subscribe_events must be recorded")
-        .seq;
-    let snap_seq = recorded
+        .expect("subscribe_events must be recorded");
+    let snap_frame = recorded
         .iter()
         .find(|r| r.kind == "get_states")
-        .expect("get_states must be recorded")
-        .seq;
+        .expect("get_states must be recorded");
 
-    // get_states arrives strictly AFTER subscribe_events at the mock — and
-    // because the mock sends the ACK only on receipt of subscribe_events,
-    // the client must have processed the ACK before sending get_states.
-    // This is the TASK-029 sequencing gate AC.
+    // (Coarser, original assertion — kept as a sanity check.)  get_states
+    // arrives strictly AFTER subscribe_events at the mock — and because the
+    // mock sends the ACK only on receipt of subscribe_events, the client
+    // must have processed the ACK before sending get_states.  This is the
+    // TASK-029 sequencing gate AC.
+    let sub_seq = sub_frame.seq;
+    let snap_seq = snap_frame.seq;
     assert!(
         snap_seq > sub_seq,
         "get_states (seq {snap_seq}) must arrive after subscribe_events (seq {sub_seq})"
+    );
+
+    // (Tighter, TASK-046 finding 6 assertion.)  Codex's audit observed that
+    // the seq-based check above would still pass if the client sent
+    // `get_states` optimistically before the ACK had physically left the
+    // mock, as long as the mock happened to record the two inbound frames
+    // in the canonical order.  The real invariant is: the FSM gates
+    // `get_states` on actual ACK arrival.
+    //
+    // The mock now records the wall-clock instant at which it finished
+    // sending the `subscribe_events` ACK reply (see
+    // `tests/common/mock_ws.rs::SharedState::subscribe_ack_sent_at`).
+    // Asserting `get_states_received_at > subscribe_ack_sent_at` proves
+    // the client could not have sent `get_states` before the ACK had
+    // left the mock — i.e. the ACK gate is real, not optimistic.
+    let ack_sent_at = server
+        .subscribe_ack_sent_at()
+        .await
+        .expect("mock must have recorded a subscribe_ack send by the time Live is reached");
+    assert!(
+        snap_frame.received_at > ack_sent_at,
+        "get_states received_at ({:?}) must be strictly AFTER subscribe_events ACK \
+         sent_at ({:?}); FSM ACK gate is not real",
+        snap_frame.received_at,
+        ack_sent_at,
     );
 }
 
