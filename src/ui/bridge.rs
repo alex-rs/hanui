@@ -365,13 +365,24 @@ pub mod slint_ui {
         // `main.rs`; the Phase 1 design is a stack of tiles, not the final
         // grid layout.
         //
+        // Phase 2 (TASK-033) adds:
+        //   * `status-banner-visible: bool` — toggled by the Rust bridge
+        //     when `ConnectionState` enters or leaves `Reconnecting`/`Failed`.
+        //     Defaults to `false`. While `true`, an overlay rectangle with
+        //     "Reconnecting…" text is drawn on top of the layout. The overlay
+        //     is plain Slint primitives (Rectangle + Text), not a new
+        //     component file — keeps the files_allowlist for TASK-033 to
+        //     `src/ui/bridge.rs` only.
+        //
         // Property naming uses kebab-case per Slint convention; the
         // generated Rust setters are `set_light_tiles`, `set_sensor_tiles`,
-        // `set_entity_tiles` (kebab → snake automatically).
+        // `set_entity_tiles`, `set_status_banner_visible` (kebab → snake
+        // automatically).
         export component MainWindow inherits Window {
             in property <[LightTileVM]> light-tiles;
             in property <[SensorTileVM]> sensor-tiles;
             in property <[EntityTileVM]> entity-tiles;
+            in property <bool> status-banner-visible: false;
 
             title: "hanui";
             background: Theme.background;
@@ -390,6 +401,29 @@ pub mod slint_ui {
                 }
                 for tile[i] in root.entity-tiles : EntityTile {
                     view-model: tile;
+                }
+            }
+
+            // Status banner overlay. Visibility is gated by the
+            // `status-banner-visible` property so the overlay disappears
+            // entirely when the connection is `Live`. Positioned at the top
+            // edge so it does not occlude tile content. Plain primitives
+            // only — no new Slint component file.
+            if root.status-banner-visible : Rectangle {
+                x: 0px;
+                y: 0px;
+                width: parent.width;
+                height: 32px;
+                background: #c45a00;
+
+                Text {
+                    text: "Reconnecting…";
+                    color: white;
+                    font-size: 14px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: parent.width;
+                    height: parent.height;
                 }
             }
         }
