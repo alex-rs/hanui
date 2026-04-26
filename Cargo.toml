@@ -28,6 +28,11 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 toml = "0.8"
 tracing-test = { version = "0.2", default-features = false }
 url = "2"
+# rand: used in src/ha/client.rs for exponential-backoff jitter (TASK-032).
+# rand 0.8 is already a transitive dep via tokio-tungstenite; pinning it here
+# makes the usage explicit and gives us access to SmallRng for seeded tests.
+# Phase 4: if SBC profiles need different backoff bounds, surface via DeviceProfile.
+rand = { version = "0.8", features = ["small_rng"] }
 # SVG rasterization for icon resolver (TASK-010).
 # These three crates are already pulled in transitively by slint; pinning them
 # as direct deps makes the version dependency explicit and keeps cargo from
