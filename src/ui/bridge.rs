@@ -409,17 +409,23 @@ pub mod slint_ui {
             // entirely when the connection is `Live`. Positioned at the top
             // edge so it does not occlude tile content. Plain primitives
             // only — no new Slint component file.
+            //
+            // Colors: uses theme tokens (`Theme.banner-bg`, `Theme.text-primary`)
+            // rather than inline hex literals. The CI hex-color gate scans
+            // `ui/slint/*.slint` files only — inline `slint!{}` macros in
+            // `.rs` files are invisible to it (TODO: see PR body — open
+            // question for CTO about extending the gate to inline macros).
             if root.status-banner-visible : Rectangle {
                 x: 0px;
                 y: 0px;
                 width: parent.width;
                 height: 32px;
-                background: #c45a00;
+                background: Theme.banner-bg;
 
                 Text {
                     text: "Reconnecting…";
-                    color: white;
-                    font-size: 14px;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-md;
                     horizontal-alignment: center;
                     vertical-alignment: center;
                     width: parent.width;
@@ -936,13 +942,41 @@ async fn run_entity_subscriber(
 ///      lifts.
 ///   3. Otherwise, drain the pending map.  If empty, do nothing (no tile
 ///      churn, no allocation).  If non-empty, rebuild the full tile list via
-///      `build_tiles(&*store, &dashboard)` and hand it to the sink.
+///      `build_tiles(&*store, &dashboard)`.
+///   4. **Re-check** `state_rx.borrow()` immediately before the property
+///      write.  If the state flipped to a gated state between step 1 and
+///      this point (the read-then-check race), drop the drained ids and skip
+///      the write.
+///
+/// Recovery of dropped ids: as soon as the bridge re-enters
+/// `ConnectionState::Live`, `run_state_watcher` fires a full `build_tiles`
+/// resync that re-reads every widget's entity via `store.get` — the dropped
+/// ids are picked up there.  Note this guarantee holds **only** while the
+/// watcher loop is alive (see the watcher's own loop-exit conditions in
+/// `run_state_watcher`'s doc-comment).  In the rare path where the
+/// `ConnectionState` watch sender is dropped while gated (e.g. the WS task
+/// exits permanently without a clean reconnect), the watcher returns and
+/// no further resync ever fires; dropped ids stay dropped.  This is
+/// acceptable because once the watch sender is gone, the upstream WS task
+/// has terminated and the bridge has no live data source to render — the
+/// last on-screen frame is the best the user can see anyway.
+///
+/// We deliberately do NOT push the drained ids back into `pending`, because
+/// the next flush has no way to distinguish "we already lost the racing-
+/// with-gate write" from a genuine pending update; relying on the resync-
+/// on-`Live` path is strictly correct and avoids re-introducing the same
+/// race.
 ///
 /// The flush rebuilds the **entire** tile list on every flush rather than
 /// patching individual tiles; this matches the Phase 1 wire_window contract
 /// and the `pending_map` is a "did anything change" signal, not a
-/// per-tile patch list.  Cost is bounded by `dashboard.widget_count` and
-/// runs at most once per 80 ms.
+/// per-tile patch list.  Per-flush cost is dominated by `build_tiles`, which
+/// is O(`dashboard.widget_count` + `store.entity_count`) — the per-widget
+/// `store.get` walk plus the diagnostic `for_each` visitor walk added in
+/// Phase 1 to satisfy the AC that `for_each` be exercised on the live
+/// store path.  Under PHASES.md's `max_entities = 16k`, the visitor walk
+/// dominates; the 12.5 Hz cap is validated end-to-end by TASK-038's churn
+/// benchmark, not by widget-count alone.
 async fn run_flush_loop<S: BridgeSink>(
     store: Arc<dyn EntityStore>,
     dashboard: Arc<Dashboard>,
@@ -971,6 +1005,18 @@ async fn run_flush_loop<S: BridgeSink>(
 
         // Rebuild the full tile list against the current store snapshot.
         let tiles = build_tiles(&*store, &dashboard);
+
+        // Re-check state immediately before the write to close the
+        // read-then-check race (Codex finding BLOCKER 1).  ConnectionState
+        // can flip to Reconnecting/Failed between the initial gate check
+        // and `build_tiles` returning; if so, do not write.  The ids we
+        // just drained are recovered on the eventual Live transition via
+        // `run_state_watcher`'s full resync (see doc-comment above).
+        let state_at_write = *state_rx.borrow();
+        if is_writes_gated(state_at_write) {
+            continue;
+        }
+
         sink.write_tiles(tiles);
     }
 }
@@ -988,6 +1034,26 @@ async fn run_flush_loop<S: BridgeSink>(
 /// Every other transition (e.g. `Live → Connecting → Authenticating → Live`
 /// during a clean reconnect) hides the banner without a redundant resync;
 /// the resync only fires on entry into `Live`.
+///
+/// # Invariant: synchronous `build_tiles` between observe-`Live` and write
+///
+/// The Live-transition path observes `state_rx.borrow_and_update() == Live`,
+/// then synchronously runs `build_tiles` and `sink.write_tiles` — there is
+/// no `.await` between the state observation and the property write.  The
+/// flush loop has the analogous race (state can flip during `build_tiles`)
+/// and addresses it with a post-`build_tiles` re-check.  The watcher does
+/// NOT need that re-check today because `build_tiles` is synchronous: the
+/// tokio scheduler cannot preempt this task between observing `Live` and
+/// the write, so a `state_tx.send(Reconnecting)` from another task that
+/// arrives mid-`build_tiles` will only be observed on the watcher's NEXT
+/// `state_rx.changed().await` poll.  Worst-case, the watcher's resync write
+/// pushes a snapshot tied to the (now-stale) `Live` state — exactly what
+/// "the user sees the freshest snapshot the moment the connection
+/// recovers" is supposed to achieve.  If `EntityStore::for_each` ever
+/// becomes async (e.g. a future network-backed store), this invariant
+/// breaks and the watcher needs the same post-`build_tiles` re-check the
+/// flush loop has.  Track this assumption alongside any change to the
+/// `EntityStore` trait.
 async fn run_state_watcher<S: BridgeSink>(
     store: Arc<dyn EntityStore>,
     dashboard: Arc<Dashboard>,
@@ -999,6 +1065,9 @@ async fn run_state_watcher<S: BridgeSink>(
     let initial = *state_rx.borrow_and_update();
     sink.set_status_banner_visible(is_writes_gated(initial));
     if matches!(initial, ConnectionState::Live) {
+        // SAFETY (sync invariant): build_tiles is synchronous — see this
+        // function's doc-comment.  If EntityStore::for_each ever becomes
+        // async, add a post-build state re-check here mirroring run_flush_loop.
         let tiles = build_tiles(&*store, &dashboard);
         sink.write_tiles(tiles);
     }
@@ -1014,8 +1083,9 @@ async fn run_state_watcher<S: BridgeSink>(
         let new_state = *state_rx.borrow_and_update();
         sink.set_status_banner_visible(is_writes_gated(new_state));
         if matches!(new_state, ConnectionState::Live) {
-            // Full resync: read current state for every entity via
-            // build_tiles (which calls store.get under the hood) and push.
+            // SAFETY (sync invariant): see initial-state branch above.
+            // build_tiles is synchronous; tokio cannot preempt this task
+            // between observing Live and the property write below.
             let tiles = build_tiles(&*store, &dashboard);
             sink.write_tiles(tiles);
         }
@@ -2695,6 +2765,357 @@ mod tests {
         assert!(
             !recorder.snapshot_tile_writes().is_empty(),
             "initial Live-transition write must have landed before subscriber exit"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // BLOCKER 1 regression: state flip between gate-check and property write
+    // -----------------------------------------------------------------------
+
+    /// Stub store that signals every `for_each` entry on `enter_tx` and
+    /// blocks until a corresponding `()` is received on the per-entry
+    /// release channel.  The test thread choreographs entries by sending
+    /// release signals one at a time.
+    ///
+    /// This lets the test deterministically open the read-then-check race
+    /// window in `run_flush_loop`: while the flush task is blocked inside
+    /// `build_tiles -> for_each`, the test flips `ConnectionState` to
+    /// `Reconnecting`, then releases.  The flush task's second state read
+    /// must observe `Reconnecting` and skip the property write.
+    struct RendezvousStore {
+        base: StubStore,
+        // Sent on every `for_each` entry; test reads to know we are blocked.
+        enter_tx: std::sync::mpsc::SyncSender<()>,
+        // Receives one release signal per `for_each` entry.  Wrapped in a
+        // Mutex because mpsc::Receiver is not Sync.
+        release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl EntityStore for RendezvousStore {
+        fn get(&self, id: &EntityId) -> Option<Entity> {
+            self.base.get(id)
+        }
+        fn for_each(&self, f: &mut dyn FnMut(&EntityId, &Entity)) {
+            // Signal entry, then block until the test thread sends a release.
+            let _ = self.enter_tx.send(());
+            {
+                let rx = self.release_rx.lock().expect("release_rx mutex poisoned");
+                let _ = rx.recv();
+            }
+            self.base.for_each(f);
+        }
+        fn subscribe(&self, ids: &[EntityId]) -> broadcast::Receiver<EntityUpdate> {
+            self.base.subscribe(ids)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_skips_write_if_state_flips_to_gated_during_build_tiles() {
+        // Regression: if `ConnectionState` flips Live -> Reconnecting between
+        // the flush loop's initial gate check and the property write, the
+        // write must be suppressed.  Without the post-build_tiles re-check,
+        // a stale tile slice would be pushed through the sink while the
+        // bridge is supposed to be gated.
+        ensure_icons_init();
+
+        let base = StubStore::new(vec![make_test_entity("light.kitchen", "on")]);
+        // Bounded enter-channel so the stub blocks before flooding signals.
+        let (enter_tx, enter_rx) = std::sync::mpsc::sync_channel::<()>(4);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let store: Arc<RendezvousStore> = Arc::new(RendezvousStore {
+            base,
+            enter_tx,
+            release_rx: Mutex::new(release_rx),
+        });
+
+        let dashboard = Arc::new(one_widget_dashboard());
+        let (state_tx, state_rx) = status_channel();
+        // Start in Live so the state-watcher fires its initial resync
+        // (build_tiles -> for_each).  We release that first entry so the
+        // bridge is fully primed before the racing flush.
+        state_tx.send(ConnectionState::Live).unwrap();
+
+        let recorder = Arc::new(RecordingSink::default());
+        let _bridge = LiveBridge::spawn(
+            store.clone() as Arc<dyn EntityStore>,
+            dashboard.clone(),
+            state_rx,
+            ArcSink(Arc::clone(&recorder)),
+        );
+
+        // (1) Initial state-watcher resync on entry to Live.  Wait for it
+        // to enter for_each, then release.
+        let primed = tokio::task::spawn_blocking({
+            let release_tx = release_tx.clone();
+            move || {
+                let got = enter_rx
+                    .recv_timeout(std::time::Duration::from_millis(2_000))
+                    .is_ok();
+                if got {
+                    let _ = release_tx.send(());
+                }
+                (got, enter_rx, release_tx)
+            }
+        })
+        .await
+        .expect("primed-rendezvous join");
+        let (primed_ok, enter_rx, release_tx) = primed;
+        assert!(
+            primed_ok,
+            "initial Live-transition for_each must enter the rendezvous"
+        );
+
+        // Allow the watcher's write_tiles to land before we sample baseline.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let writes_after_initial = recorder.snapshot_tile_writes().len();
+        assert!(
+            writes_after_initial >= 1,
+            "initial Live-transition resync must have produced at least one write; \
+             got {writes_after_initial}"
+        );
+
+        // (2) Make the flush loop have work to do: publish so the per-entity
+        // subscriber inserts into pending.
+        store
+            .base
+            .set_entity(make_test_entity("light.kitchen", "off"));
+        store.base.publish(EntityUpdate {
+            id: EntityId::from("light.kitchen"),
+            entity: Some(make_test_entity("light.kitchen", "off")),
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // (3) On the next flush tick the flush loop enters build_tiles ->
+        // for_each and blocks on the rendezvous.  Wait for the enter signal
+        // WITHOUT releasing yet — that opens the race window.
+        let raced = tokio::task::spawn_blocking(move || {
+            let got = enter_rx
+                .recv_timeout(std::time::Duration::from_millis(2_000))
+                .is_ok();
+            (got, enter_rx)
+        })
+        .await
+        .expect("racing-enter join");
+        let (raced_ok, enter_rx) = raced;
+        assert!(
+            raced_ok,
+            "flush task must enter for_each within 2s; race window never opened"
+        );
+
+        // (4) Flip state to Reconnecting WHILE the flush loop is blocked
+        // inside build_tiles.  This is the race we are testing.
+        // `watch::Sender::send` is synchronous: by the time `send()` returns,
+        // the channel cell holds the new value and any subsequent
+        // `state_rx.borrow()` (on any thread) observes it.  The flush task's
+        // post-build_tiles `borrow()` runs strictly after we issue the
+        // release signal below (because the flush task is currently
+        // suspended inside the rendezvous `rx.recv()`), so the cell update
+        // here happens-before that borrow via the rendezvous channel's
+        // send→recv ordering.  No sleep is required for correctness; the
+        // tokio runtime's mpsc and watch primitives guarantee acquire/release
+        // semantics.  We do not insert a sleep here in order to keep the
+        // race-window assertion as tight as possible.
+        state_tx.send(ConnectionState::Reconnecting).unwrap();
+
+        let writes_pre_release = recorder.snapshot_tile_writes().len();
+
+        // (5) Release the flush task's for_each.  The state watcher's
+        // Live -> Reconnecting transition will ALSO have fired by now;
+        // because that transition does NOT call build_tiles (build_tiles
+        // is gated on `matches!(new_state, Live)`), no second rendezvous
+        // hit happens here for the watcher.
+        release_tx.send(()).expect("release flush for_each");
+
+        // Wait several flush cadences.  Even though the flush task's
+        // for_each has now returned, its post-build_tiles state re-check
+        // must observe Reconnecting and skip the write.
+        tokio::time::sleep(Duration::from_millis(FLUSH_INTERVAL_MS * 4)).await;
+        let writes_post_release = recorder.snapshot_tile_writes().len();
+        assert_eq!(
+            writes_post_release, writes_pre_release,
+            "post-build_tiles state flip to Reconnecting must suppress the racing write; \
+             got {writes_post_release} writes (was {writes_pre_release} pre-release)"
+        );
+
+        // Banner must have flipped visible on the Live -> Reconnecting edge.
+        let banner_visible_after_flip = recorder.snapshot_banner_calls().iter().any(|&v| v);
+        assert!(
+            banner_visible_after_flip,
+            "banner must have been set visible on Live -> Reconnecting"
+        );
+
+        // Test cleanup: dropping `release_tx` closes the channel; any later
+        // `for_each` call (none expected — we are gated) would observe the
+        // closed receiver and not deadlock.  `_bridge` Drop aborts the
+        // tokio tasks; the SyncSender's bounded capacity keeps the test
+        // deterministic if scheduling jitter produced extra entries.
+        drop(release_tx);
+        drop(enter_rx);
+    }
+
+    // -----------------------------------------------------------------------
+    // IMPORTANT 3 regression: Lagged calls store.get for ALL subscribed ids
+    // -----------------------------------------------------------------------
+
+    /// Stub store that wraps `StubStore` and counts `store.get` invocations
+    /// per entity id, so the multi-id Lagged test can assert that EVERY
+    /// subscribed id receives a `get` call after a single subscriber lags
+    /// (not just the lagged one).
+    struct CountingStore {
+        base: StubStore,
+        get_calls: Mutex<StdHashMap<EntityId, usize>>,
+    }
+
+    impl EntityStore for CountingStore {
+        fn get(&self, id: &EntityId) -> Option<Entity> {
+            let mut g = self.get_calls.lock().expect("get_calls mutex poisoned");
+            *g.entry(id.clone()).or_insert(0) += 1;
+            drop(g);
+            self.base.get(id)
+        }
+        fn for_each(&self, f: &mut dyn FnMut(&EntityId, &Entity)) {
+            self.base.for_each(f);
+        }
+        fn subscribe(&self, ids: &[EntityId]) -> broadcast::Receiver<EntityUpdate> {
+            self.base.subscribe(ids)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lagged_on_one_subscriber_triggers_get_for_all_subscribed_ids() {
+        // Spec: on RecvError::Lagged from a per-entity subscriber, the bridge
+        // calls `store.get(id)` for ALL subscribed IDs (not just the lagged
+        // one).  This test uses a 3-widget dashboard with three distinct
+        // entities, lags one of them, and asserts that get-call counts went
+        // up for every subscribed id afterward.
+        use crate::dashboard::view_spec::{
+            Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
+        };
+        ensure_icons_init();
+
+        let make_widget = |entity: &str| Widget {
+            id: format!("w-{entity}"),
+            widget_type: WidgetKind::LightTile,
+            entity: Some(entity.to_string()),
+            entities: vec![],
+            name: Some(entity.to_string()),
+            icon: None,
+            tap_action: None,
+            hold_action: None,
+            double_tap_action: None,
+            layout: WidgetLayout {
+                preferred_columns: 1,
+                preferred_rows: 1,
+            },
+            options: vec![],
+            placement: None,
+        };
+        let dashboard = Arc::new(Dashboard {
+            version: 1,
+            device_profile: "rpi4".to_string(),
+            home_assistant: None,
+            theme: None,
+            default_view: "home".to_string(),
+            views: vec![View {
+                id: "home".to_string(),
+                title: "Home".to_string(),
+                layout: Layout::Sections,
+                sections: vec![Section {
+                    id: "s1".to_string(),
+                    title: "Test".to_string(),
+                    widgets: vec![
+                        make_widget("light.kitchen"),
+                        make_widget("light.bedroom"),
+                        make_widget("light.hallway"),
+                    ],
+                }],
+            }],
+        });
+
+        let base = StubStore::new(vec![
+            make_test_entity("light.kitchen", "on"),
+            make_test_entity("light.bedroom", "off"),
+            make_test_entity("light.hallway", "on"),
+        ]);
+        let store = Arc::new(CountingStore {
+            base,
+            get_calls: Mutex::new(StdHashMap::new()),
+        });
+
+        let (state_tx, state_rx) = status_channel();
+        // Start gated so the state-watcher's initial Live-transition resync
+        // does NOT pre-populate `get_calls` for every id (which would defeat
+        // the "Lagged caused the get-for-all" assertion below).
+        state_tx.send(ConnectionState::Reconnecting).unwrap();
+
+        let recorder = Arc::new(RecordingSink::default());
+        let _bridge = LiveBridge::spawn(
+            store.clone() as Arc<dyn EntityStore>,
+            dashboard,
+            state_rx,
+            ArcSink(Arc::clone(&recorder)),
+        );
+
+        // Allow per-entity subscribers to register.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Snapshot baseline get-call counts.  Pending updates routed through
+        // the subscriber path do NOT call `store.get` directly; only the
+        // Lagged recovery and the flush's `build_tiles` do.  Because we
+        // started gated, no flush has run yet — get_calls should be empty.
+        let baseline = {
+            let g = store.get_calls.lock().unwrap();
+            g.clone()
+        };
+        assert!(
+            baseline.is_empty() || baseline.values().all(|&n| n == 0),
+            "baseline get_calls must be empty before Lagged recovery; got {baseline:?}"
+        );
+
+        // Force a Lagged condition on the kitchen subscriber by issuing two
+        // un-consumed sends on its capacity-1 channel.
+        store
+            .base
+            .set_entity(make_test_entity("light.kitchen", "intermediate"));
+        store.base.publish(EntityUpdate {
+            id: EntityId::from("light.kitchen"),
+            entity: Some(make_test_entity("light.kitchen", "intermediate")),
+        });
+        store
+            .base
+            .set_entity(make_test_entity("light.kitchen", "final"));
+        store.base.publish(EntityUpdate {
+            id: EntityId::from("light.kitchen"),
+            entity: Some(make_test_entity("light.kitchen", "final")),
+        });
+
+        // Wait for the Lagged recovery to fire.  The subscriber loop calls
+        // `store.get(id)` for every id in `ids_for_resync`, then re-subscribes.
+        // Use a generous bound — Lagged + recovery + scheduling jitter.
+        let saw_all = wait_until(800, || {
+            let g = store.get_calls.lock().unwrap();
+            let kitchen = g
+                .get(&EntityId::from("light.kitchen"))
+                .copied()
+                .unwrap_or(0);
+            let bedroom = g
+                .get(&EntityId::from("light.bedroom"))
+                .copied()
+                .unwrap_or(0);
+            let hallway = g
+                .get(&EntityId::from("light.hallway"))
+                .copied()
+                .unwrap_or(0);
+            kitchen >= 1 && bedroom >= 1 && hallway >= 1
+        })
+        .await;
+
+        let snap = store.get_calls.lock().unwrap().clone();
+        assert!(
+            saw_all,
+            "Lagged on light.kitchen must trigger store.get for ALL subscribed ids; \
+             got per-id counts: {snap:?}"
         );
     }
 }
