@@ -41,6 +41,18 @@ name = "soak_tests"
 path = "tests/soak_tests.rs"
 required-features = []
 
+# SBC CPU smoke test binary — cross-compiled to aarch64 and run under QEMU.
+# Explicitly declared so Cargo does not try to auto-discover tests/smoke/mod.rs
+# alongside the existing tests/smoke.rs (TASK-016 Phase 1 smoke).
+# The test is NOT in the default `cargo test` run because it requires:
+#   (a) the aarch64-unknown-linux-gnu target, and
+#   (b) qemu-aarch64 for execution.
+# Nightly CI installs both and runs this binary explicitly (see
+# .github/workflows/ci.yml sbc-cpu-smoke job).
+[[test]]
+name = "sbc_smoke"
+path = "tests/smoke/mod.rs"
+
 [dependencies]
 slint = { version = "1.16.1", default-features = false, features = ["std", "compat-1-2", "renderer-software", "backend-winit-x11"] }
 serde = { version = "1", features = ["derive"] }
