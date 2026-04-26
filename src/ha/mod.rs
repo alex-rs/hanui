@@ -9,4 +9,5 @@ pub mod entity;
 pub mod fixture;
 pub mod live_store;
 pub mod protocol;
+pub mod services;
 pub mod store;
