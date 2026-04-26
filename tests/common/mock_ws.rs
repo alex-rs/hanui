@@ -1,27 +1,42 @@
-//! Canonical mock Home Assistant WebSocket server — shared common harness.
+//! Canonical mock Home Assistant WebSocket server — single shared harness.
 //!
-//! This module is the **superset** of `tests/integration/mock_ws.rs`, moved to
-//! `tests/common/` so that `tests/soak/` can reuse it without the soak binary
-//! depending on the integration test binary.
+//! This is the **single canonical** mock harness for every Phase 2 test binary
+//! (integration, soak, smoke) and the churn bench.  A second mock WS
+//! implementation is forbidden; tests MUST drive [`MockWsServer`] rather than
+//! rolling their own.
 //!
-//! The sole addition vs. the integration copy is
-//! [`MockWsServer::force_disconnect`], which triggers a graceful WS `Close`
-//! frame on the next loop tick and is used by TASK-039's burst scenario.
+//! # History
+//!
+//! TASK-035 introduced the original harness under `tests/integration/`.  TASK-039
+//! could not modify that path (it was in `must_not_touch`) and produced a
+//! near-identical fork under `tests/common/` with one extra method
+//! ([`MockWsServer::force_disconnect`]).  TASK-042 unified the two by promoting
+//! `tests/common/mock_ws.rs` to the single canonical location and merging in the
+//! frame-recording / auth-invalid / mid-session-auth features that were only in
+//! the integration copy.  The integration-tree copy was deleted in the same
+//! task.
 //!
 //! # Design
 //!
-//! - One [`MockWsServer`] binds to an ephemeral local port and accepts
-//!   successive client connections.  Each accepted connection runs in its own
-//!   Tokio task and consults the server's shared state for what to send next.
-//! - A FIFO `scripted_replies` queue holds frames the server will send in
-//!   response to client requests.
-//! - Tests can inject events mid-session via [`MockWsServer::inject_event`]
+//! - One [`MockWsServer`] binds to an ephemeral local port and accepts any
+//!   number of concurrent client connections.  Each accepted connection runs
+//!   in its own Tokio task and consults the server's shared state for what to
+//!   send next.
+//! - A FIFO `scripted_replies` queue holds frames the server will send in order
+//!   in response to client requests (e.g. `auth_required` upon connect, then
+//!   `auth_ok` after the client sends `auth`, etc.).
+//! - The server records every inbound frame (with arrival timestamp) into a
+//!   `recorded_frames` log so tests can assert message-receipt ordering — which
+//!   is critical for the "subscribe-ACK before snapshot" gate (TASK-029).
+//! - Tests can imperatively inject events mid-session via [`MockWsServer::inject_event`]
 //!   and force a connection drop via [`MockWsServer::force_disconnect`].
 //!
-//! # No new dependencies
+//! # No external new dependency required
 //!
-//! `tokio-tungstenite` is already a project dependency; `accept_async` is
-//! available with the existing feature set.
+//! `tokio-tungstenite` is already a project dependency; both `connect_async`
+//! (client side) and `accept_async` (server side) are available with the
+//! existing feature set.  `futures` is already a project dependency for its
+//! `SinkExt`/`StreamExt` traits.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -34,17 +49,41 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
 // ---------------------------------------------------------------------------
+// Recorded frame
+// ---------------------------------------------------------------------------
+
+/// A single inbound frame captured by the mock server.
+///
+/// `kind` is the value of the JSON `"type"` field (e.g. `"auth"`,
+/// `"subscribe_events"`, `"get_states"`); `body` is the raw text frame so tests
+/// can inspect ids and other fields.  `seq` is a monotonic counter assigned at
+/// receipt time, used by the subscribe-ACK ordering test to assert receipt
+/// order across two different message kinds.
+#[derive(Debug, Clone)]
+pub struct RecordedFrame {
+    pub seq: u64,
+    pub kind: String,
+    pub body: String,
+}
+
+// ---------------------------------------------------------------------------
 // Scripted reply
 // ---------------------------------------------------------------------------
 
 /// A frame the mock server will send to the client.
+///
+/// `Immediate` frames are sent unconditionally as soon as the client connects.
+/// `OnRequest` frames are sent in response to a specific inbound message kind
+/// (matched on the JSON `"type"` field) and copy the inbound `id` into the
+/// reply when `forward_id` is true (the standard HA `result` pattern).
 #[derive(Debug, Clone)]
 pub enum ScriptedReply {
     /// Send this raw text frame immediately on connect.
     Immediate(String),
     /// Wait for a request whose `"type"` matches `match_type`, then send the
     /// reply.  When `forward_id` is true the request's `"id"` is substituted
-    /// into the reply at the placeholder `{{ID}}`.
+    /// into the reply at the literal placeholder `{{ID}}` (HA result-correlation
+    /// pattern).
     OnRequest {
         match_type: String,
         body: String,
@@ -56,8 +95,17 @@ pub enum ScriptedReply {
 // Server-side shared state
 // ---------------------------------------------------------------------------
 
+/// Shared state accessed by the accept loop and by test code via
+/// [`MockWsServer`].  Wrapped in `Arc<Mutex<...>>` because tests may inject or
+/// inspect from a different task than the server loop.
 struct SharedState {
+    /// FIFO queue of scripted replies.  Drained as the server matches them
+    /// against incoming requests (or sends them immediately on connect).
     replies: Vec<ScriptedReply>,
+    /// Log of every inbound text frame received across all accepted connections.
+    recorded: Vec<RecordedFrame>,
+    /// Frames to inject mid-session (sent on the next connection's loop tick
+    /// after a delay).  Each entry is sent once and removed.
     injected: Vec<String>,
 }
 
@@ -65,6 +113,7 @@ impl SharedState {
     fn new() -> Self {
         SharedState {
             replies: Vec::new(),
+            recorded: Vec::new(),
             injected: Vec::new(),
         }
     }
@@ -76,9 +125,11 @@ impl SharedState {
 
 /// A scriptable mock Home Assistant WebSocket server.
 ///
-/// Construct via [`MockWsServer::start`].  Drop to shut down the accept loop.
+/// Construct via [`MockWsServer::start`] which binds an ephemeral port and
+/// returns the bound URL plus the handle.  Drop the handle to shut down the
+/// accept loop (the accept-task is aborted in `Drop`).
 pub struct MockWsServer {
-    /// URL clients should connect to (e.g. `ws://127.0.0.1:PORT/api/websocket`).
+    /// URL the client should connect to (e.g. `ws://127.0.0.1:54321/api/websocket`).
     pub ws_url: String,
     state: Arc<Mutex<SharedState>>,
     accept_task: JoinHandle<()>,
@@ -89,11 +140,16 @@ pub struct MockWsServer {
 
 impl MockWsServer {
     /// Bind to an ephemeral local port and start the accept loop.
+    ///
+    /// Returns once the listener is bound (so `ws_url` is valid for clients to
+    /// connect to immediately).
     pub async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("mock WS: bind ephemeral port");
-        let local_addr = listener.local_addr().expect("mock WS: local_addr");
+            .expect("mock WS server: bind ephemeral port");
+        let local_addr = listener
+            .local_addr()
+            .expect("mock WS server: read local_addr");
         let ws_url = format!("ws://{}/api/websocket", local_addr);
 
         let state = Arc::new(Mutex::new(SharedState::new()));
@@ -115,6 +171,9 @@ impl MockWsServer {
     }
 
     /// Append a scripted reply to the FIFO queue.
+    ///
+    /// Public helpers (`script_auth_ok`, `script_subscribe_ack`, etc.) wrap this
+    /// for the common HA flows.
     pub async fn push_reply(&self, reply: ScriptedReply) {
         self.state.lock().await.replies.push(reply);
     }
@@ -134,6 +193,21 @@ impl MockWsServer {
         .await;
     }
 
+    /// Script `auth_required` (immediate) followed by `auth_invalid` with
+    /// the given reason on receipt of `auth`.
+    pub async fn script_auth_invalid(&self, message: &str) {
+        self.push_reply(ScriptedReply::Immediate(
+            r#"{"type":"auth_required","ha_version":"2024.4.0"}"#.to_owned(),
+        ))
+        .await;
+        self.push_reply(ScriptedReply::OnRequest {
+            match_type: "auth".to_owned(),
+            body: format!(r#"{{"type":"auth_invalid","message":"{message}"}}"#),
+            forward_id: false,
+        })
+        .await;
+    }
+
     /// Script the `subscribe_events` ACK (`result { id, success: true }`).
     pub async fn script_subscribe_ack(&self) {
         self.push_reply(ScriptedReply::OnRequest {
@@ -145,6 +219,9 @@ impl MockWsServer {
     }
 
     /// Script a `get_states` reply with the given JSON entity array.
+    ///
+    /// `entities_json` is the literal JSON array string for the `result` field
+    /// (e.g. `r#"[{"entity_id":"light.x","state":"on", ...}]"#`).
     pub async fn script_get_states_reply(&self, entities_json: &str) {
         let body = format!(
             r#"{{"type":"result","id":{{{{ID}}}},"success":true,"result":{entities_json}}}"#
@@ -171,9 +248,31 @@ impl MockWsServer {
     }
 
     /// Inject a raw text frame to be sent to the connected client on the next
-    /// loop tick.
+    /// loop tick.  Used to fire `state_changed` events mid-session.
     pub async fn inject_event(&self, raw: String) {
         self.state.lock().await.injected.push(raw);
+    }
+
+    /// Inject a mid-session `auth_required` re-prompt.
+    pub async fn inject_auth_required(&self) {
+        self.inject_event(r#"{"type":"auth_required","ha_version":"2024.4.0"}"#.to_owned())
+            .await;
+    }
+
+    /// Snapshot of all recorded inbound frames in receipt order.
+    pub async fn recorded_requests(&self) -> Vec<RecordedFrame> {
+        self.state.lock().await.recorded.clone()
+    }
+
+    /// Count of recorded frames matching the given `"type"` value.
+    pub async fn recorded_request_count(&self, kind: &str) -> usize {
+        self.state
+            .lock()
+            .await
+            .recorded
+            .iter()
+            .filter(|r| r.kind == kind)
+            .count()
     }
 
     /// Force the currently-connected client to be disconnected by sending a
@@ -209,7 +308,7 @@ async fn run_accept_loop(
     loop {
         let (stream, _peer) = match listener.accept().await {
             Ok(p) => p,
-            Err(_) => return,
+            Err(_) => return, // listener closed (mock dropped)
         };
 
         let conn_state = Arc::clone(&state);
@@ -233,7 +332,7 @@ async fn run_connection(
     };
     let (mut write, mut read) = ws_stream.split();
 
-    // Drain and send all leading Immediate replies.
+    // Send all leading Immediate replies, draining them from the queue.
     loop {
         let body = {
             let mut s = state.lock().await;
@@ -260,7 +359,7 @@ async fn run_connection(
             return;
         }
 
-        // Drain injected events.
+        // Drain injected events (mid-session pushes).
         let injected = {
             let mut s = state.lock().await;
             std::mem::take(&mut s.injected)
@@ -275,8 +374,8 @@ async fn run_connection(
         let frame = match next {
             Ok(Some(Ok(m))) => m,
             Ok(Some(Err(_))) => return,
-            Ok(None) => return,
-            Err(_) => continue,
+            Ok(None) => return, // peer closed
+            Err(_) => continue, // timeout — loop again to check injected/disconnect
         };
 
         let text = match frame {
@@ -289,8 +388,7 @@ async fn run_connection(
             _ => continue,
         };
 
-        // Parse, record seq (discarded here — soak test doesn't need ordering
-        // assertions), and find a matching scripted reply.
+        // Parse the inbound frame.
         let parsed: serde_json::Value = match serde_json::from_str(&text) {
             Ok(v) => v,
             Err(_) => continue,
@@ -301,10 +399,19 @@ async fn run_connection(
             .unwrap_or("")
             .to_owned();
         let id = parsed.get("id").and_then(|v| v.as_u64());
-        // Advance the counter even though no caller reads it from this module,
-        // so the counter remains monotonically consistent if callers are added.
-        let _ = seq_counter.fetch_add(1, Ordering::Relaxed);
 
+        // Record the frame with a monotonically increasing seq number.
+        let seq = seq_counter.fetch_add(1, Ordering::Relaxed) as u64;
+        {
+            let mut s = state.lock().await;
+            s.recorded.push(RecordedFrame {
+                seq,
+                kind: kind.clone(),
+                body: text.clone(),
+            });
+        }
+
+        // Find matching scripted reply.
         let reply_body = {
             let mut s = state.lock().await;
             let mut found: Option<String> = None;
@@ -361,7 +468,8 @@ pub fn entity_state_json(
 
 /// Build a `state_changed` event frame for `inject_event`.
 ///
-/// `subscription_id` is the id of the `subscribe_events` request.
+/// `subscription_id` is the id of the `subscribe_events` request being
+/// answered (HA echoes this back in every event frame).
 pub fn state_changed_event_json(
     subscription_id: u32,
     entity_id: &str,
