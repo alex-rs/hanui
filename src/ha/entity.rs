@@ -114,6 +114,19 @@ pub struct Entity {
     pub last_updated: Timestamp,
 }
 
+impl Entity {
+    /// Returns the entity's `friendly_name` attribute, if present and a string.
+    ///
+    /// This is the canonical accessor for the HA `friendly_name` attribute.
+    /// It hides the raw `serde_json::Value` machinery behind a typed boundary
+    /// so callers in `src/ui/` never need to import or spell `serde_json`.
+    pub fn friendly_name(&self) -> Option<&str> {
+        self.attributes
+            .get("friendly_name")
+            .and_then(|v| v.as_str())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -197,5 +210,45 @@ mod tests {
             &entity.state as &Arc<str>,
             &cloned.state as &Arc<str>
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Entity::friendly_name accessor
+    // -----------------------------------------------------------------------
+
+    fn make_entity_with_attrs(attrs: Map<String, Value>) -> Entity {
+        Entity {
+            id: EntityId::from("light.test"),
+            state: Arc::from("on"),
+            attributes: Arc::new(attrs),
+            last_changed: Timestamp::UNIX_EPOCH,
+            last_updated: Timestamp::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn friendly_name_present_and_string_returns_some() {
+        let mut attrs = Map::new();
+        attrs.insert(
+            "friendly_name".to_string(),
+            Value::String("Kitchen Light".to_string()),
+        );
+        let entity = make_entity_with_attrs(attrs);
+        assert_eq!(entity.friendly_name(), Some("Kitchen Light"));
+    }
+
+    #[test]
+    fn friendly_name_missing_returns_none() {
+        let attrs = Map::new();
+        let entity = make_entity_with_attrs(attrs);
+        assert_eq!(entity.friendly_name(), None);
+    }
+
+    #[test]
+    fn friendly_name_non_string_value_returns_none() {
+        let mut attrs = Map::new();
+        attrs.insert("friendly_name".to_string(), Value::Number(42.into()));
+        let entity = make_entity_with_attrs(attrs);
+        assert_eq!(entity.friendly_name(), None);
     }
 }
