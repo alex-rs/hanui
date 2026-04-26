@@ -89,6 +89,7 @@ use crate::ha::protocol::{
     AuthPayload, EventVariant, GetServicesPayload, GetStatesPayload, InboundMsg, OutboundMsg,
     RawEntityState, SubscribeEventsPayload,
 };
+use crate::ha::services::ServiceRegistry;
 use crate::ha::store::EntityUpdate;
 use crate::platform::config::Config;
 use crate::platform::status::ConnectionState;
@@ -441,6 +442,21 @@ pub struct WsClient {
     /// - routes every subsequent `state_changed` event into the store via
     ///   `store.apply_changed_event`.
     pub(crate) store: Option<Arc<dyn SnapshotApplier>>,
+    /// In-memory cache of HA service definitions, populated from a successful
+    /// `get_services` reply.
+    ///
+    /// BLOCKER 3 fix (TASK-044): codex's post-shipment audit found that
+    /// `ServiceRegistry::from_get_services_result` was never called from
+    /// production code, leaving the registry empty for Phase 3's dispatcher
+    /// to inherit.  The `Services → Live` transition now parses the reply
+    /// `result` map into this field; consumers reach it via
+    /// [`WsClient::services`].
+    ///
+    /// Defaults to an empty registry; remains empty if `get_services` fails
+    /// (the FSM still proceeds to `Live`, matching the pre-existing tolerance
+    /// contract — Phase 2 must not refuse to render just because the service
+    /// catalogue is unavailable).
+    pub(crate) services: ServiceRegistry,
 }
 
 impl WsClient {
@@ -460,7 +476,22 @@ impl WsClient {
             live_event_count: 0,
             stable_live_threshold: STABLE_LIVE_DURATION,
             store: None,
+            services: ServiceRegistry::new(),
         }
+    }
+
+    /// Read-only access to the populated service registry.
+    ///
+    /// Returns an empty registry until the FSM has reached `Phase::Live` with
+    /// a successful `get_services` reply.  After that the registry contains
+    /// every `(domain, service)` pair HA reported, and lookups via
+    /// [`ServiceRegistry::lookup`] return `Some` for known services.
+    ///
+    /// Phase 3's command dispatcher reads from this accessor before issuing a
+    /// `call_service` frame so it can validate the service exists and surface
+    /// schema-aware errors instead of letting HA reject the call.
+    pub fn services(&self) -> &ServiceRegistry {
+        &self.services
     }
 
     /// Attach a [`SnapshotApplier`] sink so the FSM persists `get_states`
@@ -901,7 +932,39 @@ impl WsClient {
                 if result.id == get_services_id =>
             {
                 if result.success {
-                    tracing::info!(id = get_services_id, "get_services reply received");
+                    // BLOCKER 3 fix (TASK-044): parse the result map into a
+                    // ServiceRegistry instead of just logging the reply.  The
+                    // pre-fix code dropped the payload on the floor, leaving
+                    // Phase 3's dispatcher with an empty registry.  Parse
+                    // failures (malformed shape) are surfaced as a warn-log
+                    // and the registry is left empty — we still advance to
+                    // `Live` so a quirky HA build can't keep the UI offline.
+                    match result.result {
+                        Some(ref value) => match ServiceRegistry::from_get_services_result(value) {
+                            Ok(registry) => {
+                                tracing::info!(
+                                    id = get_services_id,
+                                    "get_services reply received; ServiceRegistry populated"
+                                );
+                                self.services = registry;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    id = get_services_id,
+                                    error = %e,
+                                    "get_services result did not parse as ServiceRegistry; \
+                                     proceeding to Live with empty registry"
+                                );
+                            }
+                        },
+                        None => {
+                            tracing::warn!(
+                                id = get_services_id,
+                                "get_services reply had no `result` field; \
+                                 proceeding to Live with empty registry"
+                            );
+                        }
+                    }
                 } else {
                     tracing::warn!(
                         id = get_services_id,
