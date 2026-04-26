@@ -4,8 +4,8 @@
     "enforcement": "ops/checks/coverage-ratchet.js",
     "tool": "cargo-llvm-cov",
     "tool_version": "cargo-llvm-cov 0.8.5",
-    "seeded_at": "2026-04-26T01:02:56Z",
-    "seeded_from": "a824d1e6a6c7b2f2fe7f5badbabbc73f2ad5bfaa"
+    "seeded_at": "2026-04-26T18:53:09Z",
+    "seeded_from": "291523d1d0d7aeba81ae58a874e5ffa0f4592ab8"
   },
   "files": {
     "src/assets/icons.rs": {
@@ -14,8 +14,8 @@
       "pct": 100
     },
     "src/dashboard/profiles.rs": {
-      "lines_total": 12,
-      "lines_covered": 12,
+      "lines_total": 16,
+      "lines_covered": 16,
       "pct": 100
     },
     "src/dashboard/view_spec.rs": {
@@ -23,9 +23,14 @@
       "lines_covered": 221,
       "pct": 99.5
     },
+    "src/ha/client.rs": {
+      "lines_total": 1308,
+      "lines_covered": 1195,
+      "pct": 91.4
+    },
     "src/ha/entity.rs": {
-      "lines_total": 80,
-      "lines_covered": 80,
+      "lines_total": 114,
+      "lines_covered": 114,
       "pct": 100
     },
     "src/ha/fixture.rs": {
@@ -33,25 +38,50 @@
       "lines_covered": 203,
       "pct": 96.7
     },
+    "src/ha/live_store.rs": {
+      "lines_total": 291,
+      "lines_covered": 280,
+      "pct": 96.2
+    },
+    "src/ha/protocol.rs": {
+      "lines_total": 319,
+      "lines_covered": 292,
+      "pct": 91.5
+    },
+    "src/ha/services.rs": {
+      "lines_total": 314,
+      "lines_covered": 311,
+      "pct": 99.0
+    },
     "src/ha/store.rs": {
-      "lines_total": 191,
-      "lines_covered": 183,
-      "pct": 95.8
+      "lines_total": 198,
+      "lines_covered": 190,
+      "pct": 96.0
     },
     "src/lib.rs": {
-      "lines_total": 52,
-      "lines_covered": 0,
-      "pct": 0
+      "lines_total": 286,
+      "lines_covered": 160,
+      "pct": 55.9
     },
     "src/main.rs": {
-      "lines_total": 3,
+      "lines_total": 6,
       "lines_covered": 0,
       "pct": 0
     },
+    "src/platform/config.rs": {
+      "lines_total": 97,
+      "lines_covered": 97,
+      "pct": 100
+    },
+    "src/platform/status.rs": {
+      "lines_total": 91,
+      "lines_covered": 91,
+      "pct": 100
+    },
     "src/ui/bridge.rs": {
-      "lines_total": 587,
-      "lines_covered": 562,
-      "pct": 95.7
+      "lines_total": 1662,
+      "lines_covered": 1618,
+      "pct": 97.4
     },
     "src/assets/mod.rs": {
       "lines_total": 0,
@@ -64,6 +94,11 @@
       "pct": 0.0
     },
     "src/ha/mod.rs": {
+      "lines_total": 0,
+      "lines_covered": 0,
+      "pct": 0.0
+    },
+    "src/platform/mod.rs": {
       "lines_total": 0,
       "lines_covered": 0,
       "pct": 0.0
