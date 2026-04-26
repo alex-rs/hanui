@@ -30,13 +30,6 @@
 //! unconditional: every widget in the dashboard config maps to exactly one
 //! tile in the output `Vec`.
 //!
-//! # CI gate
-//!
-//! The project enforces that no JSON-value type names appear in `src/ui/`.
-//! This file accesses attribute values only via the typed accessor family
-//! (`.as_str()`, `.as_f64()`, etc.) which are methods on the value type
-//! without naming the type itself.
-//!
 //! # Slint property wiring (TASK-015)
 //!
 //! Below the typed-VM layer, this file also defines:
@@ -237,9 +230,7 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
 
                         let name = widget.name.clone().unwrap_or_else(|| {
                             entity
-                                .attributes
-                                .get("friendly_name")
-                                .and_then(|v| v.as_str())
+                                .friendly_name()
                                 .unwrap_or(entity.id.as_ref())
                                 .to_string()
                         });
