@@ -15,15 +15,19 @@ path = "src/lib.rs"
 slint = { version = "1.16.1", default-features = false, features = ["std", "compat-1-2", "renderer-software", "backend-winit-x11"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 anyhow = "1"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-secrecy = { version = "0.8", features = ["alloc"] }
-tracing-test = { version = "0.2", default-features = false }
+futures = "0.3"
 jiff = "0.2"
+secrecy = { version = "0.8", features = ["alloc"] }
 smol_str = "0.3"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+toml = "0.8"
+tracing-test = { version = "0.2", default-features = false }
+url = "2"
 # SVG rasterization for icon resolver (TASK-010).
 # These three crates are already pulled in transitively by slint; pinning them
 # as direct deps makes the version dependency explicit and keeps cargo from
