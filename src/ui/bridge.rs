@@ -30,14 +30,17 @@
 //! unconditional: every widget in the dashboard config maps to exactly one
 //! tile in the output `Vec`.
 //!
-//! # Slint property wiring (TASK-015)
+//! # Slint property wiring (TASK-015 / TASK-043)
 //!
 //! Below the typed-VM layer, this file also defines:
 //!
-//!   * The top-level `MainWindow` Slint component (declared inline via
-//!     `slint::slint!{}` inside the [`slint_ui`] sub-module so the generated
-//!     names do not collide with the Rust VM structs that share names with
-//!     their Slint counterparts).
+//!   * The top-level `MainWindow` Slint component is declared in
+//!     `ui/slint/main_window.slint` and pulled in via `slint::include_modules!()`
+//!     inside the [`slint_ui`] sub-module so the generated names do not collide
+//!     with the Rust VM structs that share names with their Slint counterparts.
+//!     `build.rs` calls `slint_build::compile("ui/slint/main_window.slint")`
+//!     at build time, which transitively compiles `theme.slint`,
+//!     `card_base.slint`, and the three tile component files.
 //!   * [`wire_window`] — splits a `&[TileVM]` slice by variant, converts each
 //!     element into the Slint-generated VM struct (resolving `icon_id` via
 //!     [`crate::assets::icons::resolve`]), wraps each per-variant `Vec` in a
@@ -321,119 +324,23 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
 }
 
 // ---------------------------------------------------------------------------
-// Slint window definition (inline) and property wiring
+// Slint window definition and property wiring
 // ---------------------------------------------------------------------------
 //
-// The MainWindow component is defined inline via `slint::slint!{}` because the
-// `files_allowlist` for TASK-015 limits .slint authoring to the existing tile
-// files only (`ui/slint/{theme,card_base,light_tile,sensor_tile,entity_tile}.slint`).
-// Keeping the top-level window inline in `bridge.rs` also means TASK-016
-// (`main.rs` wiring) needs to know about a single Rust artefact, not a separate
-// `.slint` file.
+// The `MainWindow` component lives in `ui/slint/main_window.slint` (TASK-043).
+// `build.rs` invokes `slint_build::compile("ui/slint/main_window.slint")`,
+// which transitively compiles `theme.slint`, `card_base.slint`, and the three
+// tile component files. The macro below picks up the resulting Rust types.
 //
-// The macro is wrapped in a `slint_ui` sub-module to namespace the generated
-// types: the Slint compiler emits Rust types named `LightTileVM`, `SensorTileVM`,
-// `EntityTileVM`, `TilePlacement`, `SensorTilePlacement`, `EntityTilePlacement`
-// — names that collide 1:1 with the public Rust structs declared above. The
-// sub-module gives them a distinct path (`slint_ui::LightTileVM`) so callers of
-// the bridge see both: the typed Rust VMs (from TASK-014) and the Slint-typed
-// ones (from this task).
-//
-// Path note: with rustc >= 1.88, `slint::slint!{}` resolves `import` paths
-// relative to the source file containing the macro. From `src/ui/bridge.rs`
-// that is `../../ui/slint/...`.
+// Why the `slint_ui` sub-module: the Slint compiler emits Rust types named
+// `LightTileVM`, `SensorTileVM`, `EntityTileVM`, `TilePlacement`,
+// `SensorTilePlacement`, `EntityTilePlacement` — names that collide 1:1 with
+// the public Rust structs declared above. Wrapping `include_modules!()` in
+// a sub-module gives the Slint-generated types a distinct path
+// (`slint_ui::LightTileVM`) so callers of this bridge see both the typed Rust
+// VMs (from TASK-014) and the Slint-typed ones side-by-side.
 pub mod slint_ui {
-    slint::slint! {
-        import { Theme } from "../../ui/slint/theme.slint";
-        import { CardBase } from "../../ui/slint/card_base.slint";
-        import { LightTile, LightTileVM, TilePlacement } from "../../ui/slint/light_tile.slint";
-        import { SensorTile, SensorTileVM, SensorTilePlacement } from "../../ui/slint/sensor_tile.slint";
-        import { EntityTile, EntityTileVM, EntityTilePlacement } from "../../ui/slint/entity_tile.slint";
-
-        // Re-export `AnimationBudget` from this compilation root so the Slint
-        // compiler emits a public Rust handle for it. Without this re-export,
-        // the global is in-scope for binding expressions but not surfaced as
-        // a `pub struct AnimationBudget<'a>` on the generated API — the Rust
-        // bridge cannot then call `window.global::<AnimationBudget>()` to
-        // write `framerate-cap` and `max-simultaneous` from `DEFAULT_PROFILE`.
-        export { AnimationBudget } from "../../ui/slint/card_base.slint";
-
-        // MainWindow — the top-level Phase 1 window. It exposes three array
-        // properties (one per tile kind) that `wire_window` writes from the
-        // typed VM slices, and renders each tile in a vertical flow. The
-        // layout is intentionally minimal: TASK-016 wires this window into
-        // `main.rs`; the Phase 1 design is a stack of tiles, not the final
-        // grid layout.
-        //
-        // Phase 2 (TASK-033) adds:
-        //   * `status-banner-visible: bool` — toggled by the Rust bridge
-        //     when `ConnectionState` enters or leaves `Reconnecting`/`Failed`.
-        //     Defaults to `false`. While `true`, an overlay rectangle with
-        //     "Reconnecting…" text is drawn on top of the layout. The overlay
-        //     uses plain Slint primitives (Rectangle + Text), not a new
-        //     component file — keeps the files_allowlist for TASK-033 to
-        //     `src/ui/bridge.rs` only.
-        //
-        // Property naming uses kebab-case per Slint convention; the
-        // generated Rust setters are `set_light_tiles`, `set_sensor_tiles`,
-        // `set_entity_tiles`, `set_status_banner_visible` (kebab → snake
-        // automatically).
-        export component MainWindow inherits Window {
-            in property <[LightTileVM]> light-tiles;
-            in property <[SensorTileVM]> sensor-tiles;
-            in property <[EntityTileVM]> entity-tiles;
-            in property <bool> status-banner-visible: false;
-
-            title: "hanui";
-            background: Theme.background;
-            preferred-width: 480px;
-            preferred-height: 600px;
-
-            VerticalLayout {
-                padding: Theme.space-3;
-                spacing: Theme.space-2;
-
-                for tile[i] in root.light-tiles : LightTile {
-                    view-model: tile;
-                }
-                for tile[i] in root.sensor-tiles : SensorTile {
-                    view-model: tile;
-                }
-                for tile[i] in root.entity-tiles : EntityTile {
-                    view-model: tile;
-                }
-            }
-
-            // Status banner overlay. Visibility is gated by the
-            // `status-banner-visible` property so the overlay disappears
-            // entirely when the connection is `Live`. Positioned at the top
-            // edge so it does not occlude tile content. Plain primitives
-            // only — no new Slint component file.
-            //
-            // Colors: uses theme tokens (`Theme.banner-bg`, `Theme.text-primary`)
-            // rather than inline hex literals. The CI hex-color gate scans
-            // `ui/slint/*.slint` files only — inline `slint!{}` macros in
-            // `.rs` files are invisible to it (TODO: see PR body — open
-            // question for CTO about extending the gate to inline macros).
-            if root.status-banner-visible : Rectangle {
-                x: 0px;
-                y: 0px;
-                width: parent.width;
-                height: 32px;
-                background: Theme.banner-bg;
-
-                Text {
-                    text: "Reconnecting…";
-                    color: Theme.text-primary;
-                    font-size: Theme.font-md;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                    width: parent.width;
-                    height: parent.height;
-                }
-            }
-        }
-    }
+    slint::include_modules!();
 }
 
 pub use slint_ui::{AnimationBudget, MainWindow};
