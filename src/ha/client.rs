@@ -941,6 +941,34 @@ impl WsClient {
                 Ok(Phase::Live)
             }
 
+            // ── Mid-session auth_invalid (any non-Authenticating phase) ─────
+            //
+            // BLOCKER 2 fix (TASK-044): codex's post-shipment audit flagged that
+            // `auth_invalid` was only handled in `Phase::Authenticating`.  In any
+            // other phase the message would fall through to the catch-all skip
+            // arm at the bottom of this match and be silently ignored.  HA can
+            // emit `auth_invalid` mid-session if the access token is revoked
+            // while the connection is open; treating that as "no-op" left the
+            // FSM stuck in `Live` with a server that has already cut auth.
+            //
+            // Semantics: identical to the `Authenticating` branch — clear stable
+            // tracking, transition to `Failed`, return `ClientError::AuthInvalid`
+            // (which the reconnect loop in `lib.rs::run_ws_client` interprets as
+            // "do NOT reconnect").  The token plaintext is never logged; only
+            // the human-readable message returned by HA is surfaced.
+            //
+            // Distinct from mid-session `auth_required` (handled above for
+            // `Phase::Live`), which TASK-029 correctly treats as a transport
+            // disconnect → `Reconnecting`.
+            (_phase, InboundMsg::AuthInvalid(p)) => {
+                tracing::error!(
+                    "auth_invalid received mid-session; transitioning to Failed (no reconnect)"
+                );
+                self.on_disconnect();
+                self.set_state(ConnectionState::Failed);
+                Err(ClientError::AuthInvalid { reason: p.message })
+            }
+
             // ── Result correlation (any phase) ───────────────────────────────
             (phase, InboundMsg::Result(result)) => {
                 let id = result.id;
