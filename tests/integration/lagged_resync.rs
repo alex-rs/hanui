@@ -418,3 +418,255 @@ async fn scenario_lagged_resync_bridge_recovers_latest_state() {
     // demonstrates that the mock lifecycle is managed correctly.
     drop(server);
 }
+
+// ---------------------------------------------------------------------------
+// Multi-id scenario (TASK-046 finding 5)
+// ---------------------------------------------------------------------------
+
+/// Three-widget dashboard that references three distinct entity ids in document
+/// order.  The bridge subscribes per UNIQUE entity id, so this exercises the
+/// "Lagged on ONE subscriber → resync `store.get(id)` for ALL subscribed ids"
+/// contract documented in `src/ui/bridge.rs::run_entity_subscriber`.
+fn three_entity_dashboard(ids: [&str; 3]) -> Dashboard {
+    let widgets: Vec<Widget> = ids
+        .iter()
+        .enumerate()
+        .map(|(idx, id)| Widget {
+            id: format!("widget_{idx}"),
+            widget_type: WidgetKind::EntityTile,
+            entity: Some((*id).to_string()),
+            entities: vec![],
+            name: Some((*id).to_string()),
+            icon: None,
+            tap_action: Some(Action::Toggle),
+            hold_action: None,
+            double_tap_action: None,
+            layout: WidgetLayout {
+                preferred_columns: 2,
+                preferred_rows: 1,
+            },
+            options: vec![],
+            placement: None,
+        })
+        .collect();
+    Dashboard {
+        version: 1,
+        device_profile: "rpi4".to_string(),
+        home_assistant: None,
+        theme: None,
+        default_view: "home".to_string(),
+        views: vec![View {
+            id: "home".to_string(),
+            title: "Home".to_string(),
+            layout: Layout::Sections,
+            sections: vec![Section {
+                id: "test_section".to_string(),
+                title: "Test".to_string(),
+                widgets,
+            }],
+        }],
+    }
+}
+
+/// Multi-id Lagged-resync scenario.
+///
+/// Acceptance criteria (TASK-046 finding 5):
+/// 1. Dashboard references 3 distinct entity ids.
+/// 2. Lagged is triggered on ONE entity's subscriber (light.b) — two
+///    back-to-back `apply_event` calls overflow that channel's capacity-1
+///    queue before the subscriber consumes either.
+/// 3. After lag recovery, `store.get(id)` has been invoked AT LEAST ONCE for
+///    EACH of the three subscribed ids (light.a, light.b, light.c).
+///
+/// The CountingStore wraps `LiveStore` and counts every `get` call against the
+/// inner store.  Each subscriber task records its own re-`subscribe` call —
+/// the lagged subscriber re-subscribes for its own id and drives a single
+/// `store.get` per id across the whole subscriber-id set.
+#[tokio::test]
+async fn scenario_lagged_resync_multi_id_recovers_all_subscribed_ids() {
+    // Step 1: Mock server scripted to document this is part of the canonical
+    // Phase 2 integration suite (mirrors the single-id test above).
+    let server = MockWsServer::start().await;
+    server.script_auth_ok().await;
+    server.script_subscribe_ack().await;
+    let initial_states = format!(
+        "[{},{},{}]",
+        entity_state_json(
+            "light.a",
+            "off",
+            "2024-01-01T00:00:00+00:00",
+            "2024-01-01T00:00:00+00:00",
+        ),
+        entity_state_json(
+            "light.b",
+            "off",
+            "2024-01-01T00:00:00+00:00",
+            "2024-01-01T00:00:00+00:00",
+        ),
+        entity_state_json(
+            "light.c",
+            "off",
+            "2024-01-01T00:00:00+00:00",
+            "2024-01-01T00:00:00+00:00",
+        ),
+    );
+    server.script_get_states_reply(&initial_states).await;
+    server.script_get_services_reply("{}").await;
+
+    // Step 2: Seed the LiveStore with all three entities.
+    let live_store = Arc::new(LiveStore::new());
+    live_store.apply_event(make_update("light.a", "off"));
+    live_store.apply_event(make_update("light.b", "off"));
+    live_store.apply_event(make_update("light.c", "off"));
+
+    // Step 3: ConnectionState::Live so flush is not gated.
+    let (state_tx, state_rx) = status::channel();
+    state_tx
+        .send(ConnectionState::Live)
+        .expect("state_tx must be open");
+
+    // Step 4: Wrap the live store in the counting interceptor.  We track
+    // per-id `get` counts (not just an aggregate count) so we can prove
+    // that the lagged-resync path called `store.get` for EACH subscribed id.
+    let counting_store = Arc::new(MultiIdCountingStore::new(Arc::clone(&live_store)));
+    let per_id_get_counts = Arc::clone(&counting_store.per_id_get_counts);
+    let subscribe_count = Arc::clone(&counting_store.subscribe_count);
+
+    let dashboard = Arc::new(three_entity_dashboard(["light.a", "light.b", "light.c"]));
+    let sink = RecordingSink::new();
+    let _tiles_log = Arc::clone(&sink.tiles_log);
+
+    let _bridge = LiveBridge::spawn(
+        counting_store as Arc<dyn EntityStore>,
+        Arc::clone(&dashboard),
+        state_rx,
+        sink,
+    );
+
+    // Wait for all three subscriber tasks to call store.subscribe().
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if subscribe_count.load(Ordering::Relaxed) >= 3 {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "bridge did not subscribe for all 3 ids within 2 s; subscribe_count={}",
+                subscribe_count.load(Ordering::Relaxed),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let subscribe_count_after_initial = subscribe_count.load(Ordering::Relaxed);
+
+    // Snapshot the initial per-id get counts.  The bridge MAY have called
+    // `store.get` during the flush path before lag was triggered (e.g.
+    // initial render); we assert post-lag deltas, not absolute counts.
+    let initial_per_id_counts = snapshot_per_id_counts(&per_id_get_counts);
+
+    // Step 5: Force RecvError::Lagged on light.b's subscriber by overflowing
+    // ITS capacity-1 broadcast channel with two back-to-back synchronous
+    // `apply_event` calls.  light.a and light.c are not lagged (no events
+    // applied to them), but the bridge's resync contract calls `store.get`
+    // for ALL subscribed ids on lag.
+    live_store.apply_event(make_update("light.b", "on"));
+    live_store.apply_event(make_update("light.b", "on_v2"));
+
+    // Step 6 — AC: store.get(id) called AT LEAST ONCE for EACH subscribed id
+    // AFTER the lag was forced.  We compute the delta against the pre-lag
+    // snapshot so we don't conflate the lag-resync path with any prior calls.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let now = snapshot_per_id_counts(&per_id_get_counts);
+        let a_delta = now.0 - initial_per_id_counts.0;
+        let b_delta = now.1 - initial_per_id_counts.1;
+        let c_delta = now.2 - initial_per_id_counts.2;
+        if a_delta >= 1 && b_delta >= 1 && c_delta >= 1 {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "lag-resync did not call store.get for all 3 ids within 3 s; \
+                 deltas: a={a_delta} b={b_delta} c={c_delta}; \
+                 subscribe_count={} (initial={})",
+                subscribe_count.load(Ordering::Relaxed),
+                subscribe_count_after_initial,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The mock server context is no longer needed.
+    drop(server);
+}
+
+// ---------------------------------------------------------------------------
+// MultiIdCountingStore — per-id `get` interception
+// ---------------------------------------------------------------------------
+
+/// Counting wrapper that records `get` calls partitioned by entity id.
+///
+/// The single-id [`CountingStore`] above tracks an aggregate `get_count`,
+/// which is sufficient for the single-entity scenario but cannot prove the
+/// multi-id "lag → resync calls store.get for ALL subscribed ids" contract.
+/// This wrapper records per-id counts for the three ids the multi-id test
+/// uses (light.a, light.b, light.c); any other id increments a fall-through
+/// `other` bucket so a regression that calls `store.get` for an unexpected
+/// id does not silently pass.
+struct MultiIdCountingStore {
+    inner: Arc<LiveStore>,
+    per_id_get_counts: Arc<Mutex<PerIdGetCounts>>,
+    subscribe_count: Arc<AtomicUsize>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct PerIdGetCounts {
+    light_a: usize,
+    light_b: usize,
+    light_c: usize,
+    other: usize,
+}
+
+impl MultiIdCountingStore {
+    fn new(inner: Arc<LiveStore>) -> Self {
+        MultiIdCountingStore {
+            inner,
+            per_id_get_counts: Arc::new(Mutex::new(PerIdGetCounts::default())),
+            subscribe_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl EntityStore for MultiIdCountingStore {
+    fn get(&self, id: &EntityId) -> Option<Entity> {
+        {
+            let mut guard = self
+                .per_id_get_counts
+                .lock()
+                .expect("per_id_get_counts mutex poisoned");
+            match id.as_str() {
+                "light.a" => guard.light_a += 1,
+                "light.b" => guard.light_b += 1,
+                "light.c" => guard.light_c += 1,
+                _ => guard.other += 1,
+            }
+        }
+        self.inner.get(id)
+    }
+
+    fn for_each(&self, f: &mut dyn FnMut(&EntityId, &Entity)) {
+        self.inner.for_each(f);
+    }
+
+    fn subscribe(&self, ids: &[EntityId]) -> broadcast::Receiver<EntityUpdate> {
+        self.subscribe_count.fetch_add(1, Ordering::Relaxed);
+        self.inner.subscribe(ids)
+    }
+}
+
+/// Snapshot the per-id counts as a `(a, b, c)` tuple.  Held under the mutex
+/// for the duration of the read only; used by the test's polling loop.
+fn snapshot_per_id_counts(counts: &Arc<Mutex<PerIdGetCounts>>) -> (usize, usize, usize) {
+    let g = counts.lock().expect("per_id_get_counts mutex poisoned");
+    (g.light_a, g.light_b, g.light_c)
+}
