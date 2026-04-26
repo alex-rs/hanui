@@ -2,6 +2,10 @@
 name = "hanui"
 version = "0.1.0"
 edition = "2021"
+# Slint UI is compiled at build time from ui/slint/main_window.slint via
+# build.rs (slint-build); src/ui/bridge.rs picks up the generated Rust types
+# through `slint::include_modules!()` (TASK-043).
+build = "build.rs"
 
 [[bin]]
 name = "hanui"
@@ -82,3 +86,10 @@ rand = { version = "0.8", features = ["small_rng"] }
 resvg = "0.47"
 usvg = "0.47"
 tiny-skia = "0.12"
+
+# Build-time compilation of `ui/slint/main_window.slint` (and its transitive
+# imports) into Rust code that `slint::include_modules!()` picks up at compile
+# time. Pinned to the same minor as the runtime `slint` dependency to avoid
+# generated-code / runtime ABI skew.
+[build-dependencies]
+slint-build = "1.16.1"
