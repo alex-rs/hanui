@@ -1,6 +1,7 @@
 pub mod assets;
 pub mod dashboard;
 pub mod ha;
+pub mod platform;
 pub mod ui;
 
 use anyhow::Result;

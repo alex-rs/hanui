@@ -20,6 +20,8 @@ anyhow = "1"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+secrecy = { version = "0.8", features = ["alloc"] }
+tracing-test = { version = "0.2", default-features = false }
 jiff = "0.2"
 smol_str = "0.3"
 # SVG rasterization for icon resolver (TASK-010).
