@@ -469,8 +469,7 @@ jobs:
           BIN=$(find target/aarch64-unknown-linux-gnu/debug -maxdepth 1 \
                   -name 'sbc_smoke-*' -executable -type f | head -1)
           if [ -z "$BIN" ]; then
-            echo "ERROR: could not find sbc_smoke test binary under \
-target/aarch64-unknown-linux-gnu/debug/"
+            echo "ERROR: could not find sbc_smoke test binary under target/aarch64-unknown-linux-gnu/debug/"
             exit 1
           fi
           echo "bin=$BIN" >> "$GITHUB_OUTPUT"
