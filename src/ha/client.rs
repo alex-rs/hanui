@@ -1977,6 +1977,281 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Test (b1): elapsed < threshold + events flowing → counter does NOT reset.
+    //
+    // Codex finding 8 (TASK-046): the existing happy-path test proves that
+    // backoff resets after both `elapsed >= threshold` AND `live_event_count > 0`
+    // are satisfied, but does not lock down the AND-conjunction.  This sub-test
+    // closes the (b1) hole: when events flow but the stability window has not
+    // yet elapsed, the backoff state must remain untouched.
+    //
+    // Strategy: set `stable_live_threshold` to a very long value (1 hour) so
+    // the test's real wall-clock time cannot satisfy the elapsed-since arm.
+    // Drive the FSM to Live, deliver one Live state_changed event (which
+    // increments `live_event_count` and triggers `check_and_maybe_reset_backoff`),
+    // then assert the backoff state is byte-for-byte unchanged.  Forcing a
+    // disconnect at the end mirrors the spec's "force disconnect, assert
+    // backoff window did NOT reset" formulation; the disconnect is observable
+    // via `on_disconnect` not touching the backoff counter (only the stability
+    // window is cleared — see `WsClient::on_disconnect`).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_b1_stable_live_does_not_reset_before_threshold() {
+        let (mut client, _state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-backoff-b1")
+        };
+        let (mut sink, _sent) = MockSink::new();
+
+        // Simulate 3 failed attempts so the backoff counter is elevated.
+        client.backoff.advance();
+        client.backoff.advance();
+        client.backoff.advance();
+        let attempts_before = client.backoff.attempts;
+        let window_before = client.backoff.current_window;
+        assert_eq!(attempts_before, 3);
+        assert!(window_before > MIN_BACKOFF);
+
+        // Drive FSM to Live (mirrors test_b setup).
+        let phase = client
+            .handle_message(
+                inbound(r#"{"type":"auth_required","ha_version":"2024.4.0"}"#),
+                Phase::Authenticating,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let phase = client
+            .handle_message(
+                inbound(r#"{"type":"auth_ok","ha_version":"2024.4.0"}"#),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let subscribe_id = match &phase {
+            Phase::Subscribing { subscribe_id } => *subscribe_id,
+            other => panic!("expected Subscribing; got: {other:?}"),
+        };
+        let phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{subscribe_id},"success":true,"result":null}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let get_states_id = match &phase {
+            Phase::Snapshotting { get_states_id, .. } => *get_states_id,
+            other => panic!("expected Snapshotting; got: {other:?}"),
+        };
+        let phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{get_states_id},"success":true,"result":[]}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let get_services_id = match &phase {
+            Phase::Services { get_services_id } => *get_services_id,
+            other => panic!("expected Services; got: {other:?}"),
+        };
+        let _phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{get_services_id},"success":true,"result":{{}}}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        assert!(
+            client.stable_live_since.is_some(),
+            "stable_live_since must be set on Live entry"
+        );
+
+        // Inject a 1-hour threshold — the rest of the test takes well under a
+        // second, so the elapsed-since arm of the AND can never be satisfied.
+        client.stable_live_threshold = Duration::from_secs(3600);
+
+        // Deliver a Live event — this increments live_event_count and runs
+        // `check_and_maybe_reset_backoff`.  With elapsed << threshold, the
+        // function must short-circuit without resetting.
+        let _phase = client
+            .handle_message(
+                inbound(r#"{"type":"event","id":1,"event":{"event_type":"state_changed","data":{"entity_id":"light.x","new_state":null,"old_state":null},"origin":"LOCAL","time_fired":"2024-01-01T00:00:00+00:00"}}"#),
+                Phase::Live,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        assert!(
+            client.live_event_count >= 1,
+            "live_event_count must reflect the event delivery; got: {}",
+            client.live_event_count
+        );
+
+        // Mirror the spec's "force disconnect" step.  on_disconnect clears the
+        // stability window but MUST NOT touch the backoff counter — without
+        // a successful stable-Live reset, the elevated counter must survive.
+        client.on_disconnect();
+
+        // Backoff state must be byte-for-byte unchanged from before the
+        // (failed) stability check.
+        assert_eq!(
+            client.backoff.attempts, attempts_before,
+            "backoff.attempts must NOT change when events flow but elapsed < threshold"
+        );
+        assert_eq!(
+            client.backoff.current_window, window_before,
+            "backoff.current_window must NOT change when events flow but elapsed < threshold"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test (b2): elapsed >= threshold + NO events → counter does NOT reset.
+    //
+    // Codex finding 8 (TASK-046) sibling: closes the second AND-conjunction
+    // hole.  Even when the elapsed-since-Live window has comfortably exceeded
+    // the threshold, the absence of any Live event must keep the counter
+    // intact.  Phase 2 design intent (see `WsClient::check_and_maybe_reset_backoff`):
+    // the stability invariant is "this connection produced at least one
+    // payload" — a connection that goes idle for 5 s without ever delivering
+    // a state_changed event has not earned a reset.
+    //
+    // Strategy: set `stable_live_threshold` to 1 ms so the elapsed arm is
+    // trivially satisfied.  Enter Live, sleep past the threshold, deliver
+    // ZERO events, then call `check_and_maybe_reset_backoff` directly to
+    // exercise the stability check without an event.  Force a disconnect to
+    // mirror the spec wording, then assert the backoff state is unchanged.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_b2_stable_live_does_not_reset_without_events() {
+        let (mut client, _state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-backoff-b2")
+        };
+        let (mut sink, _sent) = MockSink::new();
+
+        // Simulate 3 failed attempts so the backoff counter is elevated.
+        client.backoff.advance();
+        client.backoff.advance();
+        client.backoff.advance();
+        let attempts_before = client.backoff.attempts;
+        let window_before = client.backoff.current_window;
+        assert_eq!(attempts_before, 3);
+        assert!(window_before > MIN_BACKOFF);
+
+        // Drive FSM to Live (mirrors test_b setup).
+        let phase = client
+            .handle_message(
+                inbound(r#"{"type":"auth_required","ha_version":"2024.4.0"}"#),
+                Phase::Authenticating,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let phase = client
+            .handle_message(
+                inbound(r#"{"type":"auth_ok","ha_version":"2024.4.0"}"#),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let subscribe_id = match &phase {
+            Phase::Subscribing { subscribe_id } => *subscribe_id,
+            other => panic!("expected Subscribing; got: {other:?}"),
+        };
+        let phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{subscribe_id},"success":true,"result":null}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let get_states_id = match &phase {
+            Phase::Snapshotting { get_states_id, .. } => *get_states_id,
+            other => panic!("expected Snapshotting; got: {other:?}"),
+        };
+        let phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{get_states_id},"success":true,"result":[]}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let get_services_id = match &phase {
+            Phase::Services { get_services_id } => *get_services_id,
+            other => panic!("expected Services; got: {other:?}"),
+        };
+        let phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{get_services_id},"success":true,"result":{{}}}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(phase, Phase::Live),
+            "expected Live; got: {phase:?}"
+        );
+        assert!(
+            client.stable_live_since.is_some(),
+            "stable_live_since must be set on Live entry"
+        );
+        assert_eq!(
+            client.live_event_count, 0,
+            "live_event_count must be 0 immediately after Live entry"
+        );
+
+        // Threshold of 1 ms; sleep 5 ms to be well past it.
+        client.stable_live_threshold = Duration::from_millis(1);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // Deliver NO events.  Call `check_and_maybe_reset_backoff` directly
+        // (it is `pub(crate)`) so the stability-AND is exercised in the
+        // "elapsed satisfied, events not satisfied" configuration without
+        // accidentally triggering the events arm.  Returns `false` when the
+        // invariant is not satisfied.
+        let did_reset = client.check_and_maybe_reset_backoff();
+        assert!(
+            !did_reset,
+            "check_and_maybe_reset_backoff must NOT report a reset when no events have arrived"
+        );
+
+        // Mirror the spec's "force disconnect" step.
+        client.on_disconnect();
+
+        // Backoff state must be byte-for-byte unchanged.
+        assert_eq!(
+            client.backoff.attempts, attempts_before,
+            "backoff.attempts must NOT change when elapsed >= threshold but live_event_count == 0"
+        );
+        assert_eq!(
+            client.backoff.current_window, window_before,
+            "backoff.current_window must NOT change when elapsed >= threshold but live_event_count == 0"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Test (b) complement: failed Snapshotting does NOT reset backoff.
     // -----------------------------------------------------------------------
 
