@@ -1,7 +1,82 @@
 {
   "_meta": {
     "description": "Per-file coverage baseline. Ratchet: current >= baseline per file.",
-    "enforcement": "ops/checks/coverage-ratchet.js"
+    "enforcement": "ops/checks/coverage-ratchet.js",
+    "tool": "cargo-llvm-cov",
+    "tool_version": "cargo-llvm-cov 0.8.5",
+    "seeded_at": "2026-04-26T01:02:56Z",
+    "seeded_from": "a824d1e6a6c7b2f2fe7f5badbabbc73f2ad5bfaa"
   },
-  "files": {}
+  "files": {
+    "src/assets/icons.rs": {
+      "lines_total": 156,
+      "lines_covered": 156,
+      "pct": 100
+    },
+    "src/dashboard/profiles.rs": {
+      "lines_total": 12,
+      "lines_covered": 12,
+      "pct": 100
+    },
+    "src/dashboard/view_spec.rs": {
+      "lines_total": 222,
+      "lines_covered": 221,
+      "pct": 99.5
+    },
+    "src/ha/entity.rs": {
+      "lines_total": 80,
+      "lines_covered": 80,
+      "pct": 100
+    },
+    "src/ha/fixture.rs": {
+      "lines_total": 210,
+      "lines_covered": 203,
+      "pct": 96.7
+    },
+    "src/ha/store.rs": {
+      "lines_total": 191,
+      "lines_covered": 183,
+      "pct": 95.8
+    },
+    "src/lib.rs": {
+      "lines_total": 52,
+      "lines_covered": 0,
+      "pct": 0
+    },
+    "src/main.rs": {
+      "lines_total": 3,
+      "lines_covered": 0,
+      "pct": 0
+    },
+    "src/ui/bridge.rs": {
+      "lines_total": 587,
+      "lines_covered": 562,
+      "pct": 95.7
+    },
+    "src/assets/mod.rs": {
+      "lines_total": 0,
+      "lines_covered": 0,
+      "pct": 0.0
+    },
+    "src/dashboard/mod.rs": {
+      "lines_total": 0,
+      "lines_covered": 0,
+      "pct": 0.0
+    },
+    "src/ha/mod.rs": {
+      "lines_total": 0,
+      "lines_covered": 0,
+      "pct": 0.0
+    },
+    "src/ui/mod.rs": {
+      "lines_total": 0,
+      "lines_covered": 0,
+      "pct": 0.0
+    },
+    "tests/smoke.rs": {
+      "lines_total": 0,
+      "lines_covered": 0,
+      "pct": 0.0
+    }
+  }
 }
