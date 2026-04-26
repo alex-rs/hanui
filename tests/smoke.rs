@@ -109,7 +109,7 @@ fn empty_attributes_entity_does_not_panic() {
 fn for_each_visits_all_fixture_entities() {
     let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
     let mut count = 0usize;
-    store.for_each(|_id, _entity| {
+    store.for_each(&mut |_id, _entity| {
         count += 1;
     });
     assert_eq!(

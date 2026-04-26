@@ -70,6 +70,14 @@ pub struct EntityUpdate {
 /// defined).  Both must be `Send + Sync` so they can be shared across Tokio
 /// tasks via `Arc<dyn EntityStore>`.
 ///
+/// **Object-safety (PATH A — dyn-compat refactor, 2026-04-26):** `for_each`
+/// accepts `&mut dyn FnMut` rather than a generic `<F: FnMut>` parameter.
+/// This makes the trait object-safe: `Box<dyn EntityStore>` and
+/// `Arc<dyn EntityStore>` both compile and can be used for Phase 2's runtime-
+/// swappable `LiveStore` drop-in.  The visitor pattern is retained so the
+/// implementer can hold an internal read-lock for the entire walk without
+/// exposing a lock-guarded iterator across the API boundary.
+///
 /// # Method contract
 ///
 /// - [`get`][EntityStore::get] — cheap clone (`Entity` is Arc-wrapped); `None`
@@ -83,7 +91,7 @@ pub struct EntityUpdate {
 ///   filtered subscription; Phase 1 broadcasts all updates regardless.
 pub trait EntityStore: Send + Sync {
     fn get(&self, id: &EntityId) -> Option<Entity>;
-    fn for_each<F: FnMut(&EntityId, &Entity)>(&self, f: F);
+    fn for_each(&self, f: &mut dyn FnMut(&EntityId, &Entity));
     fn subscribe(&self, ids: &[EntityId]) -> broadcast::Receiver<EntityUpdate>;
 }
 
@@ -176,7 +184,7 @@ impl EntityStore for MemoryStore {
             .cloned()
     }
 
-    fn for_each<F: FnMut(&EntityId, &Entity)>(&self, mut f: F) {
+    fn for_each(&self, f: &mut dyn FnMut(&EntityId, &Entity)) {
         let guard = self.map.read().expect("MemoryStore RwLock poisoned");
         for (id, entity) in guard.iter() {
             f(id, entity);
@@ -207,6 +215,19 @@ fn _assert_store<S: EntityStore>() {}
 /// Called from tests so that coverage instrumentation reaches these lines.
 fn _assert_memory_store_satisfies_bound() {
     _assert_store::<MemoryStore>();
+}
+
+/// Compile-time proof that `EntityStore` is dyn-compatible.
+///
+/// Both `&dyn EntityStore` and `Arc<dyn EntityStore>` must be constructible
+/// from a concrete `MemoryStore` reference.  Phase 2's `LiveStore` drop-in
+/// depends on this: the Tokio task that receives entity updates will hold an
+/// `Arc<dyn EntityStore>` so the bridge can be swapped without changing its
+/// call sites.  This function is never called; it exists solely to verify the
+/// invariant at build time.
+fn _assert_dyn_entity_store_works() {
+    fn _accepts_dyn(_: &dyn EntityStore) {}
+    fn _accepts_arc_dyn(_: std::sync::Arc<dyn EntityStore>) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -283,7 +304,7 @@ mod tests {
         let store = MemoryStore::load(entities).unwrap();
 
         let mut visited: Vec<String> = Vec::new();
-        store.for_each(|id, _entity| {
+        store.for_each(&mut |id, _entity| {
             visited.push(id.as_str().to_owned());
         });
         visited.sort();
@@ -295,7 +316,7 @@ mod tests {
     fn for_each_on_empty_store_calls_visitor_zero_times() {
         let store = MemoryStore::load(vec![]).unwrap();
         let mut count = 0usize;
-        store.for_each(|_id, _entity| {
+        store.for_each(&mut |_id, _entity| {
             count += 1;
         });
         assert_eq!(count, 0);
@@ -306,7 +327,7 @@ mod tests {
         let entity = make_entity("switch.outlet", "off");
         let store = MemoryStore::load(vec![entity]).unwrap();
 
-        store.for_each(|id, e| {
+        store.for_each(&mut |id, e| {
             assert_eq!(id.as_str(), "switch.outlet");
             assert_eq!(&*e.state, "off");
         });

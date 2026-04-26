@@ -11,7 +11,7 @@
 #   4. gitleaks           — secret scan on full repo history
 #   5. hex-color grep     — bans inline hex literals in ui/slint/**/*.slint;
 #                           escape hatch: "// theme-allow:" restricted to theme.slint only
-#   6. serde_json::Value  — bans serde_json::Value anywhere under src/ui/**
+#   6. serde_json crate   — bans any serde_json crate path under src/ui/**
 #   7. cargo test         — full unit + integration test suite (TZ=UTC, two-pass for
 #                           order-dependence detection)
 #   8. coverage ratchet   — per-file line coverage must not drop below coverage/baseline.json;
@@ -192,12 +192,16 @@ jobs:
   #   bypass; it is semantically restricted to the theme file.
   #   Blast-radius: ~5% of PRs once UI files exist. FP rate: <1%.
   #
-  # Gate 2 — serde_json::Value:
-  #   Rejects any direct use or import of serde_json::Value under src/ui/**.
-  #   Pattern: \bserde_json\s*::\s*Value\b catches:
+  # Gate 2 — serde_json crate-path ban:
+  #   Rejects any occurrence of the serde_json crate path under src/ui/**.
+  #   Pattern: \bserde_json\b catches all forms:
   #     - `use serde_json::Value;`
-  #     - `fn f(v: serde_json::Value)`
+  #     - `use serde_json::{Map, Value};`  (grouped import — old pattern missed this)
   #     - `serde_json :: Value` (unusual whitespace)
+  #   The prior \bserde_json\s*::\s*Value\b pattern was a type-name ban that
+  #   could be evaded by calling Value methods without naming the type. This
+  #   crate-path ban closes that evasion: any future legitimate use of
+  #   serde_json in src/ui/ requires an explicit waiver in docs/waivers.yaml.
   #   Blast-radius: ~1% of PRs. FP rate: 0% (pattern is precise).
   # ────────────────────────────────────────────────────────────────────────────
   repo-rules:
@@ -239,24 +243,31 @@ jobs:
           fi
           echo "hex-color gate: OK (zero matches)"
 
-      # ── Gate 2: No serde_json::Value access in src/ui/** ─────────────────────
+      # ── Gate 2: No serde_json crate path in src/ui/** ───────────────────────
       # The bridge must operate exclusively on typed view-model structs.
-      # Pattern catches direct usage, use-statement imports, and unusual
-      # whitespace around the path separator.
-      - name: serde_json::Value gate (no Value in src/ui)
+      # Any use of serde_json in src/ui/ requires a waiver in docs/waivers.yaml.
+      - name: serde_json gate (no serde_json under src/ui)
         run: |
-          SERDE_PATTERN='\bserde_json\s*::\s*Value\b'
-          # src/ui may not exist yet (pre-Phase-1). find exits 0 on empty results.
+          SERDE_PATTERN='\bserde_json\b'
+          # Self-test: pattern must match all three variants.
+          for VARIANT in 'use serde_json::Value;' 'use serde_json::{Map, Value};' 'serde_json :: Value'; do
+            if ! echo "$VARIANT" | grep -qE "$SERDE_PATTERN"; then
+              echo "ERROR: regex self-test failed for: $VARIANT"
+              exit 1
+            fi
+          done
+          echo "regex self-test: OK"
           VIOLATIONS=$(grep -rEn "$SERDE_PATTERN" src/ui/ 2>/dev/null || true)
           if [ -n "$VIOLATIONS" ]; then
-            echo "ERROR: serde_json::Value found in src/ui/**"
+            echo "ERROR: serde_json found in src/ui/**"
             echo "The UI bridge must use typed view-model structs, not raw JSON values."
             echo "JSON parsing belongs in the fixture/data layer, not in src/ui."
+            echo "Any future legitimate use requires an explicit waiver in docs/waivers.yaml."
             echo ""
             echo "$VIOLATIONS"
             exit 1
           fi
-          echo "serde_json::Value gate: OK (zero matches)"
+          echo "serde_json gate: OK (zero matches)"
 
   # ────────────────────────────────────────────────────────────────────────────
   # Job: test
