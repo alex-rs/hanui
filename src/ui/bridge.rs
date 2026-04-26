@@ -36,6 +36,28 @@
 //! This file accesses attribute values only via the typed accessor family
 //! (`.as_str()`, `.as_f64()`, etc.) which are methods on the value type
 //! without naming the type itself.
+//!
+//! # Slint property wiring (TASK-015)
+//!
+//! Below the typed-VM layer, this file also defines:
+//!
+//!   * The top-level `MainWindow` Slint component (declared inline via
+//!     `slint::slint!{}` inside the [`slint_ui`] sub-module so the generated
+//!     names do not collide with the Rust VM structs that share names with
+//!     their Slint counterparts).
+//!   * [`wire_window`] — splits a `&[TileVM]` slice by variant, converts each
+//!     element into the Slint-generated VM struct (resolving `icon_id` via
+//!     [`crate::assets::icons::resolve`]), wraps each per-variant `Vec` in a
+//!     `slint::ModelRc<...>`, and writes the three array properties on
+//!     `MainWindow`. Also writes the two `AnimationBudget` globals from
+//!     [`crate::dashboard::profiles::DEFAULT_PROFILE`].
+//!
+//! [`wire_window`] runs once per refresh cycle, not per frame. Per-frame
+//! property reads inside the Slint runtime see only `SharedString`
+//! (`Arc<str>`-backed) and `slint::Image` (`Arc<SharedPixelBuffer>`-backed)
+//! values; cloning either is an `Arc` bump. No allocation occurs in any
+//! Slint callback or animation timer (per the slint-engineer charter
+//! hot-path discipline).
 
 use crate::dashboard::view_spec::{Dashboard, Placement, WidgetKind};
 use crate::ha::entity::{EntityId, EntityKind};
@@ -306,6 +328,256 @@ pub fn build_tiles<S: EntityStore>(store: &S, dashboard: &Dashboard) -> Vec<Tile
     }
 
     tiles
+}
+
+// ---------------------------------------------------------------------------
+// Slint window definition (inline) and property wiring
+// ---------------------------------------------------------------------------
+//
+// The MainWindow component is defined inline via `slint::slint!{}` because the
+// `files_allowlist` for TASK-015 limits .slint authoring to the existing tile
+// files only (`ui/slint/{theme,card_base,light_tile,sensor_tile,entity_tile}.slint`).
+// Keeping the top-level window inline in `bridge.rs` also means TASK-016
+// (`main.rs` wiring) needs to know about a single Rust artefact, not a separate
+// `.slint` file.
+//
+// The macro is wrapped in a `slint_ui` sub-module to namespace the generated
+// types: the Slint compiler emits Rust types named `LightTileVM`, `SensorTileVM`,
+// `EntityTileVM`, `TilePlacement`, `SensorTilePlacement`, `EntityTilePlacement`
+// — names that collide 1:1 with the public Rust structs declared above. The
+// sub-module gives them a distinct path (`slint_ui::LightTileVM`) so callers of
+// the bridge see both: the typed Rust VMs (from TASK-014) and the Slint-typed
+// ones (from this task).
+//
+// Path note: with rustc >= 1.88, `slint::slint!{}` resolves `import` paths
+// relative to the source file containing the macro. From `src/ui/bridge.rs`
+// that is `../../ui/slint/...`.
+pub mod slint_ui {
+    slint::slint! {
+        import { Theme } from "../../ui/slint/theme.slint";
+        import { CardBase } from "../../ui/slint/card_base.slint";
+        import { LightTile, LightTileVM, TilePlacement } from "../../ui/slint/light_tile.slint";
+        import { SensorTile, SensorTileVM, SensorTilePlacement } from "../../ui/slint/sensor_tile.slint";
+        import { EntityTile, EntityTileVM, EntityTilePlacement } from "../../ui/slint/entity_tile.slint";
+
+        // Re-export `AnimationBudget` from this compilation root so the Slint
+        // compiler emits a public Rust handle for it. Without this re-export,
+        // the global is in-scope for binding expressions but not surfaced as
+        // a `pub struct AnimationBudget<'a>` on the generated API — the Rust
+        // bridge cannot then call `window.global::<AnimationBudget>()` to
+        // write `framerate-cap` and `max-simultaneous` from `DEFAULT_PROFILE`.
+        export { AnimationBudget } from "../../ui/slint/card_base.slint";
+
+        // MainWindow — the top-level Phase 1 window. It exposes three array
+        // properties (one per tile kind) that `wire_window` writes from the
+        // typed VM slices, and renders each tile in a vertical flow. The
+        // layout is intentionally minimal: TASK-016 wires this window into
+        // `main.rs`; the Phase 1 design is a stack of tiles, not the final
+        // grid layout.
+        //
+        // Property naming uses kebab-case per Slint convention; the
+        // generated Rust setters are `set_light_tiles`, `set_sensor_tiles`,
+        // `set_entity_tiles` (kebab → snake automatically).
+        export component MainWindow inherits Window {
+            in property <[LightTileVM]> light-tiles;
+            in property <[SensorTileVM]> sensor-tiles;
+            in property <[EntityTileVM]> entity-tiles;
+
+            title: "hanui";
+            background: Theme.background;
+            preferred-width: 480px;
+            preferred-height: 600px;
+
+            VerticalLayout {
+                padding: Theme.space-3;
+                spacing: Theme.space-2;
+
+                for tile[i] in root.light-tiles : LightTile {
+                    view-model: tile;
+                }
+                for tile[i] in root.sensor-tiles : SensorTile {
+                    view-model: tile;
+                }
+                for tile[i] in root.entity-tiles : EntityTile {
+                    view-model: tile;
+                }
+            }
+        }
+    }
+}
+
+pub use slint_ui::{AnimationBudget, MainWindow};
+
+use crate::assets::icons;
+use crate::dashboard::profiles::DEFAULT_PROFILE;
+use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+
+/// Errors that can occur while wiring VM data into Slint properties.
+///
+/// Variants are kept small and `Copy` so the error type does not allocate on
+/// the failure path either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireError {
+    /// `DEFAULT_PROFILE.animation_framerate_cap` does not fit in `i32` (the
+    /// Slint property type for `framerate-cap`).
+    FramerateCapOutOfRange,
+    /// `DEFAULT_PROFILE.max_simultaneous_animations` does not fit in `i32`
+    /// (the Slint property type for `max-simultaneous`).
+    MaxSimultaneousOutOfRange,
+}
+
+impl std::fmt::Display for WireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WireError::FramerateCapOutOfRange => {
+                f.write_str("DEFAULT_PROFILE.animation_framerate_cap does not fit in i32")
+            }
+            WireError::MaxSimultaneousOutOfRange => {
+                f.write_str("DEFAULT_PROFILE.max_simultaneous_animations does not fit in i32")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WireError {}
+
+// ---------------------------------------------------------------------------
+// VM split + conversion
+// ---------------------------------------------------------------------------
+
+/// Split a flat `&[TileVM]` slice into three per-variant `Vec`s of the
+/// Slint-generated VM structs, ready to be wrapped in `ModelRc`s and written
+/// to `MainWindow` properties.
+///
+/// This is factored out of [`wire_window`] so it can be exercised in unit
+/// tests without instantiating a Slint window (which would require a live
+/// graphics backend / display server — not available in headless CI).
+///
+/// All `String -> SharedString` and `String -> Image` conversions happen here.
+/// A `String -> SharedString` conversion is a single heap copy; `Image` clones
+/// (returned from [`icons::resolve`]) are `Arc` bumps. None of these allocate
+/// inside per-frame paths — the function runs once per refresh cycle.
+///
+/// # Panics
+///
+/// Panics if [`crate::assets::icons::init`] has not been called first, because
+/// [`icons::resolve`] panics on an unset `OnceLock`. Production callers wire
+/// `icons::init()` at startup (TASK-016 / `main.rs`); tests call it explicitly.
+pub fn split_tile_vms(
+    tiles: &[TileVM],
+) -> (
+    Vec<slint_ui::LightTileVM>,
+    Vec<slint_ui::SensorTileVM>,
+    Vec<slint_ui::EntityTileVM>,
+) {
+    let mut lights = Vec::new();
+    let mut sensors = Vec::new();
+    let mut entities = Vec::new();
+
+    for tile in tiles {
+        match tile {
+            TileVM::Light(vm) => lights.push(slint_ui::LightTileVM {
+                name: SharedString::from(vm.name.as_str()),
+                state: SharedString::from(vm.state.as_str()),
+                r#icon_id: SharedString::from(vm.icon_id.as_str()),
+                icon: icons::resolve(&vm.icon_id),
+                preferred_columns: vm.preferred_columns,
+                preferred_rows: vm.preferred_rows,
+                placement: slint_ui::TilePlacement {
+                    col: vm.placement.col,
+                    row: vm.placement.row,
+                    span_cols: vm.placement.span_cols,
+                    span_rows: vm.placement.span_rows,
+                },
+            }),
+            TileVM::Sensor(vm) => sensors.push(slint_ui::SensorTileVM {
+                name: SharedString::from(vm.name.as_str()),
+                state: SharedString::from(vm.state.as_str()),
+                r#icon_id: SharedString::from(vm.icon_id.as_str()),
+                icon: icons::resolve(&vm.icon_id),
+                preferred_columns: vm.preferred_columns,
+                preferred_rows: vm.preferred_rows,
+                placement: slint_ui::SensorTilePlacement {
+                    col: vm.placement.col,
+                    row: vm.placement.row,
+                    span_cols: vm.placement.span_cols,
+                    span_rows: vm.placement.span_rows,
+                },
+            }),
+            TileVM::Entity(vm) => entities.push(slint_ui::EntityTileVM {
+                name: SharedString::from(vm.name.as_str()),
+                state: SharedString::from(vm.state.as_str()),
+                r#icon_id: SharedString::from(vm.icon_id.as_str()),
+                icon: icons::resolve(&vm.icon_id),
+                preferred_columns: vm.preferred_columns,
+                preferred_rows: vm.preferred_rows,
+                placement: slint_ui::EntityTilePlacement {
+                    col: vm.placement.col,
+                    row: vm.placement.row,
+                    span_cols: vm.placement.span_cols,
+                    span_rows: vm.placement.span_rows,
+                },
+            }),
+        }
+    }
+
+    (lights, sensors, entities)
+}
+
+// ---------------------------------------------------------------------------
+// wire_window
+// ---------------------------------------------------------------------------
+
+/// Wire a typed `&[TileVM]` slice into the three array properties on
+/// [`MainWindow`], and write the two `AnimationBudget` globals from
+/// [`DEFAULT_PROFILE`].
+///
+/// This is the single public entry point used by `main.rs` (TASK-016) and by
+/// any future Phase 2 push-update path. The function runs once per refresh
+/// cycle and is not on a per-frame hot path; per-element conversion via
+/// `String -> SharedString` allocates exactly once per VM field (acceptable),
+/// and `Image` is `Arc`-backed so cloning is a refcount bump.
+///
+/// `AnimationBudget.framerate-cap` and `AnimationBudget.max-simultaneous` are
+/// written here, once. `active-count` is initialised to 0 by the Slint global
+/// declaration itself; tile press handlers (Phase 3) mutate it later. We do
+/// not write `active-count` here because doing so on every refresh would
+/// stomp any in-flight animation count.
+///
+/// # Errors
+///
+/// Returns [`WireError::FramerateCapOutOfRange`] if
+/// `DEFAULT_PROFILE.animation_framerate_cap` does not fit in `i32`, and
+/// [`WireError::MaxSimultaneousOutOfRange`] if
+/// `DEFAULT_PROFILE.max_simultaneous_animations` does not fit. Both are
+/// defensive: the desktop preset values (60 and 8 respectively) are well
+/// within `i32` range, but a future profile could exceed it and we want a
+/// typed failure rather than a silent truncation.
+pub fn wire_window(window: &MainWindow, tiles: &[TileVM]) -> Result<(), WireError> {
+    let (lights, sensors, entities) = split_tile_vms(tiles);
+
+    // Wrap each Vec in a VecModel and pass via ModelRc to the Slint property.
+    // Slint clones the ModelRc internally (Arc bump); no per-element copy.
+    let light_model: ModelRc<slint_ui::LightTileVM> = ModelRc::new(VecModel::from(lights));
+    let sensor_model: ModelRc<slint_ui::SensorTileVM> = ModelRc::new(VecModel::from(sensors));
+    let entity_model: ModelRc<slint_ui::EntityTileVM> = ModelRc::new(VecModel::from(entities));
+
+    window.set_light_tiles(light_model);
+    window.set_sensor_tiles(sensor_model);
+    window.set_entity_tiles(entity_model);
+
+    // AnimationBudget globals — wired once at startup from DEFAULT_PROFILE.
+    let budget = window.global::<AnimationBudget>();
+
+    let cap_i32 = i32::try_from(DEFAULT_PROFILE.animation_framerate_cap)
+        .map_err(|_| WireError::FramerateCapOutOfRange)?;
+    let max_i32 = i32::try_from(DEFAULT_PROFILE.max_simultaneous_animations)
+        .map_err(|_| WireError::MaxSimultaneousOutOfRange)?;
+
+    budget.set_framerate_cap(cap_i32);
+    budget.set_max_simultaneous(max_i32);
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -740,5 +1012,219 @@ mod tests {
 
         let tiles = build_tiles(&store, &dashboard);
         assert!(tiles.is_empty(), "no widgets means no tiles");
+    }
+
+    // -----------------------------------------------------------------------
+    // Slint wiring smoke tests (TASK-015)
+    // -----------------------------------------------------------------------
+    //
+    // These tests exercise [`split_tile_vms`] — the Slint-typed conversion
+    // that [`wire_window`] performs before writing properties — without
+    // instantiating a [`MainWindow`]. Constructing the window requires a live
+    // graphics backend (the crate is configured with `backend-winit-x11`,
+    // which fails in headless CI runners). The test instead asserts on the
+    // Slint-typed VM structs that the bridge would write into the property
+    // models, which is the same data path the Slint runtime sees.
+    //
+    // The "Slint properties update when a fixture entity changes" AC is
+    // exercised by mutating a synthesized `TileVM` slice between two calls
+    // to `split_tile_vms` and asserting the resulting Slint-typed structs
+    // differ in the expected fields.
+
+    fn ensure_icons_init() {
+        // `split_tile_vms` calls `crate::assets::icons::resolve`, which
+        // requires `icons::init()` to have been called. Idempotent.
+        crate::assets::icons::init();
+    }
+
+    fn make_light_tile(name: &str, state: &str, icon_id: &str) -> TileVM {
+        TileVM::Light(LightTileVM {
+            name: name.to_string(),
+            state: state.to_string(),
+            icon_id: icon_id.to_string(),
+            preferred_columns: 2,
+            preferred_rows: 2,
+            placement: TilePlacement {
+                col: 0,
+                row: 0,
+                span_cols: 2,
+                span_rows: 2,
+            },
+        })
+    }
+
+    fn make_sensor_tile(name: &str, state: &str, icon_id: &str) -> TileVM {
+        TileVM::Sensor(SensorTileVM {
+            name: name.to_string(),
+            state: state.to_string(),
+            icon_id: icon_id.to_string(),
+            preferred_columns: 2,
+            preferred_rows: 1,
+            placement: TilePlacement {
+                col: 0,
+                row: 0,
+                span_cols: 2,
+                span_rows: 1,
+            },
+        })
+    }
+
+    fn make_entity_tile(name: &str, state: &str, icon_id: &str) -> TileVM {
+        TileVM::Entity(EntityTileVM {
+            name: name.to_string(),
+            state: state.to_string(),
+            icon_id: icon_id.to_string(),
+            preferred_columns: 1,
+            preferred_rows: 1,
+            placement: TilePlacement {
+                col: 0,
+                row: 0,
+                span_cols: 1,
+                span_rows: 1,
+            },
+        })
+    }
+
+    #[test]
+    fn split_tile_vms_partitions_by_variant() {
+        ensure_icons_init();
+
+        let tiles = vec![
+            make_light_tile("Kitchen", "on", "mdi:lightbulb"),
+            make_sensor_tile("Hallway", "21.3", "mdi:thermometer"),
+            make_entity_tile("Outlet", "off", "mdi:help-circle"),
+            make_light_tile("Bedroom", "off", "mdi:lightbulb"),
+        ];
+
+        let (lights, sensors, entities) = split_tile_vms(&tiles);
+
+        assert_eq!(lights.len(), 2, "two LightTileVMs expected");
+        assert_eq!(sensors.len(), 1, "one SensorTileVM expected");
+        assert_eq!(entities.len(), 1, "one EntityTileVM expected");
+    }
+
+    #[test]
+    fn split_tile_vms_copies_string_fields_into_shared_strings() {
+        ensure_icons_init();
+
+        let tiles = vec![make_light_tile("Kitchen", "on", "mdi:lightbulb")];
+        let (lights, _, _) = split_tile_vms(&tiles);
+
+        assert_eq!(lights[0].name.as_str(), "Kitchen");
+        assert_eq!(lights[0].state.as_str(), "on");
+        assert_eq!(lights[0].r#icon_id.as_str(), "mdi:lightbulb");
+        assert_eq!(lights[0].preferred_columns, 2);
+        assert_eq!(lights[0].preferred_rows, 2);
+        assert_eq!(lights[0].placement.col, 0);
+        assert_eq!(lights[0].placement.span_cols, 2);
+    }
+
+    #[test]
+    fn split_tile_vms_resolves_icon_id_to_image() {
+        ensure_icons_init();
+
+        // Two tiles with distinct icon ids must yield distinct resolved
+        // images (the lightbulb pixel data differs from the thermometer's).
+        let tiles = vec![
+            make_light_tile("Kitchen", "on", "mdi:lightbulb"),
+            make_sensor_tile("Hallway", "21.3", "mdi:thermometer"),
+        ];
+
+        let (lights, sensors, _) = split_tile_vms(&tiles);
+
+        let lb_pixels = lights[0]
+            .icon
+            .to_rgba8()
+            .expect("lightbulb image must have rgba8 data");
+        let th_pixels = sensors[0]
+            .icon
+            .to_rgba8()
+            .expect("thermometer image must have rgba8 data");
+
+        assert_ne!(
+            lb_pixels.as_bytes(),
+            th_pixels.as_bytes(),
+            "different icon_ids must resolve to different image bytes"
+        );
+    }
+
+    #[test]
+    fn split_tile_vms_unknown_icon_id_falls_back_to_help_circle() {
+        ensure_icons_init();
+
+        let tiles = vec![make_light_tile("Mystery", "on", "mdi:nonexistent")];
+        let (lights, _, _) = split_tile_vms(&tiles);
+
+        // The fallback path is exercised: the icon must equal the help-circle
+        // pixel data even though the id is unrecognised.
+        let resolved = lights[0]
+            .icon
+            .to_rgba8()
+            .expect("fallback image must have rgba8 data");
+        let fallback = crate::assets::icons::resolve("mdi:help-circle")
+            .to_rgba8()
+            .expect("fallback image must have rgba8 data");
+
+        assert_eq!(
+            resolved.as_bytes(),
+            fallback.as_bytes(),
+            "unknown icon id must resolve to the fallback image bytes"
+        );
+    }
+
+    #[test]
+    fn split_tile_vms_reflects_state_change_on_re_wire() {
+        // This is the "Slint properties update when a fixture entity changes"
+        // AC: re-running the conversion with mutated VM data must produce a
+        // different Slint-typed struct in the corresponding slot. This is the
+        // same path `wire_window` invokes; the property write is a constant-
+        // cost ModelRc replacement on top.
+        ensure_icons_init();
+
+        let tiles_before = vec![make_light_tile("Kitchen", "on", "mdi:lightbulb")];
+        let (lights_before, _, _) = split_tile_vms(&tiles_before);
+        assert_eq!(lights_before[0].state.as_str(), "on");
+
+        // Mutate the synthesized fixture: simulate the entity flipping to off.
+        let tiles_after = vec![make_light_tile("Kitchen", "off", "mdi:lightbulb")];
+        let (lights_after, _, _) = split_tile_vms(&tiles_after);
+        assert_eq!(lights_after[0].state.as_str(), "off");
+
+        // Same name, same icon, but state must have flipped — exactly the
+        // delta the Slint property would observe between two refresh cycles.
+        assert_eq!(lights_before[0].name, lights_after[0].name);
+        assert_eq!(lights_before[0].r#icon_id, lights_after[0].r#icon_id);
+        assert_ne!(lights_before[0].state, lights_after[0].state);
+    }
+
+    #[test]
+    fn split_tile_vms_preserves_per_variant_order() {
+        ensure_icons_init();
+
+        let tiles = vec![
+            make_light_tile("L1", "on", "mdi:lightbulb"),
+            make_sensor_tile("S1", "10", "mdi:thermometer"),
+            make_light_tile("L2", "off", "mdi:lightbulb"),
+            make_sensor_tile("S2", "20", "mdi:thermometer"),
+        ];
+
+        let (lights, sensors, _) = split_tile_vms(&tiles);
+
+        // Per-variant order must match document order within that variant.
+        assert_eq!(lights[0].name.as_str(), "L1");
+        assert_eq!(lights[1].name.as_str(), "L2");
+        assert_eq!(sensors[0].name.as_str(), "S1");
+        assert_eq!(sensors[1].name.as_str(), "S2");
+    }
+
+    #[test]
+    fn wire_error_messages_are_deterministic() {
+        // Defensive: format strings must not depend on Debug derive output.
+        // This guards against accidental refactors that swap the variant text.
+        let cap = WireError::FramerateCapOutOfRange;
+        let max = WireError::MaxSimultaneousOutOfRange;
+
+        assert!(cap.to_string().contains("framerate_cap"));
+        assert!(max.to_string().contains("max_simultaneous_animations"));
     }
 }
