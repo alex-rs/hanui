@@ -25,10 +25,11 @@
 //     background + border-color, gated by AnimationBudget.at-capacity).
 //   * Mutating AnimationBudget.active-count from a Slint expression on
 //     touch press/release is awkward declaratively (the change wouldn't
-//     have a deterministic decrement point). The Rust bridge (TASK-015)
-//     will wire active-count increment/decrement from the press handler
-//     because Rust owns the timer that decides when an animation ends.
-//   * TODO TASK-015: bridge wires AnimationBudget.active-count +=/-=.
+//     have a deterministic decrement point). The Rust bridge will wire
+//     active-count increment/decrement from the press handler because
+//     Rust owns the timer that decides when an animation ends. Deferred
+//     to Phase 3 (no specific ticket yet); active-count plumbing is not
+//     needed in Phase 1 because there are no press-driven animations.
 //
 // Out of scope (Phase 3):
 //   * tap_action / hold_action / double_tap_action callback wiring.
@@ -36,9 +37,9 @@
 
 import { Theme } from "theme.slint";
 import { CardBase } from "card_base.slint";
-// AnimationBudget is referenced via the bridge (TASK-015) — see comment
-// block above. Tiles do not import it directly because they do not mutate
-// active-count from a Slint expression in Phase 1.
+// AnimationBudget is referenced via the bridge — see comment block above.
+// Tiles do not import it directly because they do not mutate active-count
+// from a Slint expression in Phase 1.
 
 // Computed grid placement, mirrors `dashboard::view_spec::Placement` in Rust.
 // Nested (rather than flat ints) so the Rust ↔ Slint mapping is 1:1.
