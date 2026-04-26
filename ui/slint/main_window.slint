@@ -1,0 +1,105 @@
+// main_window.slint — top-level Phase 1/2 application window for hanui.
+//
+// Owns the three per-tile-kind array properties that the Rust bridge
+// (`src/ui/bridge.rs::wire_window`) writes from typed `TileVM` slices, plus
+// the Phase 2 status-banner overlay (TASK-033) toggled by the
+// `ConnectionState` watcher.
+//
+// History:
+//   * TASK-014 introduced this component inline via `slint::slint!{}` inside
+//     `src/ui/bridge.rs` because the slint-engineer charter for Phase 1
+//     constrained `files_allowlist` to the existing tile/theme/card_base
+//     `.slint` files only.
+//   * TASK-033 (Phase 2) added the status-banner overlay, still inline.
+//   * TASK-043 lifts the macro contents into this `.slint` file so the CI
+//     hex-color gate (`.github/workflows/ci.yml` § Gate 1, which scans
+//     `ui/slint/**/*.slint`) naturally protects the file. No inline hex
+//     literals are permitted here — colors come from `Theme` only.
+//
+// Compilation entry point:
+//   `build.rs` calls `slint_build::compile("ui/slint/main_window.slint")`,
+//   which transitively compiles `theme.slint`, `card_base.slint`, and the
+//   three tile component files via the imports below. `slint::include_modules!()`
+//   in `src/ui/bridge.rs` picks up the resulting Rust types.
+//
+// Re-exports:
+//   `AnimationBudget` is re-exported so the Slint compiler emits a public
+//   Rust handle for it (so the bridge can call
+//   `window.global::<AnimationBudget>()` to write `framerate-cap` and
+//   `max-simultaneous` from `DEFAULT_PROFILE`). Without an explicit
+//   re-export at the compilation root, the global is in-scope for binding
+//   expressions but not surfaced on the generated public API.
+
+import { Theme } from "theme.slint";
+import { CardBase } from "card_base.slint";
+import { LightTile, LightTileVM, TilePlacement } from "light_tile.slint";
+import { SensorTile, SensorTileVM, SensorTilePlacement } from "sensor_tile.slint";
+import { EntityTile, EntityTileVM, EntityTilePlacement } from "entity_tile.slint";
+
+export { AnimationBudget } from "card_base.slint";
+
+// MainWindow — the top-level Phase 1 window. Exposes three array properties
+// (one per tile kind) that `wire_window` writes from the typed VM slices,
+// and renders each tile in a vertical flow. The layout is intentionally
+// minimal: Phase 1 design is a stack of tiles, not the final grid layout.
+//
+// Phase 2 (TASK-033) adds:
+//   * `status-banner-visible: bool` — toggled by the Rust bridge when
+//     `ConnectionState` enters or leaves `Reconnecting`/`Failed`. Defaults
+//     to `false`. While `true`, an overlay rectangle with "Reconnecting…"
+//     text is drawn on top of the layout. The overlay uses plain Slint
+//     primitives (Rectangle + Text), not a new component file.
+//
+// Property naming uses kebab-case per Slint convention; the generated Rust
+// setters are `set_light_tiles`, `set_sensor_tiles`, `set_entity_tiles`,
+// `set_status_banner_visible` (kebab → snake automatically).
+export component MainWindow inherits Window {
+    in property <[LightTileVM]> light-tiles;
+    in property <[SensorTileVM]> sensor-tiles;
+    in property <[EntityTileVM]> entity-tiles;
+    in property <bool> status-banner-visible: false;
+
+    title: "hanui";
+    background: Theme.background;
+    preferred-width: 480px;
+    preferred-height: 600px;
+
+    VerticalLayout {
+        padding: Theme.space-3;
+        spacing: Theme.space-2;
+
+        for tile[i] in root.light-tiles : LightTile {
+            view-model: tile;
+        }
+        for tile[i] in root.sensor-tiles : SensorTile {
+            view-model: tile;
+        }
+        for tile[i] in root.entity-tiles : EntityTile {
+            view-model: tile;
+        }
+    }
+
+    // Status banner overlay. Visibility is gated by `status-banner-visible`
+    // so the overlay disappears entirely when the connection is `Live`.
+    // Positioned at the top edge so it does not occlude tile content.
+    // Plain primitives only — no new Slint component file. Colors use
+    // theme tokens (`Theme.banner-bg`, `Theme.text-primary`); the
+    // ui/slint/**/*.slint hex-color gate now naturally protects this code.
+    if root.status-banner-visible : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: 32px;
+        background: Theme.banner-bg;
+
+        Text {
+            text: "Reconnecting…";
+            color: Theme.text-primary;
+            font-size: Theme.font-md;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: parent.width;
+            height: parent.height;
+        }
+    }
+}
