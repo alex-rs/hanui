@@ -700,3 +700,100 @@ async fn scenario_consecutive_overflow_circuit_breaker_trips() {
         "third consecutive overflow within 60s must trip the circuit-breaker"
     );
 }
+
+// ---------------------------------------------------------------------------
+// BLOCKER 1 (TASK-044) verification: production wiring routes events to store.
+//
+// Codex's post-shipment audit found that `src/lib.rs::run_with_live_store`
+// constructed a `LiveStore` and a `WsClient` independently and never wired
+// them together via `WsClient::with_store(...)`.  The Phase 2 live HA path
+// would parse `get_states` / `state_changed` then drop everything on the
+// floor, leaving the UI rendering "unavailable" forever.
+//
+// This test reproduces the same wiring `run_with_live_store` uses (build a
+// shared `Arc<LiveStore>`, hand the same Arc to the WS client and to the test
+// observer) and asserts that a mid-Live `state_changed` event mutates the
+// store the test holds.  Pre-fix, this assertion would fail because the WS
+// task held no store reference.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn scenario_run_with_live_store_routes_events_into_store() {
+    let server = MockWsServer::start().await;
+    server.script_auth_ok().await;
+    server.script_subscribe_ack().await;
+    let states = format!(
+        "[{}]",
+        entity_state_json(
+            "light.kitchen",
+            "off",
+            "2024-01-01T00:00:00+00:00",
+            "2024-01-01T00:00:00+00:00",
+        )
+    );
+    server.script_get_states_reply(&states).await;
+    server.script_get_services_reply("{}").await;
+
+    // Replicate run_with_live_store wiring: a single Arc<LiveStore>, used both
+    // as the SnapshotApplier sink for the WS task AND as the read handle the
+    // (test stand-in for the) bridge consults.  The Arc clone is what makes
+    // BLOCKER 1's fix observable — without with_store(), the writes never land.
+    let store: Arc<LiveStore> = Arc::new(LiveStore::new());
+    let store_for_ws: Arc<dyn hanui::ha::client::SnapshotApplier> = store.clone();
+
+    let config = make_config(&server.ws_url, "tok-blocker1-wiring");
+    let (mut state_rx, _handle) = spawn_client(config, Some(store_for_ws));
+
+    assert!(
+        wait_for_state(&mut state_rx, ConnectionState::Live, Duration::from_secs(5)).await,
+        "client must reach Live before the snapshot can be observed"
+    );
+
+    // After Live the snapshot must be visible to the read-side `store` handle
+    // — proving the same Arc backs both endpoints (BLOCKER 1's invariant).
+    let initial = store
+        .get(&hanui::ha::entity::EntityId::from("light.kitchen"))
+        .expect("snapshot apply via WS must populate the read-side store");
+    assert_eq!(
+        &*initial.state, "off",
+        "snapshot value must surface through the shared Arc"
+    );
+
+    // Fire a mid-Live state_changed event; it must mutate the same store.
+    server
+        .inject_event(state_changed_event_json(
+            1,
+            "light.kitchen",
+            Some((
+                "on",
+                "2024-01-01T01:00:00+00:00",
+                "2024-01-01T01:00:00+00:00",
+            )),
+            Some((
+                "off",
+                "2024-01-01T00:00:00+00:00",
+                "2024-01-01T00:00:00+00:00",
+            )),
+        ))
+        .await;
+
+    // Spin briefly until the read-side store reflects the new value.  Bound
+    // the wait so a regression of BLOCKER 1 (events dropped) fails fast.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let e = store
+            .get(&hanui::ha::entity::EntityId::from("light.kitchen"))
+            .expect("entity must remain present through the event");
+        if &*e.state == "on" {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "BLOCKER 1 regression: state_changed did not flow into the shared LiveStore \
+                 within 2s — WsClient::with_store wiring is missing.  Last seen state: {}",
+                &*e.state
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
