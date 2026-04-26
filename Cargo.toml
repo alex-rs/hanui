@@ -11,6 +11,31 @@ path = "src/main.rs"
 name = "hanui"
 path = "src/lib.rs"
 
+# bench: enables benches/churn.rs (TASK-038 synthetic churn benchmark).
+# Feature-gated so the 60-second scenario does not run on every PR; the nightly
+# CI job passes --features bench explicitly.
+# Run: cargo test --features bench --test churn -- --nocapture
+[features]
+bench = []
+
+[[test]]
+name = "churn"
+path = "benches/churn.rs"
+required-features = ["bench"]
+
+# Suppress the Cargo auto-discovery bench target for benches/churn.rs.
+# The file is a tokio #[test] scenario (not a libtest Bencher fn), so it
+# is wired as a [[test]] above, not a standard [[bench]]. The explicit
+# [[bench]] entry with harness = false prevents Cargo from auto-discovering
+# a second target for the same path and emitting a "present in multiple
+# build targets" warning.
+[[bench]]
+name = "churn"
+path = "benches/churn.rs"
+harness = false
+test = false
+required-features = ["bench"]
+
 [dependencies]
 slint = { version = "1.16.1", default-features = false, features = ["std", "compat-1-2", "renderer-software", "backend-winit-x11"] }
 serde = { version = "1", features = ["derive"] }
