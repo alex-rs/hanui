@@ -33,14 +33,27 @@ logs/
 .claude/.cache/
 .claude/shell-snapshots/
 .claude/todos/
+.claude/worktrees/
 
 # === opencode local files ===
 .opencode/node_modules/
 .opencode.json
 # === Local governance/planning workspace (this-machine-only dev) ===
 docs/
-ops/
 .leap/
+
+# ops/ is local-only by default, but specific scripts are shippable infrastructure
+# (CI gates / pre-receive hooks called out as protected paths in CLAUDE.md).
+# Pattern: ignore everything under ops/, then explicitly un-ignore the files
+# CI/pre-receive depends on.
+ops/*
+!ops/checks/
+!ops/pre-receive/
+ops/checks/*
+ops/pre-receive/*
+!ops/checks/coverage-ratchet.js
+!ops/checks/__tests__/
+!ops/pre-receive/test-deletion.sh
 # === Coverage tooling outputs (coverage/baseline.json is the only tracked file) ===
 coverage/*.profraw
 coverage/lcov.info
