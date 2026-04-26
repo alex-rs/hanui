@@ -8,4 +8,5 @@ pub mod client;
 pub mod entity;
 pub mod fixture;
 pub mod protocol;
+pub mod services;
 pub mod store;
