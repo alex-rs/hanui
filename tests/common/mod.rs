@@ -1,11 +1,9 @@
-//! Shared test utilities used by multiple test binaries.
+//! Shared test utilities used by every test binary and bench in the workspace.
 //!
 //! # Contents
 //!
-//! - [`mock_ws`] — the canonical mock Home Assistant WebSocket server.  This is
-//!   the **superset** copy of `tests/integration/mock_ws.rs` with the
-//!   `force_disconnect` extension needed by TASK-039's memory-soak burst
-//!   scenario.  `tests/integration/` continues to use its own copy so the
-//!   integration test binary has no dependency on this module.
+//! - [`mock_ws`] — the **single canonical** mock Home Assistant WebSocket server.
+//!   This is the only mock WS implementation in the repo (TASK-042 unification);
+//!   integration, soak, smoke and bench targets all import from this module.
 
 pub mod mock_ws;

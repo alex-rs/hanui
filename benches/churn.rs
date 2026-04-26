@@ -39,11 +39,14 @@
 //!
 //! # Mock harness
 //!
-//! Reuses `tests/integration/mock_ws.rs` via a `#[path]` directive. No
-//! duplicate mock implementation exists; this is the canonical path documented
-//! in TASK-038. The `#[path]` directive is used rather than a shared module
-//! refactor because `tests/**` is in `must_not_touch` for this task — we
-//! cannot restructure the test tree. The mock source is read-only here.
+//! Reuses `tests/common/mock_ws.rs` via a `#[path]` directive. This is the
+//! single canonical mock harness post TASK-042; no duplicate mock
+//! implementation exists. The bench uses only a subset of `MockWsServer`'s
+//! API (the rest is exercised by the integration / soak / smoke binaries) so
+//! the mock module is annotated with `#[expect(dead_code)]` — this produces a
+//! warning if the mock is ever refactored such that every method becomes used
+//! here, prompting the annotation to be removed (self-cleaning vs. the
+//! forbidden `#[allow(…)]` form).
 //!
 //! [`FLUSH_INTERVAL_MS`]: hanui::ui::bridge::FLUSH_INTERVAL_MS
 
@@ -52,7 +55,8 @@
 // normal `cargo test` run on every PR.
 #![cfg(feature = "bench")]
 
-#[path = "../tests/integration/mock_ws.rs"]
+#[path = "../tests/common/mock_ws.rs"]
+#[expect(dead_code)]
 mod mock_ws;
 
 use std::sync::{
