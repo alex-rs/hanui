@@ -39,6 +39,13 @@ packages:
   - xvfb
   - pkg-config
   - cmake
+  # Docker engine + compose v2 plugin for the local HA target (Phase 2.5).
+  # Debian 12 stable apt resolves these — no version pin (locked_decision
+  # docker_apt_pin in docs/plans/2026-04-27-phase-2.5-local-ha-target.md);
+  # minor drift between cloud-init and `make vm-docker` installs is
+  # acceptable per Risk #14.
+  - docker.io
+  - docker-compose-plugin
 
 write_files:
   - path: /usr/local/bin/install-rustup.sh
