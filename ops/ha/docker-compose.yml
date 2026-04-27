@@ -1,0 +1,64 @@
+# Home Assistant Core — local dev target for hanui (Phase 2.5).
+#
+# Pinned image: homeassistant/home-assistant:2026.4.4
+#
+# Release notes consulted (2026-04-27):
+#   - https://www.home-assistant.io/blog/2026/04/01/release-20264/
+#     Latest patch in the 2026.4 line is 2026.4.4. Breaking changes in 2026.4
+#     are scoped to JVC Projector, Litter-Robot, Motion Blinds, MQTT
+#     (`object_id` → `default_entity_id`), pyLoad, Roth Touchline, Tuya, and
+#     Z-Wave. NONE of those touch the integrations this dev target uses
+#     (`template:`, `input_boolean:`, `input_number:`), so 2026.4.4 is safe.
+#   - The MQTT `default_entity_id` rename is a sibling rename to the same
+#     mechanism we use here on `template:` entities to force canonical
+#     entity_ids — confirms `default_entity_id` is the modern, supported key.
+#
+# Bumping policy: BEFORE changing this tag, the bumper MUST read the release
+# notes for every minor version between current pin and target pin
+# (https://www.home-assistant.io/blog/categories/core/) and confirm none of
+# the breaking changes affect `template:`, `input_boolean:`, `input_number:`,
+# or the onboarding API (used by ops/ha/provision-ha.sh in TASK-052).
+# Pinning to `:stable` is forbidden — drift between dev environments breaks
+# provisioning reproducibility.
+#
+# Networking: HA listens on 8123 inside the container; we publish to the
+# VM's loopback only (127.0.0.1:8123:8123). The `cargo run` process inside
+# the VM connects to localhost:8123, which works against a loopback-bound
+# port. Provisioning from the host (TASK-052) reaches HA via SSH `-L`
+# forwarding through ./ssh-vm.sh — that arrives on the VM's 127.0.0.1, also
+# fine. DO NOT widen this binding to 0.0.0.0:8123 without security-engineer
+# review: any future change to QEMU networking (tap device, bridged
+# interface, additional hostfwd) would otherwise expose HA to the LAN.
+# Defense-in-depth: configuration.yaml also pins http.server_host: 127.0.0.1.
+# Plain HTTP is acceptable for dev (Phase 5 hardens TLS).
+#
+# Volume strategy:
+#   - Bind-mount ./ → /config so configuration.yaml is picked up on first
+#     boot. HA runtime writes (.storage/, *.db, *.log, .uuid, tts/, ...)
+#     also land in /config — they are kept out of git via ops/ha/.gitignore.
+#   - The `./` is resolved by Docker Compose v2 against the COMPOSE FILE's
+#     directory (the implicit project_directory when `-f` is supplied),
+#     NOT against the shell's cwd. Always invoke as
+#     `docker compose -f ops/ha/docker-compose.yml ...` (or `cd ops/ha &&
+#     docker compose ...`). Do NOT pass `--project-directory <other>` —
+#     that would re-anchor `./` and HA would boot with a blank config.
+#   - Named volume `ha_data` is RESERVED for future use (e.g. snapshot
+#     storage that must survive `docker compose down` but not `down -v`).
+#     It is currently mounted at /data; `docker compose down -v` removes
+#     it, which aligns with the plan's `make ha-clean` recovery story.
+
+services:
+  homeassistant:
+    image: homeassistant/home-assistant:2026.4.4
+    container_name: hanui-homeassistant
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8123:8123"
+    volumes:
+      - ./:/config
+      - ha_data:/data
+    environment:
+      - TZ=UTC
+
+volumes:
+  ha_data:

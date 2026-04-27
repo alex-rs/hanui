@@ -1,0 +1,17 @@
+# Phase 2.5 — block-by-default + explicit allowlist.
+#
+# HA writes a large set of runtime files into /config (the bind-mount target
+# for ops/ha/). Some of those files contain auth tokens (.storage/auth) or
+# PII (shopping_list.json), and HA's `backup` integration writes tarballs of
+# the entire /config tree to backups/.  An allowlist-by-extension strategy is
+# fragile against future HA file additions.  This file blocks everything by
+# default and explicitly tracks only the 4 files we author.
+#
+# Per security-engineer review on PR #50.
+*
+
+# Files we author (tracked):
+!.gitignore
+!docker-compose.yml
+!configuration.yaml
+!automations.yaml
