@@ -321,6 +321,66 @@ pub fn event_to_entity_update(event: &crate::ha::protocol::EventPayload) -> Opti
     Some(EntityUpdate { id, entity })
 }
 
+/// Apply a single `service_registered` / `service_removed` event to the
+/// shared [`ServiceRegistryHandle`].
+///
+/// Returns `true` if the event matched a service-lifecycle variant and the
+/// registry was mutated (or the no-op remove path exercised); `false` if the
+/// event was anything else (the caller can fall through to other dispatch
+/// arms).  The handle's write-lock is acquired only for the duration of this
+/// single mutation — readers (`LiveStore::services_lookup`, Phase 3
+/// dispatchers) see at most a single-pair gap.
+///
+/// `service_registered` events apply with a default-empty
+/// [`crate::ha::services::ServiceMeta`] because HA's event payload does NOT
+/// carry the field schema (verified against the documented event shape at
+/// <https://www.home-assistant.io/docs/configuration/events/>).  The
+/// next successful `get_services` round refills the metadata; until then,
+/// `lookup` returns `Some(default_meta)` for the new pair, which is the
+/// correct "exists but schema unknown" signal for Phase 3 dispatchers — they
+/// can still resolve the `(domain, service)` and issue a `call_service`
+/// frame, just without parameter introspection.
+///
+/// `service_removed` events call [`crate::ha::services::ServiceRegistry::remove_service`],
+/// which is a documented no-op for unknown pairs (so a duplicate or
+/// out-of-order event can never panic).
+fn apply_service_lifecycle_event(
+    services: &ServiceRegistryHandle,
+    event: &crate::ha::protocol::EventPayload,
+) -> bool {
+    use crate::ha::services::ServiceMeta;
+    match &event.event {
+        EventVariant::ServiceRegistered(sl) => {
+            // `expect` (not `unwrap`) so a poisoned lock surfaces a clear
+            // panic message rather than the generic "called Result::unwrap
+            // on Err".  Same convention as the get_services apply site.
+            services
+                .write()
+                .expect("ServiceRegistry RwLock poisoned")
+                .add_service(&sl.data.domain, &sl.data.service, ServiceMeta::default());
+            tracing::info!(
+                domain = %sl.data.domain,
+                service = %sl.data.service,
+                "service_registered event applied to ServiceRegistry (default meta until next get_services)"
+            );
+            true
+        }
+        EventVariant::ServiceRemoved(sl) => {
+            services
+                .write()
+                .expect("ServiceRegistry RwLock poisoned")
+                .remove_service(&sl.data.domain, &sl.data.service);
+            tracing::info!(
+                domain = %sl.data.domain,
+                service = %sl.data.service,
+                "service_removed event applied to ServiceRegistry"
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal FSM phase
 // ---------------------------------------------------------------------------
@@ -797,7 +857,18 @@ impl WsClient {
                 Ok(Phase::Authenticating)
             }
 
-            // auth_ok → send subscribe_events, advance to Subscribing.
+            // auth_ok → send subscribe_events (subscribe-all), advance to
+            // Subscribing.
+            //
+            // TASK-049: `event_type` is `None`, which serializes the field
+            // OUT of the JSON.  HA's WS API documents this as "subscribe to
+            // all events on the bus".  Internal dispatch by `EventVariant`
+            // (in `Phase::Live` and during snapshot-buffer replay) routes
+            // `state_changed` to the entity store, `service_registered` /
+            // `service_removed` to the `ServiceRegistry`, and everything else
+            // is ignored.  This keeps the single-ACK gate and avoids an FSM
+            // phase explosion that three separate filtered subscriptions
+            // would have required.
             (Phase::Authenticating, InboundMsg::AuthOk(_)) => {
                 self.set_state(ConnectionState::Subscribing);
                 let subscribe_id = self.next_id();
@@ -805,12 +876,12 @@ impl WsClient {
                     .send(Message::Text(serde_json::to_string(
                         &OutboundMsg::SubscribeEvents(SubscribeEventsPayload {
                             id: subscribe_id,
-                            event_type: "state_changed".to_owned(),
+                            event_type: None,
                         }),
                     )?))
                     .await
                     .map_err(ClientError::Transport)?;
-                tracing::info!(id = subscribe_id, "subscribe_events sent");
+                tracing::info!(id = subscribe_id, "subscribe_events sent (all events)");
                 Ok(Phase::Subscribing { subscribe_id })
             }
 
@@ -947,12 +1018,26 @@ impl WsClient {
                 // Replay buffered events into the store (if any).  Buffered
                 // events arrived during snapshot fetch; replaying them after
                 // the snapshot is applied keeps the store consistent with HA.
+                //
+                // TASK-049: with the subscribe-all subscription, the buffer
+                // can also hold `service_registered` / `service_removed`
+                // events.  Apply them best-effort here — note that the
+                // `Phase::Services → Live` transition below will overwrite
+                // the registry with the authoritative `get_services` reply
+                // anyway, so service events arriving DURING the snapshot
+                // window are mostly redundant.  We still apply them for
+                // completeness so a `service_removed` arriving exactly
+                // before the get_services reply is not silently lost.
                 for buffered in event_buffer {
                     if let InboundMsg::Event(ev) = buffered {
                         if let Some(update) = event_to_entity_update(&ev) {
                             if let Some(store) = self.store.as_ref() {
                                 store.apply_changed_event(update);
                             }
+                        } else {
+                            // Service-lifecycle or unknown — best-effort
+                            // dispatch.  Ignored if the variant is `Other`.
+                            apply_service_lifecycle_event(&self.services, &ev);
                         }
                     }
                 }
@@ -1050,13 +1135,28 @@ impl WsClient {
                 ))
             }
 
-            // Live events: route to the attached store (if any) and update
-            // the stable-Live tracker so the backoff counter can reset.
+            // Live events: route to the attached store (state_changed) or to
+            // the shared `ServiceRegistry` (service_registered /
+            // service_removed), and update the stable-Live tracker so the
+            // backoff counter can reset.
+            //
+            // TASK-049: dispatch by `EventVariant` — `state_changed` flows to
+            // the entity store as before; service-lifecycle events flow into
+            // the shared `services_handle` so the LiveStore-side
+            // `services_lookup` accessor returns fresh state mid-session
+            // without waiting for a reconnect.  Unknown event types
+            // (`EventVariant::Other`) are silently ignored — the
+            // subscribe-all strategy means HA may emit events the client
+            // doesn't care about, and the FSM should not crash on them.
             (Phase::Live, InboundMsg::Event(event)) => {
                 if let Some(update) = event_to_entity_update(&event) {
                     if let Some(store) = self.store.as_ref() {
                         store.apply_changed_event(update);
                     }
+                } else {
+                    // Not a state_changed — try service-lifecycle dispatch.
+                    // Ignored if the variant is `Other` or any future type.
+                    apply_service_lifecycle_event(&self.services, &event);
                 }
                 self.on_live_event();
                 Ok(Phase::Live)
@@ -1323,7 +1423,13 @@ mod tests {
 
         let sub_f: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
         assert_eq!(sub_f["type"], "subscribe_events");
-        assert_eq!(sub_f["event_type"], "state_changed");
+        // TASK-049: subscribe-all — the `event_type` field MUST be absent
+        // from the serialized frame (HA treats absence, not `null`, as
+        // "all events").  This pins the wire-level guarantee.
+        assert!(
+            sub_f.get("event_type").is_none(),
+            "subscribe_events frame must omit `event_type` (subscribe-all); got: {sub_f}"
+        );
 
         let gs_f: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
         assert_eq!(gs_f["type"], "get_states");

@@ -11,9 +11,29 @@
 //! handed to Phase 3's action dispatcher, which calls [`ServiceRegistry::lookup`]
 //! to validate `(domain, service)` pairs before dispatching tap-actions.
 //!
-//! The registry also supports incremental updates via:
-//! - [`ServiceRegistry::add_service`] — applied on `service_registered` events.
-//! - [`ServiceRegistry::remove_service`] — applied on `service_removed` events.
+//! The registry is kept fresh between full re-fetches by incremental updates
+//! driven from the WS event stream (TASK-049):
+//! - [`ServiceRegistry::add_service`] is invoked from `src/ha/client.rs`
+//!   when a `service_registered` event arrives in `Phase::Live`.  HA does not
+//!   include the service's field schema in the event payload, so the
+//!   incremental entry is added with a default-empty [`ServiceMeta`]; the next
+//!   successful reconnect's `get_services` round refills the metadata.
+//!   Lookups in the meantime return `Some(default_meta)`, which is the correct
+//!   "exists but schema unknown" signal — Phase 3 dispatchers can still
+//!   resolve the `(domain, service)` pair and issue a `call_service` frame
+//!   without parameter introspection.
+//! - [`ServiceRegistry::remove_service`] is invoked when a `service_removed`
+//!   event arrives in `Phase::Live`.  Subsequent lookups for that pair return
+//!   `None`, matching the partial-failure contract below.
+//!
+//! Subscription wiring: TASK-049 changed the client's single
+//! `subscribe_events` frame to omit `event_type`, subscribing to ALL events on
+//! the bus.  HA's WS API documents this as the canonical way to receive
+//! multiple event types over one subscription; the FSM dispatches by
+//! `EventVariant` internally.  Trade-off: the client now sees every event
+//! type HA emits (most are ignored as `EventVariant::Other`), in exchange for
+//! a single ACK gate, no FSM phase explosion, and zero new sequencing
+//! invariants beyond the one that already exists.
 //!
 //! # Partial-failure handling (Risk #12)
 //!
@@ -24,6 +44,11 @@
 //! successful reconnect cycle re-issues `get_services` and refreshes the
 //! registry.  No special "is_empty" sentinel is needed — `None` from `lookup`
 //! is the correct rejection signal.
+//!
+//! Mid-session `service_registered` / `service_removed` events keep the
+//! registry fresh between full re-fetches; the "stale until reconnect"
+//! window therefore shrinks from "the lifetime of the WS session" to "the
+//! latency of one event delivery".
 //!
 //! [`lookup`]: ServiceRegistry::lookup
 

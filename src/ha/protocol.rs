@@ -160,10 +160,24 @@ pub struct AuthPayload {
 }
 
 /// Payload for the `subscribe_events` outbound frame.
+///
+/// `event_type` is `Option<String>` because HA's WS API documents the field as
+/// optional — omitting it subscribes to ALL events on the bus
+/// (<https://developers.home-assistant.io/docs/api/websocket/#subscribe-to-events>).
+/// TASK-049 changed the client from a `state_changed`-only filter to subscribe-all
+/// so `service_registered` / `service_removed` events flow on the same single
+/// subscription, with internal dispatch by [`EventVariant`].  The single-ACK
+/// gate is preserved (one outbound frame, one ACK to wait for) and so are
+/// the existing snapshot-buffer and ordering invariants.
+///
+/// `#[serde(skip_serializing_if = "Option::is_none")]` ensures the field is
+/// omitted from the serialized JSON when `None`, matching HA's expectation
+/// that absence — not `null` — means "all events".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscribeEventsPayload {
     pub id: u32,
-    pub event_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
 }
 
 /// Payload for the `get_states` outbound frame.
@@ -309,18 +323,77 @@ pub struct EventPayload {
 
 /// The discriminated union of event types arriving inside an `event` frame.
 ///
-/// `#[serde(untagged)]` is used because HA does not include a top-level type
-/// discriminator inside the event object itself — the event type is inferred
-/// from the fields present.  The `#[serde(other)]` pattern is not available
-/// for untagged enums; instead, the final `Other(Value)` variant catches
-/// everything that does not match a known shape.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// HA does not include a top-level discriminator field on the event object;
+/// the discriminator is the inner `event_type` string.  The previous
+/// implementation used `#[serde(untagged)]` and relied on serde's
+/// shape-matching to pick a variant — that worked when only `StateChanged`
+/// existed, but `ServiceRegistered` and `ServiceRemoved` (TASK-049) share an
+/// identical `{event_type, data:{domain,service}, origin, time_fired}` shape,
+/// so untagged could not distinguish them.
+///
+/// A custom [`Deserialize`] impl peeks at `event_type` and dispatches to the
+/// matching variant by value, falling back to [`EventVariant::Other`] for
+/// any unknown event type so the FSM continues to tolerate HA emitting new
+/// event types without crashing.
+///
+/// The `Serialize` impl is still derived; round-tripping a typed variant
+/// produces the exact JSON shape HA emitted.
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum EventVariant {
     /// A `state_changed` event.
     StateChanged(Box<StateChangedEvent>),
-    /// Any event whose shape does not match a known typed variant.
+    /// A `service_registered` event — HA fires this when a new service action
+    /// is registered with a domain (e.g., a freshly-loaded integration).
+    ///
+    /// The event payload at the WS level is documented as
+    /// `{event_type:"service_registered", data:{domain, service}, origin,
+    /// time_fired, ...}`.  HA does not include the service's metadata schema
+    /// in the event, so the client must default the [`crate::ha::services::ServiceMeta`]
+    /// fields to their `Default` values until the next `get_services` round.
+    /// See `src/ha/client.rs`'s `Phase::Live` event-dispatch arm for the
+    /// register-time apply.
+    ServiceRegistered(Box<ServiceLifecycleEvent>),
+    /// A `service_removed` event — HA fires this when a service action is
+    /// removed (e.g., an integration is unloaded).
+    ///
+    /// Payload is structurally identical to [`EventVariant::ServiceRegistered`]:
+    /// `{event_type:"service_removed", data:{domain, service}, ...}`.
+    ServiceRemoved(Box<ServiceLifecycleEvent>),
+    /// Any event whose `event_type` does not match a known typed variant.
+    ///
+    /// The full raw JSON is preserved so future variants can be added without
+    /// silently discarding data.
     Other(Value),
+}
+
+impl<'de> Deserialize<'de> for EventVariant {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Two-step: deserialize to Value, peek `event_type`, dispatch.  Mirrors
+        // the existing `InboundMsg` Deserialize pattern at the top of this file.
+        // The clone of `raw_value` for the typed `from_value` call is acceptable
+        // because the parse path is not hot — events arrive at human-scale
+        // frequencies, not tight-loop frequencies.
+        let raw_value = Value::deserialize(deserializer)?;
+
+        let event_type = raw_value
+            .get("event_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        match event_type {
+            "state_changed" => serde_json::from_value::<StateChangedEvent>(raw_value)
+                .map(|sc| EventVariant::StateChanged(Box::new(sc)))
+                .map_err(serde::de::Error::custom),
+            "service_registered" => serde_json::from_value::<ServiceLifecycleEvent>(raw_value)
+                .map(|sl| EventVariant::ServiceRegistered(Box::new(sl)))
+                .map_err(serde::de::Error::custom),
+            "service_removed" => serde_json::from_value::<ServiceLifecycleEvent>(raw_value)
+                .map(|sl| EventVariant::ServiceRemoved(Box::new(sl)))
+                .map_err(serde::de::Error::custom),
+            _ => Ok(EventVariant::Other(raw_value)),
+        }
+    }
 }
 
 /// A `state_changed` event nested inside an `event` frame.
@@ -343,6 +416,37 @@ pub struct StateChangedData {
     pub new_state: Option<RawEntityState>,
     /// The old state; `None` for a newly-created entity.
     pub old_state: Option<RawEntityState>,
+}
+
+/// A `service_registered` or `service_removed` event nested inside an `event`
+/// frame.
+///
+/// Both event types share the exact same payload structure per HA's
+/// documentation
+/// (<https://www.home-assistant.io/docs/configuration/events/>):
+/// `{event_type, data:{domain, service}, origin, time_fired}`.  The variant
+/// in [`EventVariant`] is the discriminator the client uses to decide between
+/// `add_service` and `remove_service`; the `event_type` field on this struct
+/// is preserved for diagnostics and for round-trip serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceLifecycleEvent {
+    pub event_type: String,
+    pub data: ServiceLifecycleData,
+    pub origin: String,
+    pub time_fired: String,
+}
+
+/// The `data` block inside a `service_registered` or `service_removed` event.
+///
+/// HA's documented schema lists exactly two fields — `domain` and `service`.
+/// No `ServiceMeta` is included; on `service_registered` the client MUST
+/// populate the registry with a default-empty [`crate::ha::services::ServiceMeta`]
+/// because the event does not carry the field schema.  The next successful
+/// `get_services` round refills it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceLifecycleData {
+    pub domain: String,
+    pub service: String,
 }
 
 /// A raw entity state as received from HA in event or snapshot frames.
@@ -437,16 +541,45 @@ mod tests {
     }
 
     #[test]
-    fn outbound_subscribe_events_round_trip() {
+    fn outbound_subscribe_events_with_specific_type_round_trip() {
+        // Backwards-compat: a `Some(event_type)` still serializes the field
+        // (used by callers that want to filter to a single event type).
         let msg = OutboundMsg::SubscribeEvents(SubscribeEventsPayload {
             id: 1,
-            event_type: "state_changed".to_owned(),
+            event_type: Some("state_changed".to_owned()),
         });
         let json = serde_json::to_string(&msg).unwrap();
         let v: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "subscribe_events");
         assert_eq!(v["id"], 1);
         assert_eq!(v["event_type"], "state_changed");
+    }
+
+    #[test]
+    fn outbound_subscribe_events_with_none_omits_event_type_for_all_events() {
+        // TASK-049: the client uses `event_type: None` to subscribe to ALL
+        // events (so `service_registered` / `service_removed` flow on the
+        // same single subscription).  HA's WS API requires the field to be
+        // ABSENT — not `null` — to mean "all events".  This test pins the
+        // serialization shape against accidental regression to a `null` value
+        // (which `#[serde(default)]` on the `Option` would otherwise allow).
+        let msg = OutboundMsg::SubscribeEvents(SubscribeEventsPayload {
+            id: 7,
+            event_type: None,
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "subscribe_events");
+        assert_eq!(v["id"], 7);
+        assert!(
+            v.get("event_type").is_none(),
+            "event_type must be ABSENT (not null) when None; got JSON: {json}"
+        );
+        assert!(
+            !json.contains("event_type"),
+            "serialized JSON must not contain the event_type key at all when None; \
+             got: {json}"
+        );
     }
 
     #[test]
@@ -641,6 +774,110 @@ mod tests {
                     );
                 }
                 other => panic!("expected StateChanged, got: {other:?}"),
+            },
+            other => panic!("expected Event, got: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Inbound: event { service_registered }
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn inbound_event_service_registered_deserializes() {
+        // TASK-049: HA emits `service_registered` events on the WS bus when an
+        // integration registers a new service action.  The client must parse
+        // these into a typed variant so the FSM can apply them to the shared
+        // `ServiceRegistry` rather than drop them as `Other(Value)`.
+        let json = r#"{
+            "type": "event",
+            "id": 1,
+            "event": {
+                "event_type": "service_registered",
+                "data": {
+                    "domain": "light",
+                    "service": "toggle"
+                },
+                "origin": "LOCAL",
+                "time_fired": "2024-04-01T12:00:00.000000+00:00"
+            }
+        }"#;
+        let msg = serde_json::from_str::<InboundMsg>(json).unwrap();
+        match msg {
+            InboundMsg::Event(p) => match &p.event {
+                EventVariant::ServiceRegistered(sr) => {
+                    assert_eq!(sr.event_type, "service_registered");
+                    assert_eq!(sr.data.domain, "light");
+                    assert_eq!(sr.data.service, "toggle");
+                    assert_eq!(sr.origin, "LOCAL");
+                }
+                other => panic!("expected ServiceRegistered, got: {other:?}"),
+            },
+            other => panic!("expected Event, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inbound_event_service_removed_deserializes_distinctly_from_registered() {
+        // Co-assertion proves the custom Deserialize uses `event_type` as the
+        // discriminator (not just shape-matching, which would conflate
+        // service_registered and service_removed since their data shapes are
+        // identical).
+        let json = r#"{
+            "type": "event",
+            "id": 1,
+            "event": {
+                "event_type": "service_removed",
+                "data": {
+                    "domain": "switch",
+                    "service": "deprecated_action"
+                },
+                "origin": "LOCAL",
+                "time_fired": "2024-04-01T12:00:01.000000+00:00"
+            }
+        }"#;
+        let msg = serde_json::from_str::<InboundMsg>(json).unwrap();
+        match msg {
+            InboundMsg::Event(p) => match &p.event {
+                EventVariant::ServiceRemoved(sr) => {
+                    assert_eq!(sr.event_type, "service_removed");
+                    assert_eq!(sr.data.domain, "switch");
+                    assert_eq!(sr.data.service, "deprecated_action");
+                }
+                EventVariant::ServiceRegistered(_) => {
+                    panic!(
+                        "service_removed must NOT deserialize as ServiceRegistered \
+                         — the event_type field is the discriminator"
+                    );
+                }
+                other => panic!("expected ServiceRemoved, got: {other:?}"),
+            },
+            other => panic!("expected Event, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inbound_event_unknown_event_type_falls_through_to_other() {
+        // A future HA event type the client doesn't yet recognise must not
+        // crash deserialization — it falls through to EventVariant::Other and
+        // the FSM ignores it.  Pins the resilience profile.
+        let json = r#"{
+            "type": "event",
+            "id": 1,
+            "event": {
+                "event_type": "future_event_from_ha_next_version",
+                "data": {"any": "shape"},
+                "origin": "LOCAL",
+                "time_fired": "2024-04-01T12:00:00.000000+00:00"
+            }
+        }"#;
+        let msg = serde_json::from_str::<InboundMsg>(json).unwrap();
+        match msg {
+            InboundMsg::Event(p) => match &p.event {
+                EventVariant::Other(v) => {
+                    assert_eq!(v["event_type"], "future_event_from_ha_next_version");
+                }
+                other => panic!("expected Other, got: {other:?}"),
             },
             other => panic!("expected Event, got: {other:?}"),
         }

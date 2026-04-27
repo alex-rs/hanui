@@ -1074,3 +1074,297 @@ async fn scenario_services_registry_visible_from_test_task_via_live_store() {
 
     ws_task.abort();
 }
+
+// ---------------------------------------------------------------------------
+// TASK-049: live registry freshness via service_registered / service_removed
+// events.
+//
+// Codex's post-rescue audit (2026-04-27) flagged that the client subscribed
+// only to `state_changed` events; service-lifecycle events from the HA bus
+// were never observed.  A long-running session would therefore see stale
+// service capabilities until the next reconnect — Phase 3's command
+// dispatcher would either reject newly-registered tap targets or attempt
+// removed ones.
+//
+// TASK-048 made the `ServiceRegistry` cross-task-reachable; TASK-049 wires
+// the EVENT path that mutates it.  These scenarios prove the invariant
+// end-to-end: drive the FSM to Live, inject a service-lifecycle event, and
+// observe the cross-task `LiveStore::services_lookup` accessor reflect the
+// change without a reconnect.
+// ---------------------------------------------------------------------------
+
+/// Build a `service_registered` event JSON frame for `inject_event`.
+///
+/// `subscription_id` is the id of the `subscribe_events` request being
+/// answered (HA echoes this back in every event frame).  Local helper rather
+/// than a `tests/common/mock_ws.rs` addition because TASK-049's allowlist
+/// scopes integration-test edits to this file only.
+fn service_registered_event_json(subscription_id: u32, domain: &str, service: &str) -> String {
+    format!(
+        r#"{{"type":"event","id":{subscription_id},"event":{{"event_type":"service_registered","data":{{"domain":"{domain}","service":"{service}"}},"origin":"LOCAL","time_fired":"2024-04-01T12:00:00.000000+00:00"}}}}"#
+    )
+}
+
+/// Build a `service_removed` event JSON frame for `inject_event`.
+fn service_removed_event_json(subscription_id: u32, domain: &str, service: &str) -> String {
+    format!(
+        r#"{{"type":"event","id":{subscription_id},"event":{{"event_type":"service_removed","data":{{"domain":"{domain}","service":"{service}"}},"origin":"LOCAL","time_fired":"2024-04-01T12:00:01.000000+00:00"}}}}"#
+    )
+}
+
+/// Spin until `cond()` returns true or the deadline elapses.  Returns true on
+/// success, false on timeout.
+async fn wait_until<F: Fn() -> bool>(cond: F, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if cond() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn scenario_service_registered_event_updates_registry() {
+    // Initial registry contains exactly `light.turn_on` (so the test can
+    // distinguish "registered via event" from "registered via initial
+    // get_services").
+    let server = MockWsServer::start().await;
+    server.script_auth_ok().await;
+    server.script_subscribe_ack().await;
+    server.script_get_states_reply("[]").await;
+    server
+        .script_get_services_reply(r#"{"light":{"turn_on":{"name":"Turn on","fields":{}}}}"#)
+        .await;
+
+    let services_handle = hanui::ha::services::ServiceRegistry::new_handle();
+    let store: Arc<LiveStore> =
+        Arc::new(LiveStore::new().with_services_handle(services_handle.clone()));
+    let store_for_ws: Arc<dyn hanui::ha::client::SnapshotApplier> = store.clone();
+
+    let config = make_config(&server.ws_url, "tok-svc-registered");
+    let (state_tx, mut state_rx) = status::channel();
+    let mut client = WsClient::new(config, state_tx)
+        .with_store(store_for_ws)
+        .with_registry(services_handle.clone());
+
+    let ws_task = tokio::spawn(async move { client.run().await });
+
+    assert!(
+        wait_for_state(&mut state_rx, ConnectionState::Live, Duration::from_secs(5)).await,
+        "client must reach Live before the service event can be observed"
+    );
+
+    // Pre-condition: the brand-new pair is NOT yet in the registry — only
+    // `light.turn_on` from the initial get_services payload.  This guards
+    // against a regression where every (domain, service) lookup returns Some
+    // (e.g. a stub that always says yes).
+    assert!(
+        store.services_lookup("light", "turn_on").is_some(),
+        "initial get_services payload must populate light.turn_on"
+    );
+    assert!(
+        store.services_lookup("script", "shop_run").is_none(),
+        "the script.shop_run pair must NOT be in the registry before the event"
+    );
+
+    // Inject the service_registered event for a brand-new (domain, service)
+    // pair the initial payload did not include.
+    server
+        .inject_event(service_registered_event_json(1, "script", "shop_run"))
+        .await;
+
+    // Cross-task observation: the WS task absorbs the event and writes to the
+    // shared registry; this test task reads via the LiveStore accessor.  Use
+    // a bounded spin so a regression (event dropped) fails fast.
+    let store_for_wait = store.clone();
+    let observed = wait_until(
+        move || {
+            store_for_wait
+                .services_lookup("script", "shop_run")
+                .is_some()
+        },
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(
+        observed,
+        "TASK-049 regression: service_registered event did not flow into the \
+         shared ServiceRegistry within 2s — the event-dispatch path is missing"
+    );
+
+    // Negative co-assertion: the previously-known pair must still be present
+    // (the event added a new pair, didn't replace the registry).
+    assert!(
+        store.services_lookup("light", "turn_on").is_some(),
+        "service_registered event must NOT clobber unrelated pairs"
+    );
+
+    ws_task.abort();
+}
+
+#[tokio::test]
+async fn scenario_service_removed_event_evicts_from_registry() {
+    // Start with a populated registry covering 2 domains × 2 services so we
+    // can assert that ONE pair is evicted while siblings remain.
+    let server = MockWsServer::start().await;
+    server.script_auth_ok().await;
+    server.script_subscribe_ack().await;
+    server.script_get_states_reply("[]").await;
+    server
+        .script_get_services_reply(
+            r#"{
+                "light":{
+                    "turn_on":{"name":"Turn on","fields":{}},
+                    "turn_off":{"name":"Turn off","fields":{}}
+                },
+                "switch":{
+                    "turn_on":{"name":"Switch on","fields":{}},
+                    "turn_off":{"name":"Switch off","fields":{}}
+                }
+            }"#,
+        )
+        .await;
+
+    let services_handle = hanui::ha::services::ServiceRegistry::new_handle();
+    let store: Arc<LiveStore> =
+        Arc::new(LiveStore::new().with_services_handle(services_handle.clone()));
+    let store_for_ws: Arc<dyn hanui::ha::client::SnapshotApplier> = store.clone();
+
+    let config = make_config(&server.ws_url, "tok-svc-removed");
+    let (state_tx, mut state_rx) = status::channel();
+    let mut client = WsClient::new(config, state_tx)
+        .with_store(store_for_ws)
+        .with_registry(services_handle.clone());
+
+    let ws_task = tokio::spawn(async move { client.run().await });
+
+    assert!(
+        wait_for_state(&mut state_rx, ConnectionState::Live, Duration::from_secs(5)).await,
+        "client must reach Live before the service event can be observed"
+    );
+
+    // Pre-condition: all four pairs are present.
+    assert!(store.services_lookup("light", "turn_on").is_some());
+    assert!(store.services_lookup("light", "turn_off").is_some());
+    assert!(store.services_lookup("switch", "turn_on").is_some());
+    assert!(store.services_lookup("switch", "turn_off").is_some());
+
+    // Inject service_removed for ONE pair.
+    server
+        .inject_event(service_removed_event_json(1, "light", "turn_on"))
+        .await;
+
+    let store_for_wait = store.clone();
+    let evicted = wait_until(
+        move || store_for_wait.services_lookup("light", "turn_on").is_none(),
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(
+        evicted,
+        "TASK-049 regression: service_removed event did not evict light.turn_on \
+         from the shared ServiceRegistry within 2s"
+    );
+
+    // Sibling pairs must remain — the event removed exactly one (domain,
+    // service), not the whole domain or the whole registry.  This co-assertion
+    // protects against an over-broad eviction regression.
+    assert!(
+        store.services_lookup("light", "turn_off").is_some(),
+        "sibling service in same domain (light.turn_off) must remain"
+    );
+    assert!(
+        store.services_lookup("switch", "turn_on").is_some(),
+        "service in different domain (switch.turn_on) must remain"
+    );
+    assert!(
+        store.services_lookup("switch", "turn_off").is_some(),
+        "service in different domain (switch.turn_off) must remain"
+    );
+
+    ws_task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// TASK-049: subscribe-all preserves the existing subscribe-ACK ordering
+// invariant.
+//
+// The ACK gate must still be a real gate — the FSM cannot send `get_states`
+// before the single `subscribe_events` ACK has left the mock.  Codex's audit
+// (TASK-046 finding 6) introduced the wall-clock proof for the previous
+// `state_changed`-filtered subscription; with TASK-049 changing to
+// subscribe-all (no `event_type` field), the same invariant must continue to
+// hold.  This test is the regression boundary: it pins both
+//   (a) that the subscribe_events frame OMITS `event_type` (subscribe-all),
+//   (b) that get_states still arrives strictly AFTER the ACK send completes,
+//   (c) that exactly ONE subscribe_events frame is sent (not three).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn scenario_subscribe_all_preserves_ack_gate_and_omits_event_type() {
+    let server = MockWsServer::start().await;
+    server.script_auth_ok().await;
+    server.script_subscribe_ack().await;
+    server.script_get_states_reply("[]").await;
+    server.script_get_services_reply("{}").await;
+
+    let config = make_config(&server.ws_url, "tok-task-049-subscribe-all");
+    let (mut state_rx, _handle) = spawn_client(config, None);
+
+    assert!(wait_for_state(&mut state_rx, ConnectionState::Live, Duration::from_secs(5)).await);
+
+    let recorded = server.recorded_requests().await;
+    let sub_frame = recorded
+        .iter()
+        .find(|r| r.kind == "subscribe_events")
+        .expect("subscribe_events must be recorded");
+
+    // (a) Wire-level guarantee: the frame must omit `event_type`.  HA's WS
+    // API treats absence (not `null`) as "subscribe to all events"; the
+    // serializer's `skip_serializing_if = "Option::is_none"` enforces this
+    // — this assertion pins it against accidental regression to a `null`
+    // value or a hard-coded "state_changed".
+    let sub_v: serde_json::Value = serde_json::from_str(&sub_frame.body)
+        .expect("subscribe_events frame body must be valid JSON");
+    assert!(
+        sub_v.get("event_type").is_none(),
+        "TASK-049: subscribe_events frame must omit `event_type` (subscribe-all); got: {sub_v}"
+    );
+
+    // (b) ACK-gate ordering invariant (TASK-046 finding 6) preserved under
+    // subscribe-all.  Same wall-clock comparison as
+    // `scenario_subscribe_ack_before_snapshot_ordering` — proves the FSM
+    // really waits for the ACK before sending get_states.
+    let snap_frame = recorded
+        .iter()
+        .find(|r| r.kind == "get_states")
+        .expect("get_states must be recorded");
+    let ack_sent_at = server
+        .subscribe_ack_sent_at()
+        .await
+        .expect("mock must have recorded a subscribe_ack send by the time Live is reached");
+    assert!(
+        snap_frame.received_at > ack_sent_at,
+        "TASK-049 regression: get_states received_at ({:?}) is NOT strictly AFTER \
+         subscribe_events ACK sent_at ({:?}); the single ACK gate is no longer real",
+        snap_frame.received_at,
+        ack_sent_at,
+    );
+
+    // (c) Single subscribe_events frame — subscribe-all means one
+    // subscription, not three.  Pins the design choice (option b in the PR
+    // body) against accidental regression to multi-subscription.
+    let sub_count = recorded
+        .iter()
+        .filter(|r| r.kind == "subscribe_events")
+        .count();
+    assert_eq!(
+        sub_count, 1,
+        "TASK-049 design: exactly ONE subscribe_events frame (subscribe-all), \
+         not three filtered subscriptions; got {sub_count}"
+    );
+}
