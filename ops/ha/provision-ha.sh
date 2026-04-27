@@ -597,17 +597,25 @@ main() {
   generate_llat
 
   # Discard the password as soon as the LLAT is in hand. The LLAT is the
-  # durable credential; the password is no longer useful.
+  # durable credential; the password is no longer useful. The LLAT itself
+  # is held in `_llat` until step 9 (post-template-verify) so that the env
+  # fragment is emitted to stdout ONLY after every "success" precondition
+  # has passed — atomic-on-success in the TASK-052 acceptance criteria
+  # means "HA up + onboarded + LLAT generated + templates loaded". Emitting
+  # before template verification would let the caller write a `.env.local`
+  # for an instance whose templates failed to load.
   unset _admin_password
   unset _short_token
 
-  # Step 7: emit env fragment to stdout. Caller writes to host .env.local.
-  emit_env_fragment
-
-  # Step 8 + 9: restart + verify templates loaded.
+  # Steps 8 + 9: restart + verify templates loaded (BEFORE emit).
   compose_restart
   wait_for_ha_http
   verify_template_loaded
+
+  # Step 7 (final): emit env fragment to stdout — last action in the
+  # success path. Any earlier failure exits non-zero before we get here,
+  # so the caller never sees a partial success token.
+  emit_env_fragment
 
   # Discard the LLAT from script memory (it's already on stdout).
   unset _llat
