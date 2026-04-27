@@ -253,7 +253,19 @@ fn run_with_live_store(runtime: &tokio::runtime::Runtime) -> Result<()> {
     info!(url = %config.url, "loaded HA config");
 
     let (state_tx, state_rx) = status::channel();
-    let store: Arc<LiveStore> = Arc::new(LiveStore::new());
+
+    // TASK-048: construct a single shared `ServiceRegistryHandle` once, then
+    // clone it into both the `LiveStore` (read side; what `LiveBridge` and
+    // Phase 3 dispatchers consult via `services_lookup`) and the `WsClient`
+    // (write side; populated on `Phase::Services → Live`).  A single
+    // `Arc<RwLock<ServiceRegistry>>` backs both endpoints, which is the
+    // cross-task reachability fix codex's post-rescue audit flagged as a
+    // Phase 3 blocker.  Without this wiring the WS task could populate the
+    // registry but no other task could read it.
+    let services_handle = crate::ha::services::ServiceRegistry::new_handle();
+
+    let store: Arc<LiveStore> =
+        Arc::new(LiveStore::new().with_services_handle(services_handle.clone()));
     let store_for_bridge: Arc<dyn EntityStore> = store.clone();
     let dashboard = Arc::new(default_dashboard());
 
@@ -285,8 +297,17 @@ fn run_with_live_store(runtime: &tokio::runtime::Runtime) -> Result<()> {
     // codex's post-shipment audit caught.  The store reference is shared (Arc),
     // so the same backing snapshot is mutated by `WsClient` and read by
     // `LiveBridge`.
+    //
+    // TASK-048: also forward the shared `services_handle` into the WS task so
+    // the `Phase::Services → Live` write site mutates the SAME registry the
+    // `LiveStore` reads from.
     let store_for_ws: Arc<dyn SnapshotApplier> = store.clone();
-    let ws_handle = runtime.spawn(run_ws_client(config, state_tx, store_for_ws));
+    let ws_handle = runtime.spawn(run_ws_client(
+        config,
+        state_tx,
+        store_for_ws,
+        services_handle,
+    ));
 
     // Spawn the bridge.  The returned handle is held until window.run() exits;
     // dropping it aborts the bridge's tasks (per LiveBridge::Drop).  This is
@@ -309,19 +330,30 @@ fn run_with_live_store(runtime: &tokio::runtime::Runtime) -> Result<()> {
 
 /// Construct a [`WsClient`] wired to share state with a [`LiveStore`].
 ///
-/// Pure factory: takes the config, the state-broadcast sender, and an
-/// `Arc<dyn SnapshotApplier>` (typically `Arc<LiveStore>`); returns the wired
-/// client.  Exercised by both [`run_ws_client`] (production path) and the unit
-/// test in this file's `tests` module — extracting the wire-up makes the
-/// `with_store(...)` call covered by a fast in-process test rather than only by
-/// the integration test in `tests/integration/ws_client.rs`, which routes
-/// through a different entry point.
+/// Pure factory: takes the config, the state-broadcast sender, an
+/// `Arc<dyn SnapshotApplier>` (typically `Arc<LiveStore>`), and the shared
+/// [`ServiceRegistryHandle`] that the `LiveStore` was constructed with;
+/// returns the wired client.  Exercised by both [`run_ws_client`] (production
+/// path) and the unit test in this file's `tests` module — extracting the
+/// wire-up makes the `with_store(...) + with_registry(...)` calls covered by
+/// a fast in-process test rather than only by the integration test in
+/// `tests/integration/ws_client.rs`, which routes through a different entry
+/// point.
+///
+/// TASK-048: signature now takes a `ServiceRegistryHandle` and threads it
+/// through `WsClient::with_registry` so the resulting client and the passed
+/// `LiveStore` share the same backing `Arc<RwLock<ServiceRegistry>>`.
+///
+/// [`ServiceRegistryHandle`]: crate::ha::services::ServiceRegistryHandle
 fn build_ws_client_with_store(
     config: Config,
     state_tx: tokio::sync::watch::Sender<ConnectionState>,
     store: Arc<dyn SnapshotApplier>,
+    services_handle: crate::ha::services::ServiceRegistryHandle,
 ) -> WsClient {
-    WsClient::new(config, state_tx).with_store(store)
+    WsClient::new(config, state_tx)
+        .with_store(store)
+        .with_registry(services_handle)
 }
 
 /// WS reconnect loop — the outer wrapper around `WsClient::run`.
@@ -345,15 +377,25 @@ fn build_ws_client_with_store(
 /// FSM parses snapshots and events but never persists them — the bug codex's
 /// post-shipment audit found.  The store ref is shared with [`LiveBridge`],
 /// so a single snapshot drives both the WS write side and the UI read side.
+///
+/// # TASK-048
+///
+/// Also takes a [`ServiceRegistryHandle`] and forwards it into the
+/// `WsClient` via [`WsClient::with_registry`], so the FSM populates the same
+/// registry the `LiveStore` exposes via `services_lookup`.  This is what
+/// makes the `ServiceRegistry` reachable from a task other than this one.
+///
+/// [`ServiceRegistryHandle`]: crate::ha::services::ServiceRegistryHandle
 async fn run_ws_client(
     config: Config,
     state_tx: tokio::sync::watch::Sender<ConnectionState>,
     store: Arc<dyn SnapshotApplier>,
+    services_handle: crate::ha::services::ServiceRegistryHandle,
 ) {
     use rand::rngs::SmallRng;
     use rand::SeedableRng;
 
-    let mut client = build_ws_client_with_store(config, state_tx, store);
+    let mut client = build_ws_client_with_store(config, state_tx, store, services_handle);
     let mut rng = SmallRng::from_entropy();
 
     loop {
@@ -684,19 +726,29 @@ mod tests {
         // coverage lives in src/ui/bridge.rs (test module's RecordingSink).
     }
 
-    /// `build_ws_client_with_store` returns a `WsClient` whose `services()`
-    /// accessor reports an empty `ServiceRegistry` (the FSM populates it later
-    /// via the `get_services` reply, never at construction time).  This is the
-    /// minimal observable post-condition of the helper that does not require a
-    /// live transport: it confirms the client object was constructed and the
-    /// `with_store(...)` call did not panic, which is the line we need to
-    /// cover for the per-file ratchet.
+    /// `build_ws_client_with_store` wires the `WsClient` and the `LiveStore`
+    /// to the SAME shared `ServiceRegistryHandle`.
+    ///
+    /// TASK-048: this replaces the prior tautological test
+    /// (`...returns_client_with_empty_registry`) that codex and opencode both
+    /// flagged as theatre — its only assertion was that
+    /// `ServiceRegistry::new()` is empty, which is a property of `Default`.
+    /// The replacement asserts the actual invariant `build_ws_client_with_store`
+    /// is responsible for: client and store reference the same backing
+    /// `Arc<RwLock<ServiceRegistry>>`.  Two complementary checks:
+    ///
+    /// 1. `Arc::ptr_eq` between `client.services_handle()` and
+    ///    `live_store.services_handle()` — proves they alias the same Arc.
+    /// 2. Mutate via the WsClient-side handle (write-lock + add_service);
+    ///    read back through the LiveStore-side `services_lookup`.  Proves
+    ///    the lock is genuinely shared (not just two Arcs to identical
+    ///    initial state).
     ///
     /// We construct `Config` via `Config::from_env`, holding a serialized lock
     /// across the env mutation + parse so this does not race with the other
     /// env-touching test in this module.
     #[test]
-    fn build_ws_client_with_store_returns_client_with_empty_registry() {
+    fn build_ws_client_with_store_shares_registry_handle_with_live_store() {
         use std::sync::Mutex;
         static LOCK: Mutex<()> = Mutex::new(());
         let _guard = LOCK.lock().unwrap();
@@ -716,23 +768,64 @@ mod tests {
             std::env::remove_var("HA_TOKEN");
         }
 
-        let (state_tx, _state_rx) = status::channel();
-        let store: Arc<LiveStore> = Arc::new(LiveStore::new());
+        // Replicate run_with_live_store wiring: construct the registry once,
+        // clone into both the LiveStore and the WsClient via
+        // build_ws_client_with_store.
+        let services_handle = crate::ha::services::ServiceRegistry::new_handle();
+        let store: Arc<LiveStore> =
+            Arc::new(LiveStore::new().with_services_handle(services_handle.clone()));
         let store_for_ws: Arc<dyn SnapshotApplier> = store.clone();
 
-        let client = build_ws_client_with_store(config, state_tx, store_for_ws);
+        let (state_tx, _state_rx) = status::channel();
+        let client =
+            build_ws_client_with_store(config, state_tx, store_for_ws, services_handle.clone());
 
-        // Pre-handshake the registry must be empty — `lookup` returns `None`
-        // for any (domain, service) pair until the FSM has processed a
-        // `get_services` reply.  This asserts the helper produced a valid
-        // client with the documented initial state, not a half-constructed one.
+        // Invariant 1: client and store reference the same Arc.  This is the
+        // structural proof that `with_registry` and `with_services_handle`
+        // both consumed the same handle.
+        let client_handle = client.services_handle();
+        let store_handle = store.services_handle();
         assert!(
-            client.services().lookup("light", "turn_on").is_none(),
-            "freshly constructed client must report an empty ServiceRegistry"
+            Arc::ptr_eq(&client_handle, &store_handle),
+            "build_ws_client_with_store must wire client and store to the same \
+             ServiceRegistryHandle Arc; Arc::ptr_eq returned false"
         );
+
+        // Invariant 2: mutating through the client-side handle is observable
+        // via the store-side accessor.  We bypass the FSM (no live transport)
+        // and write directly through the shared lock, then read via the
+        // LiveStore API a Phase 3 dispatcher would use.
+        {
+            let mut guard = client_handle
+                .write()
+                .expect("ServiceRegistry RwLock poisoned");
+            guard.add_service(
+                "light",
+                "turn_on",
+                crate::ha::services::ServiceMeta {
+                    name: "Turn on".to_owned(),
+                    ..Default::default()
+                },
+            );
+        }
+        let observed = store.services_lookup("light", "turn_on");
         assert!(
-            client.services().lookup("switch", "turn_off").is_none(),
-            "freshly constructed client must report an empty ServiceRegistry"
+            observed.is_some(),
+            "service added via client-side write-lock must be visible via \
+             LiveStore::services_lookup; the shared Arc is not actually shared"
+        );
+        assert_eq!(
+            observed.expect("checked is_some above").name,
+            "Turn on",
+            "service metadata must round-trip through the shared registry"
+        );
+
+        // And an unknown lookup still returns None — confirms the handle
+        // isn't returning a stub that always says Some.
+        assert!(
+            store.services_lookup("nonexistent", "x").is_none(),
+            "unknown (domain, service) must still return None through the \
+             shared registry"
         );
     }
 
