@@ -30,16 +30,75 @@ lint:
 check: lint test
 	@echo "All checks passed."
 
-# One-shot Docker install for VMs that booted before TASK-050.
-# Cloud-init now installs docker.io + docker-compose-plugin on freshly
-# provisioned VMs; this target covers existing VMs so they don't require
-# a full rebuild. Idempotent: apt-get install -y on already-installed
-# packages is a no-op aside from the index refresh.
-# See docs/plans/2026-04-27-phase-2.5-local-ha-target.md (Risk #14) for
-# the cloud-init-vs-make-vm-docker drift acknowledgement.
+# One-shot Docker install for VMs that booted before TASK-056.
+# Cloud-init (vm/cloud-init/user-data) installs the same `docker-ce`
+# family on freshly provisioned VMs via /usr/local/bin/install-docker.sh;
+# this target ships the SAME install sequence over SSH for older VMs
+# whose cloud-init ran before TASK-056 and lacks that script.
+#
+# Why `docker-ce` and not Debian's `docker.io`: `docker-compose-plugin`
+# is not in Debian 12 stable apt — it ships only in Docker's upstream
+# repo. `docker-ce` (Docker's package) provides /usr/bin/docker and
+# REPLACES `docker.io` (they conflict on the same path), so we install
+# the full `docker-ce` family from the upstream repo.
+#
+# Security: the recipe pins Docker's published GPG-key fingerprint
+# (9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88, per
+# https://docs.docker.com/engine/install/debian/) and refuses to install
+# if it mismatches. This is the load-bearing control against a
+# compromised Docker apt repo (security-engineer review).
+#
+# Idempotent: skips key-fetch if /etc/apt/keyrings/docker.asc exists,
+# skips sources-add if /etc/apt/sources.list.d/docker.list exists,
+# `apt-get install` is a no-op for already-installed packages.
+#
+# Implementation note: the install script is defined as a Make variable
+# (`define ... endef`) and exported to the environment, then piped to
+# `sudo bash -s` over SSH. This keeps the heredoc-style multi-line
+# script working without `.ONESHELL:` (which would change semantics for
+# every other recipe in this file).
+define VM_DOCKER_INSTALL_SCRIPT
+set -euo pipefail
+DOCKER_GPG_FINGERPRINT='9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88'
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y --no-install-recommends ca-certificates curl gnupg
+install -m 0755 -d /etc/apt/keyrings
+if [ ! -f /etc/apt/keyrings/docker.asc ]; then
+  curl -fsSL https://download.docker.com/linux/debian/gpg \
+    -o /etc/apt/keyrings/docker.asc
+  chmod a+r /etc/apt/keyrings/docker.asc
+fi
+actual_fpr=$$(gpg --dry-run --quiet --no-keyring \
+  --import --import-options import-show \
+  /etc/apt/keyrings/docker.asc 2>/dev/null \
+  | awk '/^ +[0-9A-F ]+$$/ { print; exit }' \
+  | tr -d ' ')
+expected_fpr=$$(echo "$$DOCKER_GPG_FINGERPRINT" | tr -d ' ')
+if [ "$$actual_fpr" != "$$expected_fpr" ]; then
+  echo "ERROR: Docker GPG key fingerprint mismatch." >&2
+  echo "       expected: $$expected_fpr" >&2
+  echo "       actual:   $$actual_fpr" >&2
+  echo "       refusing to install -- possible apt repo compromise." >&2
+  exit 1
+fi
+if [ ! -f /etc/apt/sources.list.d/docker.list ]; then
+  arch=$$(dpkg --print-architecture)
+  codename=$$(. /etc/os-release && echo "$$VERSION_CODENAME")
+  echo "deb [arch=$${arch} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $${codename} stable" \
+    > /etc/apt/sources.list.d/docker.list
+fi
+apt-get update -qq
+apt-get install -y --no-install-recommends \
+  docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+systemctl enable --now docker
+endef
+export VM_DOCKER_INSTALL_SCRIPT
+
 vm-docker:
-	@echo "Installing docker.io + docker-compose-plugin in the dev VM..."
-	./ssh-vm.sh -- 'sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker.io docker-compose-plugin'
+	@echo "Installing docker-ce + compose v2 in the dev VM (via Docker upstream apt repo)..."
+	@printf '%s\n' "$$VM_DOCKER_INSTALL_SCRIPT" | ./ssh-vm.sh -- 'sudo bash -s'
 
 # === Phase 2.5: Local HA target (TASK-053) ===
 #

@@ -24,6 +24,7 @@ package_update: true
 packages:
   - ca-certificates
   - curl
+  - gnupg
   - git
   - build-essential
   - vim
@@ -39,13 +40,13 @@ packages:
   - xvfb
   - pkg-config
   - cmake
-  # Docker engine + compose v2 plugin for the local HA target (Phase 2.5).
-  # Debian 12 stable apt resolves these — no version pin (locked_decision
-  # docker_apt_pin in docs/plans/2026-04-27-phase-2.5-local-ha-target.md);
-  # minor drift between cloud-init and `make vm-docker` installs is
-  # acceptable per Risk #14.
-  - docker.io
-  - docker-compose-plugin
+  # NOTE: Docker engine + Compose v2 plugin are NOT installed via this
+  # `packages:` list because `docker-compose-plugin` is not in Debian 12
+  # stable apt (founder's TASK-055 manual smoke surfaced this). Instead,
+  # /usr/local/bin/install-docker.sh below adds Docker's official upstream
+  # apt repo (https://download.docker.com/linux/debian) and installs the
+  # `docker-ce` family. `docker-ce` REPLACES Debian's `docker.io` (the two
+  # conflict on /usr/bin/docker) — that's why neither is in this list.
 
 write_files:
   - path: /usr/local/bin/install-rustup.sh
@@ -56,6 +57,72 @@ write_files:
       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --default-toolchain stable --profile minimal
 
+  # Docker engine + Compose v2 plugin install. Adds Docker's official
+  # upstream apt repo and installs the `docker-ce` family. Idempotent:
+  # safe to re-run on an already-provisioned VM (the same logic backs
+  # `make vm-docker` for VMs that booted before TASK-056).
+  #
+  # Security control: the GPG key fingerprint is pinned to Docker's
+  # published value. Mismatch -> non-zero exit. This is the load-bearing
+  # check against a compromised Docker apt repo (security-engineer review).
+  - path: /usr/local/bin/install-docker.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      # Docker's published GPG key fingerprint (per
+      # https://docs.docker.com/engine/install/debian/). Pin here so any
+      # mismatch — key-server compromise, MITM, or Docker rotation — fails
+      # the install loudly instead of silently trusting a new key.
+      DOCKER_GPG_FINGERPRINT='9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88'
+
+      # Defensive: ensure prereqs are present even if this script is run
+      # outside cloud-init context (the `packages:` list above already
+      # installs these on first boot, but a re-run on a stripped-down
+      # image would otherwise fail at the curl step).
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -qq
+      apt-get install -y --no-install-recommends ca-certificates curl gnupg
+
+      install -m 0755 -d /etc/apt/keyrings
+      if [ ! -f /etc/apt/keyrings/docker.asc ]; then
+        curl -fsSL https://download.docker.com/linux/debian/gpg \
+          -o /etc/apt/keyrings/docker.asc
+        chmod a+r /etc/apt/keyrings/docker.asc
+      fi
+
+      # Verify fingerprint BEFORE any apt-get update / install touches the
+      # repo. `gpg --dry-run --import --import-options import-show` prints
+      # the fingerprint without modifying any keyring.
+      actual_fpr=$(gpg --dry-run --quiet --no-keyring \
+        --import --import-options import-show \
+        /etc/apt/keyrings/docker.asc 2>/dev/null \
+        | awk '/^ +[0-9A-F ]+$/ { print; exit }' \
+        | tr -d ' ')
+      expected_fpr=$(echo "$DOCKER_GPG_FINGERPRINT" | tr -d ' ')
+      if [ "$actual_fpr" != "$expected_fpr" ]; then
+        echo "ERROR: Docker GPG key fingerprint mismatch." >&2
+        echo "       expected: $expected_fpr" >&2
+        echo "       actual:   $actual_fpr" >&2
+        echo "       refusing to install — possible apt repo compromise." >&2
+        exit 1
+      fi
+
+      if [ ! -f /etc/apt/sources.list.d/docker.list ]; then
+        arch=$(dpkg --print-architecture)
+        codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+        echo "deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian ${codename} stable" \
+          > /etc/apt/sources.list.d/docker.list
+      fi
+
+      apt-get update -qq
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        docker-ce docker-ce-cli containerd.io \
+        docker-buildx-plugin docker-compose-plugin
+
+      systemctl enable --now docker
+
 runcmd:
+  - /usr/local/bin/install-docker.sh
   - su - dev -c /usr/local/bin/install-rustup.sh
   - ldconfig
