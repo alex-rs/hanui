@@ -1,53 +1,17 @@
-# ops/ha/.gitignore — keep HA runtime writes out of git.
+# Phase 2.5 — block-by-default + explicit allowlist.
 #
-# `ops/ha/` is bind-mounted into HA's `/config` (see docker-compose.yml).
-# HA writes auth storage, the SQLite database, logs, the install ID, and
-# various caches into this directory at runtime. None of those should be
-# tracked: some contain secrets (`.storage/auth`, `secrets.yaml`),
-# others churn on every boot.
+# HA writes a large set of runtime files into /config (the bind-mount target
+# for ops/ha/). Some of those files contain auth tokens (.storage/auth) or
+# PII (shopping_list.json), and HA's `backup` integration writes tarballs of
+# the entire /config tree to backups/.  An allowlist-by-extension strategy is
+# fragile against future HA file additions.  This file blocks everything by
+# default and explicitly tracks only the 4 files we author.
 #
-# The ROOT .gitignore has `!ops/ha/` as a carve-out from the global
-# `ops/*` rule. That means files inside ops/ha/ are not blocked by the
-# root rules; THIS file is what filters HA's runtime droppings back out.
-#
-# Acceptance check (Phase 2.5 plan):
-#   `git status --porcelain ops/ha/` returns empty after a freshly booted
-#   HA container reaches ready state. If new HA-written paths surface in
-#   future versions, extend this list until empty status is achieved.
+# Per security-engineer review on PR #50.
+*
 
-# === HA core runtime state ===
-.storage/
-.cloud/
-.uuid
-
-# === Databases (SQLite recorder) ===
-*.db
-*.db-shm
-*.db-wal
-*.db-journal
-home-assistant_v2.db*
-
-# === Logs ===
-*.log
-*.log.*
-home-assistant.log*
-
-# === Caches and downloaded resources ===
-tts/
-deps/
-image/
-www/
-.cache/
-
-# === Secrets & generated config the user is expected to manage manually ===
-secrets.yaml
-known_devices.yaml
-ip_bans.yaml
-
-# === Misc HA scratch ===
-.HA_VERSION
-.config/
-custom_components/
-
-# Keep this file itself tracked (paranoia in case of glob expansion).
+# Files we author (tracked):
 !.gitignore
+!docker-compose.yml
+!configuration.yaml
+!automations.yaml

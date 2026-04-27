@@ -29,10 +29,15 @@
 # bootstrap the admin user and a long-lived access token.
 default_config:
 
-# Frontend / API are pulled in by default_config; binding 0.0.0.0 lets the
-# host reach HA through the VM's port forward.
+# Frontend / API are pulled in by default_config. Bind to loopback only —
+# the compose file also binds 127.0.0.1:8123:8123, so HA listens only on
+# the VM's loopback regardless of QEMU port-forwarding changes. The hanui
+# app inside the VM connects to localhost:8123, and TASK-052 provisioning
+# from the host can use SSH -L forwarding which terminates inside the VM
+# and arrives on 127.0.0.1:8123. Defense-in-depth alongside the compose
+# binding (per security-engineer review on PR #50).
 http:
-  server_host: 0.0.0.0
+  server_host: 127.0.0.1
   server_port: 8123
 
 # HA requires automations.yaml to exist; we declare an empty stub.

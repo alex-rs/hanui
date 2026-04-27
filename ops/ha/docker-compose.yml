@@ -21,10 +21,16 @@
 # Pinning to `:stable` is forbidden — drift between dev environments breaks
 # provisioning reproducibility.
 #
-# Networking: HA listens on 8123 inside the container; we publish the same
-# port on the VM. The VM is reached from the host via ./ssh-vm.sh and the
-# `cargo run` process inside the VM connects to localhost:8123. Plain HTTP
-# is acceptable for dev (Phase 5 hardens TLS).
+# Networking: HA listens on 8123 inside the container; we publish to the
+# VM's loopback only (127.0.0.1:8123:8123). The `cargo run` process inside
+# the VM connects to localhost:8123, which works against a loopback-bound
+# port. Provisioning from the host (TASK-052) reaches HA via SSH `-L`
+# forwarding through ./ssh-vm.sh — that arrives on the VM's 127.0.0.1, also
+# fine. DO NOT widen this binding to 0.0.0.0:8123 without security-engineer
+# review: any future change to QEMU networking (tap device, bridged
+# interface, additional hostfwd) would otherwise expose HA to the LAN.
+# Defense-in-depth: configuration.yaml also pins http.server_host: 127.0.0.1.
+# Plain HTTP is acceptable for dev (Phase 5 hardens TLS).
 #
 # Volume strategy:
 #   - Bind-mount ./ → /config so configuration.yaml is picked up on first
@@ -47,7 +53,7 @@ services:
     container_name: hanui-homeassistant
     restart: unless-stopped
     ports:
-      - "8123:8123"
+      - "127.0.0.1:8123:8123"
     volumes:
       - ./:/config
       - ha_data:/data
