@@ -29,15 +29,16 @@
 # bootstrap the admin user and a long-lived access token.
 default_config:
 
-# Frontend / API are pulled in by default_config. Bind to loopback only —
-# the compose file also binds 127.0.0.1:8123:8123, so HA listens only on
-# the VM's loopback regardless of QEMU port-forwarding changes. The hanui
-# app inside the VM connects to localhost:8123, and TASK-052 provisioning
-# from the host can use SSH -L forwarding which terminates inside the VM
-# and arrives on 127.0.0.1:8123. Defense-in-depth alongside the compose
-# binding (per security-engineer review on PR #50).
+# Bind to 0.0.0.0 inside the container so Docker's port mapping
+# (127.0.0.1:8123:8123 in docker-compose.yml) actually delivers traffic.
+# Defense-in-depth is still strict-loopback at three layers above this:
+#   - run-vm.sh QEMU hostfwd binds host port 8123 to 127.0.0.1 only
+#   - docker-compose.yml binds container port 8123 to host's 127.0.0.1 only
+# An earlier `server_host: 127.0.0.1` (per security-engineer review on PR #50)
+# made HA unreachable because Docker forwards external traffic to the
+# container's eth0, not loopback — see TASK-055 smoke 2026-04-28 + TASK-057.
 http:
-  server_host: 127.0.0.1
+  server_host: 0.0.0.0
   server_port: 8123
 
 # HA requires automations.yaml to exist; we declare an empty stub.

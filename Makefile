@@ -93,6 +93,10 @@ apt-get install -y --no-install-recommends \
   docker-ce docker-ce-cli containerd.io \
   docker-buildx-plugin docker-compose-plugin
 systemctl enable --now docker
+# Add the dev user to the docker group so provision-ha.sh (running as `dev`)
+# can talk to the docker daemon socket without sudo. usermod -aG is idempotent.
+# Per TASK-055 founder smoke 2026-04-28 + TASK-057.
+usermod -aG docker dev
 endef
 export VM_DOCKER_INSTALL_SCRIPT
 

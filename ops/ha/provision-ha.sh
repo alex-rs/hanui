@@ -61,7 +61,11 @@ readonly COMPOSE_FILE_DIR
 readonly CLIENT_ID="http://hanui.local/"   # opaque per HA OAuth contract; URL-formed string
 readonly LLAT_CLIENT_NAME="hanui-dev"
 readonly LLAT_LIFESPAN_DAYS=3650
-readonly READY_POLL_TIMEOUT_S=120
+# Cold first-boot of HA Core can take 60-90s on a 2-CPU VM before the HTTP
+# listener is up; 120s leaves no margin (founder hit this on the TASK-055
+# smoke 2026-04-28). Subsequent runs are fast — container restart only —
+# so the higher ceiling only matters on first boot. Per TASK-057.
+readonly READY_POLL_TIMEOUT_S=300
 readonly TEMPLATE_POLL_TIMEOUT_S=30
 
 # ----- Logging (STDERR ONLY; never echoes tokens) -----
