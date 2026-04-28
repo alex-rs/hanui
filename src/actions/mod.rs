@@ -5,15 +5,18 @@
 //!
 //! | Submodule | Ticket | Contents |
 //! |---|---|---|
-//! | [`schema`] | TASK-058 (this) | `Action`, `ActionSpec`, `Idempotency` |
-//! | `timing`   | TASK-059 | `GestureConfig`, `ActionTiming` |
+//! | [`schema`] | TASK-058 | `Action`, `ActionSpec`, `Idempotency` |
+//! | [`timing`] | TASK-059 (this) | `GestureConfig`, `ActionTiming`, `ActionOverlapStrategy` |
 //! | `map`      | TASK-062 | `WidgetActionMap` |
 //! | `dispatcher` | TASK-062 | `dispatch()` |
 //! | `url`      | TASK-063 | `Url` action handler |
 //! | `queue`    | TASK-065 | offline FIFO queue |
 //!
-//! Only `schema` exists today; the rest are added by their respective tickets.
+//! `schema` and `timing` exist today; the rest are added by their respective
+//! tickets.
 
 pub mod schema;
+pub mod timing;
 
 pub use schema::{Action, ActionSpec, Idempotency};
+pub use timing::{ActionOverlapStrategy, ActionTiming, GestureConfig};
