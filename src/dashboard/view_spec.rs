@@ -4,40 +4,17 @@
 //! field names. They are constructed in Rust for Phase 1; YAML deserialization
 //! is Phase 4 (out of scope here). No `serde` derives are added yet.
 //!
-//! Action fields (`tap_action`, `hold_action`, `double_tap_action`) are fully
-//! typed but not dispatched; dispatch wiring is Phase 3.
+//! Action fields (`tap_action`, `hold_action`, `double_tap_action`) carry the
+//! canonical [`crate::actions::Action`] type; dispatch wiring is Phase 3
+//! (TASK-062 onward). The placeholder `Action` enum that previously lived in
+//! this file was deleted in TASK-058 per
+//! `docs/plans/2026-04-28-phase-3-actions.md` `locked_decisions.phase4_forward_compat`.
 //!
 //! The computed `placement` field on `Widget` is populated by the grid packer
 //! (TASK-014). It is present here as `Option<Placement>` so the bridge can
 //! read it without needing a separate type.
 
-// ---------------------------------------------------------------------------
-// Action
-// ---------------------------------------------------------------------------
-
-/// A UI interaction action, as named in `docs/DASHBOARD_SCHEMA.md`.
-///
-/// Variants correspond 1-to-1 with the YAML `action:` strings. Phase 3 will
-/// wire these to actual dispatch; for now they are typed and constructible only.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Action {
-    /// `action: toggle` -- toggle the entity's primary state.
-    Toggle,
-    /// `action: more-info` -- open the entity's detail panel.
-    MoreInfo,
-    /// `action: none` -- suppress the default interaction.
-    None,
-    /// `action: navigate` -- push a named view onto the navigation stack.
-    Navigate(String),
-    /// `action: call-service` -- invoke a Home Assistant service.
-    CallService {
-        domain: String,
-        service: String,
-        /// Optional entity target; `None` means the service uses its own target
-        /// selection (e.g. an area or label target defined in `options`).
-        target: Option<String>,
-    },
-}
+use crate::actions::Action;
 
 // ---------------------------------------------------------------------------
 // WidgetKind
@@ -311,7 +288,9 @@ pub fn default_dashboard() -> Dashboard {
                         icon: None,
                         tap_action: Some(Action::Toggle),
                         hold_action: Some(Action::MoreInfo),
-                        double_tap_action: Some(Action::Navigate("home".to_string())),
+                        double_tap_action: Some(Action::Navigate {
+                            view_id: "home".to_string(),
+                        }),
                         layout: WidgetLayout {
                             preferred_columns: 2,
                             preferred_rows: 1,
@@ -410,7 +389,9 @@ mod tests {
 
         assert_eq!(
             entity.double_tap_action,
-            Some(Action::Navigate("home".to_string()))
+            Some(Action::Navigate {
+                view_id: "home".to_string()
+            })
         );
     }
 
@@ -451,16 +432,19 @@ mod tests {
             domain: "light".to_string(),
             service: "turn_on".to_string(),
             target: Some("light.kitchen".to_string()),
+            data: None,
         };
         if let Action::CallService {
             domain,
             service,
             target,
+            data,
         } = &action
         {
             assert_eq!(domain, "light");
             assert_eq!(service, "turn_on");
             assert_eq!(target.as_deref(), Some("light.kitchen"));
+            assert!(data.is_none());
         } else {
             panic!("expected CallService variant");
         }

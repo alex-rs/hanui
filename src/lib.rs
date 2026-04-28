@@ -27,6 +27,7 @@
 //! [`slint::invoke_from_event_loop`]; the production [`SlintSink`] is the only
 //! place this happens.
 
+pub mod actions;
 pub mod assets;
 pub mod dashboard;
 pub mod ha;
