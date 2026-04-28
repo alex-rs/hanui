@@ -1,0 +1,16 @@
+# Shared build cache across all git worktrees.
+#
+# Without this, every `isolation: "worktree"` agent run would build a fresh
+# `target/` dir (~5 GB of Slint/Tokio/Serde compile artifacts), and stale
+# worktrees pile up to ~170+ GB. Pointing target-dir at a single absolute
+# path lets parallel worktrees share Cargo's incremental cache. Cargo
+# handles concurrent access via file locking; parallel builds may serialize
+# briefly on shared crates but the disk savings are large.
+#
+# Path is hardcoded absolute because Cargo does not expand ${HOME} or env
+# vars in target-dir. CI runners override via the CARGO_TARGET_DIR env var
+# in their workflows (or by not having access to /home/alex), so this
+# config is dev-machine-only in effect.
+
+[build]
+target-dir = "/home/alex/.cargo-target/hanui"
