@@ -1,0 +1,62 @@
+// gesture_config.slint — Slint-side mirror of `src/actions/timing.rs::GestureConfig`.
+//
+// TASK-059 ships this as a STUB: the global declares the surface that the
+// Slint gesture layer (TASK-060, in card_base.slint) will read once it lands.
+// The Rust bridge (`src/ui/bridge.rs::wire_window`) populates the global at
+// startup from the Rust `GestureConfig` value, exactly the same way it
+// populates `AnimationBudget` from `DEFAULT_PROFILE`.
+//
+// Why a separate file:
+//   * `card_base.slint` is owned by TASK-060 (gesture timer wiring) and is on
+//     the TASK-059 must_not_touch list — Phase 3 plan keeps Wave 2 tracks
+//     non-overlapping at the .slint file boundary.
+//   * Defining the global in its own file lets `main_window.slint` import it
+//     and re-export the type so `slint::include_modules!()` surfaces a public
+//     `GestureConfigGlobal` Rust handle that the bridge can write to.
+//
+// Locked decisions (`docs/plans/2026-04-28-phase-3-actions.md`):
+//   * `arm_double_tap_timer` is the explicit boolean Slint must read to decide
+//     whether to arm the post-tap double-tap timer. Slint MUST NOT infer
+//     intent from `double_tap_max_gap_ms == 0` — the Rust side computes the
+//     boolean once and exposes it verbatim here.
+//   * `*_ms` values are wall-clock milliseconds, exposed as `int` because
+//     Slint property types do not include `u64` and the upper end of the
+//     ranges (a few thousand ms) is well within `i32`. The bridge converts
+//     `u64 -> i32` with a typed `WireError::*OutOfRange` on overflow, matching
+//     the existing `AnimationBudget` pattern.
+//
+// Default values mirror `src/actions/timing.rs::GestureConfig::default()` so
+// a Slint preview of any tile component renders correctly even without the
+// Rust bridge in the loop. The Rust bridge writes the runtime values at
+// startup; in production the defaults are overwritten before the first
+// gesture event.
+
+export global GestureConfigGlobal {
+    // Press shorter than this counts as a tap. Default mirrors
+    // src/actions/timing.rs::GestureConfig::default().tap_max_ms (200 ms).
+    in-out property <int> tap-max-ms: 200;
+
+    // Press at least this long fires the hold action. Default mirrors
+    // src/actions/timing.rs::GestureConfig::default().hold_min_ms (500 ms).
+    in-out property <int> hold-min-ms: 500;
+
+    // Maximum gap between two taps to count as a double-tap. Default mirrors
+    // src/actions/timing.rs::GestureConfig::default().double_tap_max_gap_ms
+    // (300 ms).
+    in-out property <int> double-tap-max-gap-ms: 300;
+
+    // Whether the double-tap path is wired at all. Default mirrors
+    // src/actions/timing.rs::GestureConfig::default().double_tap_enabled
+    // (true). Slint reads `arm-double-tap-timer` (below) — never this field
+    // directly — so the Rust source stays the single source of truth.
+    in-out property <bool> double-tap-enabled: true;
+
+    // Derived: whether the Slint gesture layer should arm the post-tap
+    // double-tap timer. Per locked_decisions.gesture_config: Slint reads
+    // this boolean and ONLY this boolean to decide; it must not branch on
+    // `double-tap-max-gap-ms == 0`. The Rust bridge writes both
+    // `double-tap-enabled` and `arm-double-tap-timer` (set to the same
+    // value) at startup; tile gesture wiring (TASK-060) reads
+    // `arm-double-tap-timer`.
+    in-out property <bool> arm-double-tap-timer: true;
+}

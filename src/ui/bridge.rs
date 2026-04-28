@@ -343,8 +343,9 @@ pub mod slint_ui {
     slint::include_modules!();
 }
 
-pub use slint_ui::{AnimationBudget, MainWindow};
+pub use slint_ui::{AnimationBudget, GestureConfigGlobal, MainWindow};
 
+use crate::actions::timing::GestureConfig;
 use crate::assets::icons;
 use crate::dashboard::profiles::DEFAULT_PROFILE;
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
@@ -361,6 +362,11 @@ pub enum WireError {
     /// `DEFAULT_PROFILE.max_simultaneous_animations` does not fit in `i32`
     /// (the Slint property type for `max-simultaneous`).
     MaxSimultaneousOutOfRange,
+    /// One of the [`GestureConfig`] `*_ms` fields does not fit in `i32` (the
+    /// Slint property type for the gesture-timing globals). Practical
+    /// thresholds are O(100–10_000) ms so this branch is purely defensive
+    /// against a malformed Phase 4 YAML override.
+    GestureTimingOutOfRange,
 }
 
 impl std::fmt::Display for WireError {
@@ -371,6 +377,9 @@ impl std::fmt::Display for WireError {
             }
             WireError::MaxSimultaneousOutOfRange => {
                 f.write_str("DEFAULT_PROFILE.max_simultaneous_animations does not fit in i32")
+            }
+            WireError::GestureTimingOutOfRange => {
+                f.write_str("GestureConfig timing field does not fit in i32")
             }
         }
     }
@@ -514,6 +523,85 @@ pub fn wire_window(window: &MainWindow, tiles: &[TileVM]) -> Result<(), WireErro
 
     budget.set_framerate_cap(cap_i32);
     budget.set_max_simultaneous(max_i32);
+
+    // GestureConfigGlobal — Slint-side mirror of `GestureConfig` (TASK-059).
+    // Phase 3 wires the default values; Phase 4 `DeviceProfile.timing_overrides`
+    // will pass an explicit `GestureConfig` value through the same write path.
+    // The Slint gesture layer (TASK-060) is the eventual consumer.
+    write_gesture_config(window, GestureConfig::default())?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GestureConfigGlobal writer (TASK-059)
+// ---------------------------------------------------------------------------
+
+/// Slint-typed projection of a [`GestureConfig`] — the four `*_ms` fields
+/// converted to `i32` (Slint property type) plus the two booleans.
+///
+/// Factored out of [`write_gesture_config`] as a pure value so the `u64 -> i32`
+/// conversion logic can be unit-tested without instantiating a `MainWindow`
+/// (which requires a live graphics backend — not available in headless CI,
+/// per the comment block above [`split_tile_vms`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GestureConfigProjection {
+    pub(crate) tap_max_ms: i32,
+    pub(crate) hold_min_ms: i32,
+    pub(crate) double_tap_max_gap_ms: i32,
+    pub(crate) double_tap_enabled: bool,
+    pub(crate) arm_double_tap_timer: bool,
+}
+
+/// Project a [`GestureConfig`] into the Slint-typed shape, narrowing every
+/// `u64` `*_ms` field to `i32` and copying the booleans.
+///
+/// Returns [`WireError::GestureTimingOutOfRange`] if any `*_ms` field exceeds
+/// `i32::MAX`. Per `locked_decisions.gesture_config`, the resulting projection
+/// carries both `double_tap_enabled` and `arm_double_tap_timer` explicitly —
+/// the Slint side reads only `arm_double_tap_timer` and must never infer
+/// intent from a zero `double_tap_max_gap_ms`.
+pub(crate) fn project_gesture_config(
+    config: GestureConfig,
+) -> Result<GestureConfigProjection, WireError> {
+    let tap_max_ms =
+        i32::try_from(config.tap_max_ms).map_err(|_| WireError::GestureTimingOutOfRange)?;
+    let hold_min_ms =
+        i32::try_from(config.hold_min_ms).map_err(|_| WireError::GestureTimingOutOfRange)?;
+    let double_tap_max_gap_ms = i32::try_from(config.double_tap_max_gap_ms)
+        .map_err(|_| WireError::GestureTimingOutOfRange)?;
+
+    Ok(GestureConfigProjection {
+        tap_max_ms,
+        hold_min_ms,
+        double_tap_max_gap_ms,
+        double_tap_enabled: config.double_tap_enabled,
+        arm_double_tap_timer: config.arm_double_tap_timer(),
+    })
+}
+
+/// Populate the Slint `GestureConfigGlobal` with the field values from a
+/// Rust [`GestureConfig`].
+///
+/// Factored out of [`wire_window`] so the Phase 4 path (which will pass an
+/// explicit, profile-overridden [`GestureConfig`] rather than the default)
+/// does not duplicate the projection plumbing. Returns
+/// [`WireError::GestureTimingOutOfRange`] if any `*_ms` field exceeds `i32`.
+///
+/// Per `locked_decisions.gesture_config`, both `double_tap_enabled` and
+/// `arm_double_tap_timer` are written from the Rust source — the Slint side
+/// reads `arm_double_tap_timer` only and never branches on
+/// `double_tap_max_gap_ms == 0`. Writing both keeps the global self-consistent
+/// in the Slint preview path (preview reads the property values directly).
+pub fn write_gesture_config(window: &MainWindow, config: GestureConfig) -> Result<(), WireError> {
+    let projection = project_gesture_config(config)?;
+    let global = window.global::<GestureConfigGlobal>();
+
+    global.set_tap_max_ms(projection.tap_max_ms);
+    global.set_hold_min_ms(projection.hold_min_ms);
+    global.set_double_tap_max_gap_ms(projection.double_tap_max_gap_ms);
+    global.set_double_tap_enabled(projection.double_tap_enabled);
+    global.set_arm_double_tap_timer(projection.arm_double_tap_timer);
 
     Ok(())
 }
@@ -1675,9 +1763,113 @@ mod tests {
         // This guards against accidental refactors that swap the variant text.
         let cap = WireError::FramerateCapOutOfRange;
         let max = WireError::MaxSimultaneousOutOfRange;
+        let gesture = WireError::GestureTimingOutOfRange;
 
         assert!(cap.to_string().contains("framerate_cap"));
         assert!(max.to_string().contains("max_simultaneous_animations"));
+        assert!(gesture.to_string().contains("GestureConfig"));
+    }
+
+    // -----------------------------------------------------------------------
+    // project_gesture_config (TASK-059) — pure conversion exercised here so
+    // the u64 -> i32 narrowing and the arm_double_tap_timer derivation are
+    // covered without instantiating a MainWindow (same headless-CI rationale
+    // documented above split_tile_vms).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn project_gesture_config_default_writes_all_default_values() {
+        let projection = project_gesture_config(GestureConfig::default())
+            .expect("default GestureConfig must project successfully");
+        assert_eq!(projection.tap_max_ms, 200);
+        assert_eq!(projection.hold_min_ms, 500);
+        assert_eq!(projection.double_tap_max_gap_ms, 300);
+        assert!(projection.double_tap_enabled);
+        // The arm_double_tap_timer invariant survives the projection: it
+        // tracks double_tap_enabled verbatim, NOT inferred from the gap.
+        assert!(projection.arm_double_tap_timer);
+        assert_eq!(
+            projection.arm_double_tap_timer,
+            projection.double_tap_enabled,
+        );
+    }
+
+    #[test]
+    fn project_gesture_config_preserves_arm_double_tap_invariant_when_disabled() {
+        // The locked_decisions.gesture_config invariant must survive the
+        // bridge layer too — Slint must receive the explicit boolean even
+        // when the gap is non-zero. Otherwise a downstream Slint reader could
+        // re-introduce the "infer from gap" bug.
+        let cfg = GestureConfig {
+            double_tap_enabled: false,
+            double_tap_max_gap_ms: 300,
+            ..GestureConfig::default()
+        };
+        let projection = project_gesture_config(cfg).expect("must project successfully");
+        assert!(!projection.arm_double_tap_timer);
+        assert!(!projection.double_tap_enabled);
+    }
+
+    #[test]
+    fn project_gesture_config_preserves_arm_double_tap_invariant_with_zero_gap() {
+        // Defensive twin of the timing.rs zero-gap test: even when the gap
+        // is zero (the value a naive Slint reader might treat as "disabled"),
+        // arm_double_tap_timer must still equal double_tap_enabled after
+        // projection.
+        let cfg = GestureConfig {
+            double_tap_enabled: true,
+            double_tap_max_gap_ms: 0,
+            ..GestureConfig::default()
+        };
+        let projection = project_gesture_config(cfg).expect("must project successfully");
+        assert!(projection.arm_double_tap_timer);
+        assert_eq!(projection.double_tap_max_gap_ms, 0);
+    }
+
+    #[test]
+    fn project_gesture_config_rejects_tap_max_ms_overflow() {
+        let cfg = GestureConfig {
+            tap_max_ms: u64::from(u32::MAX),
+            ..GestureConfig::default()
+        };
+        let err = project_gesture_config(cfg).expect_err("u64::from(u32::MAX) overflows i32::MAX");
+        assert_eq!(err, WireError::GestureTimingOutOfRange);
+    }
+
+    #[test]
+    fn project_gesture_config_rejects_hold_min_ms_overflow() {
+        let cfg = GestureConfig {
+            hold_min_ms: u64::from(u32::MAX),
+            ..GestureConfig::default()
+        };
+        let err = project_gesture_config(cfg).expect_err("u64::from(u32::MAX) overflows i32::MAX");
+        assert_eq!(err, WireError::GestureTimingOutOfRange);
+    }
+
+    #[test]
+    fn project_gesture_config_rejects_double_tap_gap_overflow() {
+        let cfg = GestureConfig {
+            double_tap_max_gap_ms: u64::from(u32::MAX),
+            ..GestureConfig::default()
+        };
+        let err = project_gesture_config(cfg).expect_err("u64::from(u32::MAX) overflows i32::MAX");
+        assert_eq!(err, WireError::GestureTimingOutOfRange);
+    }
+
+    #[test]
+    fn project_gesture_config_accepts_i32_max_boundary() {
+        // i32::MAX itself fits in i32 — the conversion is non-rejecting at
+        // the upper boundary, so out-of-range only fires above it.
+        let cfg = GestureConfig {
+            tap_max_ms: i32::MAX as u64,
+            hold_min_ms: i32::MAX as u64,
+            double_tap_max_gap_ms: i32::MAX as u64,
+            ..GestureConfig::default()
+        };
+        let projection = project_gesture_config(cfg).expect("i32::MAX must project successfully");
+        assert_eq!(projection.tap_max_ms, i32::MAX);
+        assert_eq!(projection.hold_min_ms, i32::MAX);
+        assert_eq!(projection.double_tap_max_gap_ms, i32::MAX);
     }
 
     // -----------------------------------------------------------------------
