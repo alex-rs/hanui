@@ -45,6 +45,19 @@ name = "soak_tests"
 path = "tests/soak_tests.rs"
 required-features = []
 
+# Slint headless rendering harness POC (TASK-074) — runs the in-file smoke
+# test that proves the `MinimalSoftwareWindow`-based harness captures a
+# non-empty pixel buffer from `MainWindow`. The same file is also re-used
+# as a `#[path = "../common/slint_harness.rs"]` module by TASK-073 golden-
+# frame integration tests; declaring it as a [[test]] target here gives the
+# harness its own runnable smoke without needing a wrapper file under
+# `tests/` (which would have polluted the auto-discovered binary list).
+# No new dev-deps required: the runtime `slint` dep already enables
+# `renderer-software`, which is the only Slint feature the harness uses.
+[[test]]
+name = "slint_harness_smoke"
+path = "tests/common/slint_harness.rs"
+
 # SBC CPU smoke test binary — cross-compiled to aarch64 and run under QEMU.
 # Explicitly declared so Cargo does not try to auto-discover tests/smoke/mod.rs
 # alongside the existing tests/smoke.rs (TASK-016 Phase 1 smoke).
