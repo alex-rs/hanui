@@ -57,8 +57,9 @@ use std::time::Duration;
 
 use tokio::sync::broadcast;
 
+use hanui::actions::Action;
 use hanui::dashboard::view_spec::{
-    Action, Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
+    Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
 };
 use hanui::ha::client::event_to_entity_update;
 use hanui::ha::entity::{Entity, EntityId};

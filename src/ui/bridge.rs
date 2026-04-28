@@ -1261,8 +1261,9 @@ mod tests {
 
     #[test]
     fn icon_id_override_in_widget_config_takes_precedence() {
+        use crate::actions::Action;
         use crate::dashboard::view_spec::{
-            Action, Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
+            Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
         };
 
         let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
