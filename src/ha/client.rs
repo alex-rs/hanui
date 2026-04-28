@@ -416,6 +416,153 @@ pub(crate) enum Phase {
 type PendingSender = oneshot::Sender<Result<serde_json::Value, String>>;
 
 // ---------------------------------------------------------------------------
+// Phase 3 outbound-command envelope (locked_decisions.ws_command_ack_envelope)
+// ---------------------------------------------------------------------------
+
+/// A `call_service` body that the dispatcher hands to the WS client task.
+///
+/// The WS client is the **sole id authority**: the dispatcher does NOT
+/// allocate ids and does NOT pre-serialize the JSON.  When the WS client
+/// dequeues an [`OutboundCommand`] it allocates the next id, registers the
+/// envelope's `ack_tx` into the pending-ack map, then renders the wire JSON
+/// via [`OutboundFrame::to_wire_json`] using the freshly-allocated id.
+///
+/// `target` and `data` are `Option<serde_json::Value>` so the dispatcher can
+/// omit either field at HA's discretion (e.g. a service call with no
+/// parameters omits both; one with an `entity_id` target supplies `target`
+/// only).  The WS-level JSON treats `null` distinctly from absence — when
+/// these fields are `None` the corresponding key is OMITTED from the
+/// serialized frame.
+///
+/// HA's `call_service` WS frame shape is documented at
+/// <https://developers.home-assistant.io/docs/api/websocket/#calling-a-service>.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutboundFrame {
+    /// HA service domain (e.g. `"light"`).
+    pub domain: String,
+    /// HA service action name (e.g. `"turn_on"`).
+    pub service: String,
+    /// Optional service-call target (e.g. `{"entity_id":"light.kitchen"}`).
+    pub target: Option<serde_json::Value>,
+    /// Optional service-call data (e.g. `{"brightness": 180}`).
+    pub data: Option<serde_json::Value>,
+}
+
+impl OutboundFrame {
+    /// Render the frame to wire JSON with the WS-client-assigned `id`.
+    ///
+    /// The output is a single JSON object with `type:"call_service"`, the
+    /// caller-provided `id`, plus `domain` / `service` / optional `target` /
+    /// optional `data`.  `None` fields are OMITTED from the JSON (HA treats
+    /// absence and explicit `null` differently — absence means "no target"
+    /// or "no data"; `null` would be a protocol error for these fields).
+    pub fn to_wire_json(&self, id: u32) -> String {
+        // Build via serde_json::Value so target / data Values are inlined
+        // verbatim (no double-encoding) and the missing fields are dropped
+        // by the `.as_object_mut()` filter below.
+        let mut obj = serde_json::Map::new();
+        obj.insert("id".to_owned(), serde_json::Value::from(id));
+        obj.insert(
+            "type".to_owned(),
+            serde_json::Value::String("call_service".to_owned()),
+        );
+        obj.insert(
+            "domain".to_owned(),
+            serde_json::Value::String(self.domain.clone()),
+        );
+        obj.insert(
+            "service".to_owned(),
+            serde_json::Value::String(self.service.clone()),
+        );
+        if let Some(t) = &self.target {
+            obj.insert("target".to_owned(), t.clone());
+        }
+        if let Some(d) = &self.data {
+            obj.insert("service_data".to_owned(), d.clone());
+        }
+        serde_json::Value::Object(obj).to_string()
+    }
+}
+
+/// Successful HA `result` ack for a dispatcher-originated command.
+///
+/// Carries the request id (so the dispatcher can correlate against its own
+/// log) and an optional payload — most service calls return `null`/empty,
+/// but some return data (e.g. weather forecast services).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HaAckSuccess {
+    /// The request id the WS client allocated when it dequeued the command.
+    pub id: u32,
+    /// `result.result` from the HA frame (`None` on ACK-only success).
+    pub payload: Option<serde_json::Value>,
+}
+
+/// Failed HA `result` ack for a dispatcher-originated command.
+///
+/// Carries id + HA-supplied error code + message so the dispatcher can
+/// surface a typed toast.  No raw token / PII is ever placed here — the
+/// inbound `result.error.message` is HA's own human-readable string.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HaAckError {
+    /// The request id the WS client allocated for the failed command.
+    pub id: u32,
+    /// HA error code (e.g. `"not_found"`, `"home_assistant_error"`).
+    pub code: String,
+    /// HA-supplied human-readable message.
+    pub message: String,
+}
+
+/// Dispatcher ack channel payload — `Ok` on success, `Err` on HA error.
+///
+/// The dispatcher's `oneshot::Receiver<AckResult>` resolves with this when
+/// the matching `result` frame demuxes against its registered id.
+pub type AckResult = Result<HaAckSuccess, HaAckError>;
+
+/// Cross-task command/ack envelope for dispatcher → WS client → HA.
+///
+/// **Locked by `docs/plans/2026-04-28-phase-3-actions.md`
+/// § locked_decisions.ws_command_ack_envelope.**  This is the single seam that
+/// TASK-062 (dispatcher) and TASK-072 (`LiveStore.command_tx` wiring) consume.
+///
+/// Flow (full details in the plan):
+///   1. Dispatcher builds [`OutboundFrame`] (domain/service/target/data),
+///      creates `oneshot::channel`, sends `OutboundCommand` on
+///      `LiveStore.command_tx`.
+///   2. WS client task drains its command receiver, allocates next id,
+///      registers `id → ack_tx` in its pending-ack map (parallel to the
+///      existing internal pending map for auth/get_states/get_services),
+///      renders the frame with the assigned id, writes to socket.
+///   3. Result frame arrives → demux routes it via id to the registered
+///      `ack_tx`; the oneshot fires.
+///   4. Dispatcher awaits its `ack_rx` with `tokio::time::timeout`; on
+///      timeout it drops the receiver — the WS client's send is then a
+///      no-op (the orphan `oneshot::Sender::send` returns `Err(_)` which
+///      is silently discarded), and the pending-ack entry is cleared.
+///
+/// The dispatcher NEVER sees ids and NEVER touches the pending map directly.
+/// The WS client is the sole id authority — this means TASK-062 unit tests
+/// can use a fake command channel that records `OutboundCommand`s without
+/// spinning up a real WS client.
+pub struct OutboundCommand {
+    /// The `call_service` body the dispatcher built.  The WS client fills
+    /// in the id when it serializes.
+    pub frame: OutboundFrame,
+    /// One-shot reply slot.  The dispatcher holds the matching receiver
+    /// and awaits it with a timeout per `optimistic_timeout_ms`.
+    pub ack_tx: oneshot::Sender<AckResult>,
+}
+
+impl std::fmt::Debug for OutboundCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Manual Debug — `oneshot::Sender` does not derive Debug usefully.
+        f.debug_struct("OutboundCommand")
+            .field("frame", &self.frame)
+            .field("ack_tx", &"<oneshot::Sender<AckResult>>")
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Overflow circuit-breaker
 // ---------------------------------------------------------------------------
 
@@ -478,7 +625,24 @@ pub struct WsClient {
     state_tx: watch::Sender<ConnectionState>,
     id_counter: IdCounter,
     /// Map from request id to the oneshot sender awaiting the result.
+    ///
+    /// Used by the FSM's INTERNAL outbound calls (auth, subscribe_events,
+    /// get_states, get_services).  Phase 3 dispatcher acks live in
+    /// [`pending_ack`][WsClient::pending_ack] instead — keeping the two maps
+    /// separated means existing internal callers see no behavior change and
+    /// the dispatcher path is purely additive.
     pending: HashMap<u32, PendingSender>,
+    /// Phase 3 pending-ack map: id → dispatcher-supplied `oneshot::Sender<AckResult>`.
+    ///
+    /// Per `locked_decisions.ws_command_ack_envelope`: when a dispatcher
+    /// hands an [`OutboundCommand`] to the WS client task, the client
+    /// allocates the next id and registers the envelope's `ack_tx` here.
+    /// The result-frame demux first checks the existing `pending` map for
+    /// internal callers, then this map for dispatcher-originated ids.  An
+    /// id that matches NEITHER map is logged at debug level and dropped —
+    /// never silently coalesced into the existing internal-path warn-log
+    /// (which would obscure dispatcher orphans from observability).
+    pending_ack: HashMap<u32, oneshot::Sender<AckResult>>,
     /// Circuit-breaker for snapshot-buffer overflows.
     pub overflow_breaker: OverflowBreaker,
     /// Exponential-backoff state for the reconnect loop.
@@ -548,6 +712,7 @@ impl WsClient {
             state_tx,
             id_counter: IdCounter::new(),
             pending: HashMap::new(),
+            pending_ack: HashMap::new(),
             overflow_breaker: OverflowBreaker::new(),
             backoff: BackoffState::new(),
             stable_live_since: None,
@@ -646,6 +811,48 @@ impl WsClient {
                 Ok(())
             }
             None => Err(ClientError::IdMismatch { received: id }),
+        }
+    }
+
+    /// Register a dispatcher-supplied [`OutboundCommand`] envelope.
+    ///
+    /// **Sole id authority** (per `locked_decisions.ws_command_ack_envelope`):
+    /// the WS client allocates the next monotonic id, stores the envelope's
+    /// `ack_tx` in [`pending_ack`][WsClient::pending_ack], and renders the
+    /// frame as wire-ready JSON keyed on the freshly-allocated id.  Returns
+    /// `(id, wire_json)` so the caller (the WS-loop task that drains the
+    /// command channel) can write the JSON onto the socket without further
+    /// processing.
+    ///
+    /// The dispatcher NEVER allocates ids — it constructs an
+    /// [`OutboundFrame`] without one, hands the envelope to this method via
+    /// the command channel, and awaits the matching `oneshot::Receiver`.
+    pub fn register_dispatcher_command(&mut self, cmd: OutboundCommand) -> (u32, String) {
+        let id = self.next_id();
+        self.pending_ack.insert(id, cmd.ack_tx);
+        let wire = cmd.frame.to_wire_json(id);
+        (id, wire)
+    }
+
+    /// Resolve a dispatcher-pending ack by id, if any.
+    ///
+    /// Looks up `id` in [`pending_ack`][WsClient::pending_ack]; if present,
+    /// fires the registered `oneshot::Sender<AckResult>` with the supplied
+    /// ack and removes the entry.  Returns `true` if the id was registered
+    /// (so the caller can skip the legacy `pending`-map fallback).
+    ///
+    /// `ack` is the typed result the dispatcher will see — Ok on
+    /// `result.success == true`, Err otherwise.
+    pub fn resolve_dispatcher_ack(&mut self, id: u32, ack: AckResult) -> bool {
+        match self.pending_ack.remove(&id) {
+            Some(tx) => {
+                // `send` returns `Err` only if the receiver has been dropped
+                // (dispatcher timed out or panicked); the orphaned ack is
+                // discarded silently — the dispatcher already chose to bail.
+                let _ = tx.send(ack);
+                true
+            }
+            None => false,
         }
     }
 
@@ -1191,18 +1398,70 @@ impl WsClient {
             }
 
             // ── Result correlation (any phase) ───────────────────────────────
+            //
+            // Demux order (locked by TASK-061 — the dispatcher path is
+            // strictly additive):
+            //   1. Try the existing internal pending map (auth /
+            //      get_states / get_services / subscribe_events follow-ups).
+            //   2. Fall back to the Phase 3 dispatcher pending-ack map.
+            //   3. If neither matches, log at debug level (NOT warn — an
+            //      orphan dispatcher ack arriving after the dispatcher's
+            //      timeout dropped the receiver is expected, not anomalous;
+            //      a warn-log here would be noise during normal optimistic
+            //      timeout recovery).
+            //
+            // CRITICAL: this arm runs ONLY for results whose ids are not
+            // matched by an earlier phase-specific arm (the Subscribing
+            // ACK / Snapshotting ACK / Services ACK arms above each gate
+            // on `result.id == <expected_id>`).  Internal handshake replies
+            // never reach this catch-all.
             (phase, InboundMsg::Result(result)) => {
                 let id = result.id;
-                let value = if result.success {
-                    Ok(result.result.unwrap_or(serde_json::Value::Null))
+                if self.pending.contains_key(&id) {
+                    // Existing internal-callers path — preserved unchanged.
+                    let value = if result.success {
+                        Ok(result.result.unwrap_or(serde_json::Value::Null))
+                    } else {
+                        Err(result
+                            .error
+                            .as_ref()
+                            .map(|e| e.message.clone())
+                            .unwrap_or_else(|| "unknown error".to_owned()))
+                    };
+                    if let Err(e) = self.resolve_pending(id, value) {
+                        tracing::warn!(error = %e, "unmatched result id (internal)");
+                    }
+                } else if self.pending_ack.contains_key(&id) {
+                    // Phase 3 dispatcher path — translate ResultPayload into
+                    // typed AckResult and fire the dispatcher's oneshot.
+                    let ack: AckResult = if result.success {
+                        Ok(HaAckSuccess {
+                            id,
+                            payload: result.result,
+                        })
+                    } else {
+                        let err = result.error.unwrap_or(crate::ha::protocol::HaError {
+                            code: "unknown_error".to_owned(),
+                            message: "HA returned success=false with no error object".to_owned(),
+                        });
+                        Err(HaAckError {
+                            id,
+                            code: err.code,
+                            message: err.message,
+                        })
+                    };
+                    // Always succeeds because we just probed contains_key
+                    // under &mut self — no other writer can interleave.
+                    let _fired = self.resolve_dispatcher_ack(id, ack);
                 } else {
-                    Err(result
-                        .error
-                        .map(|e| e.message)
-                        .unwrap_or_else(|| "unknown error".to_owned()))
-                };
-                if let Err(e) = self.resolve_pending(id, value) {
-                    tracing::warn!(error = %e, "unmatched result id");
+                    // Orphan ack — neither internal nor dispatcher pending
+                    // map holds this id.  Common cause: dispatcher timed
+                    // out and dropped the receiver before HA replied.
+                    tracing::debug!(
+                        result_id = id,
+                        success = result.success,
+                        "result id not in pending or pending_ack — likely a dispatcher orphan after timeout"
+                    );
                 }
                 Ok(phase)
             }
@@ -3156,5 +3415,586 @@ mod tests {
             guard.lookup("light", "unknown_service").is_none(),
             "ServiceRegistry must return None for unknown service in known domain"
         );
+    }
+
+    // =======================================================================
+    // TASK-061: Phase 3 outbound-command envelope (id-correlation seam)
+    //
+    // Per docs/plans/2026-04-28-phase-3-actions.md
+    // § locked_decisions.ws_command_ack_envelope, the dispatcher hands an
+    // `OutboundCommand { frame, ack_tx }` to the WS client; the WS client is
+    // the sole id authority and routes the matching `result` frame back to
+    // the registered `ack_tx`.  Every test below targets a specific
+    // contractual property of that seam.
+    // =======================================================================
+
+    /// Build a `result` frame with the given id, success flag, and optional
+    /// payload / error.  Used to exercise the result-correlation arm of
+    /// `handle_message` without spinning up the full FSM.
+    fn result_inbound(
+        id: u32,
+        success: bool,
+        payload: Option<serde_json::Value>,
+        error: Option<(&str, &str)>,
+    ) -> InboundMsg {
+        let body = serde_json::json!({
+            "type": "result",
+            "id": id,
+            "success": success,
+            "result": payload,
+            "error": error.map(|(c, m)| serde_json::json!({"code": c, "message": m})),
+        })
+        .to_string();
+        inbound(&body)
+    }
+
+    /// Build a minimal `state_changed` event inbound message.  Used by the
+    /// event-dispatch-preserved test — the dispatcher path must NOT
+    /// interfere with regular event flow.
+    fn state_changed_inbound(entity_id: &str, state: &str) -> InboundMsg {
+        let body = serde_json::json!({
+            "type": "event",
+            "id": 1,
+            "event": {
+                "event_type": "state_changed",
+                "data": {
+                    "entity_id": entity_id,
+                    "new_state": {
+                        "entity_id": entity_id,
+                        "state": state,
+                        "attributes": {},
+                        "last_changed": "2024-01-01T00:00:00+00:00",
+                        "last_updated": "2024-01-01T00:00:00+00:00",
+                    },
+                    "old_state": null,
+                },
+                "origin": "LOCAL",
+                "time_fired": "2024-01-01T00:00:00+00:00"
+            }
+        })
+        .to_string();
+        inbound(&body)
+    }
+
+    // -----------------------------------------------------------------------
+    // OutboundFrame::to_wire_json — wire-format guarantees
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn outbound_frame_wire_json_omits_optional_fields_when_none() {
+        let frame = OutboundFrame {
+            domain: "light".into(),
+            service: "turn_on".into(),
+            target: None,
+            data: None,
+        };
+        let wire = frame.to_wire_json(42);
+        let parsed: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(parsed["id"], 42);
+        assert_eq!(parsed["type"], "call_service");
+        assert_eq!(parsed["domain"], "light");
+        assert_eq!(parsed["service"], "turn_on");
+        // CRITICAL: HA distinguishes absence from `null`; both fields MUST
+        // be omitted, not present-with-null.
+        assert!(
+            parsed.get("target").is_none(),
+            "target must be omitted when None; got: {parsed}"
+        );
+        assert!(
+            parsed.get("service_data").is_none(),
+            "service_data must be omitted when None; got: {parsed}"
+        );
+    }
+
+    #[test]
+    fn outbound_frame_wire_json_includes_target_and_data_when_some() {
+        let frame = OutboundFrame {
+            domain: "light".into(),
+            service: "turn_on".into(),
+            target: Some(serde_json::json!({"entity_id": "light.kitchen"})),
+            data: Some(serde_json::json!({"brightness": 180})),
+        };
+        let wire = frame.to_wire_json(7);
+        let parsed: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(parsed["id"], 7);
+        assert_eq!(
+            parsed["target"],
+            serde_json::json!({"entity_id": "light.kitchen"})
+        );
+        assert_eq!(
+            parsed["service_data"],
+            serde_json::json!({"brightness": 180})
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // register_dispatcher_command — sole id authority
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn register_dispatcher_command_assigns_monotonic_ids_and_renders_wire_json() {
+        let (mut client, _rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-disp-monotonic")
+        };
+
+        let frame = OutboundFrame {
+            domain: "switch".into(),
+            service: "turn_off".into(),
+            target: Some(serde_json::json!({"entity_id": "switch.fan"})),
+            data: None,
+        };
+
+        let (tx_a, _rx_a) = oneshot::channel::<AckResult>();
+        let cmd_a = OutboundCommand {
+            frame: frame.clone(),
+            ack_tx: tx_a,
+        };
+        let (id_a, wire_a) = client.register_dispatcher_command(cmd_a);
+
+        let (tx_b, _rx_b) = oneshot::channel::<AckResult>();
+        let cmd_b = OutboundCommand {
+            frame: frame.clone(),
+            ack_tx: tx_b,
+        };
+        let (id_b, wire_b) = client.register_dispatcher_command(cmd_b);
+
+        assert!(
+            id_b > id_a,
+            "dispatcher ids must be monotonically increasing; got {id_a} then {id_b}"
+        );
+
+        // Wire JSON must carry the freshly-allocated id.
+        let parsed_a: serde_json::Value = serde_json::from_str(&wire_a).unwrap();
+        let parsed_b: serde_json::Value = serde_json::from_str(&wire_b).unwrap();
+        assert_eq!(parsed_a["id"], id_a);
+        assert_eq!(parsed_b["id"], id_b);
+        assert_eq!(parsed_a["type"], "call_service");
+        assert_eq!(parsed_a["domain"], "switch");
+        assert_eq!(parsed_a["service"], "turn_off");
+
+        // Both ids must be registered in the pending-ack map after register.
+        assert!(client.pending_ack.contains_key(&id_a));
+        assert!(client.pending_ack.contains_key(&id_b));
+    }
+
+    // -----------------------------------------------------------------------
+    // Happy path: register → resolve → oneshot fires with HaAckSuccess
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn dispatcher_envelope_happy_path_roundtrip() {
+        let (mut client, _state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-disp-happy")
+        };
+        let (mut sink, _sent) = MockSink::new();
+
+        let (ack_tx, ack_rx) = oneshot::channel::<AckResult>();
+        let frame = OutboundFrame {
+            domain: "light".into(),
+            service: "turn_on".into(),
+            target: Some(serde_json::json!({"entity_id": "light.kitchen"})),
+            data: None,
+        };
+        let cmd = OutboundCommand { frame, ack_tx };
+        let (assigned_id, wire) = client.register_dispatcher_command(cmd);
+
+        // Verify wire JSON has the assigned id (the dispatcher never sees
+        // ids — only the WS client does).
+        let parsed_wire: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(parsed_wire["id"], assigned_id);
+
+        // Simulate the matching `result` frame coming back from HA via the
+        // FSM's catch-all result arm.  The FSM must drop into the
+        // dispatcher-pending branch (not the legacy IdMismatch path).
+        let payload = serde_json::json!({"context": {"id": "abc"}});
+        let res = client
+            .handle_message(
+                result_inbound(assigned_id, true, Some(payload.clone()), None),
+                Phase::Live,
+                &mut sink,
+            )
+            .await
+            .expect("dispatcher-result demux must not error");
+        assert!(matches!(res, Phase::Live));
+
+        // The dispatcher's oneshot must have fired with Ok(HaAckSuccess { id, payload }).
+        let ack = ack_rx
+            .await
+            .expect("ack_tx must have been fired (not dropped)");
+        match ack {
+            Ok(success) => {
+                assert_eq!(success.id, assigned_id, "ack must carry the assigned id");
+                assert_eq!(
+                    success.payload,
+                    Some(payload),
+                    "ack payload must be the HA `result.result` value"
+                );
+            }
+            Err(e) => panic!("expected Ok ack on success=true; got Err: {e:?}"),
+        }
+
+        // Pending-ack map must now be empty for this id (entry was removed
+        // when the oneshot fired).
+        assert!(!client.pending_ack.contains_key(&assigned_id));
+    }
+
+    // -----------------------------------------------------------------------
+    // Error ack: success=false → Err(HaAckError) lands on the oneshot
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn dispatcher_envelope_error_ack_lands_as_haackerror() {
+        let (mut client, _state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-disp-err")
+        };
+        let (mut sink, _sent) = MockSink::new();
+
+        let (ack_tx, ack_rx) = oneshot::channel::<AckResult>();
+        let cmd = OutboundCommand {
+            frame: OutboundFrame {
+                domain: "light".into(),
+                service: "turn_on".into(),
+                target: Some(serde_json::json!({"entity_id": "light.bogus"})),
+                data: None,
+            },
+            ack_tx,
+        };
+        let (assigned_id, _wire) = client.register_dispatcher_command(cmd);
+
+        // HA returns success=false with a populated error object.
+        let _ = client
+            .handle_message(
+                result_inbound(
+                    assigned_id,
+                    false,
+                    None,
+                    Some(("not_found", "Entity not found")),
+                ),
+                Phase::Live,
+                &mut sink,
+            )
+            .await
+            .expect("error-result demux must not error");
+
+        let ack = ack_rx.await.expect("ack_tx must have been fired");
+        match ack {
+            Ok(s) => panic!("expected Err ack on success=false; got Ok: {s:?}"),
+            Err(e) => {
+                assert_eq!(e.id, assigned_id);
+                assert_eq!(e.code, "not_found");
+                assert_eq!(e.message, "Entity not found");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Error ack: success=false with no error object → synthetic error
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn dispatcher_envelope_error_without_error_object_synthesises_unknown() {
+        let (mut client, _state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-disp-err-bare")
+        };
+        let (mut sink, _sent) = MockSink::new();
+
+        let (ack_tx, ack_rx) = oneshot::channel::<AckResult>();
+        let cmd = OutboundCommand {
+            frame: OutboundFrame {
+                domain: "light".into(),
+                service: "turn_on".into(),
+                target: None,
+                data: None,
+            },
+            ack_tx,
+        };
+        let (assigned_id, _wire) = client.register_dispatcher_command(cmd);
+
+        // success=false with no error field — HA shouldn't do this, but the
+        // code must not panic.  The dispatcher sees a typed error with code
+        // "unknown_error".
+        let _ = client
+            .handle_message(
+                result_inbound(assigned_id, false, None, None),
+                Phase::Live,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+
+        let ack = ack_rx.await.unwrap();
+        match ack {
+            Err(e) => {
+                assert_eq!(e.code, "unknown_error");
+                assert!(
+                    !e.message.is_empty(),
+                    "synthetic error must carry a message"
+                );
+            }
+            Ok(_) => panic!("expected Err on success=false even without error object"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Orphan id: result frame for an id in NEITHER pending map → debug log,
+    // no panic, no IdMismatch returned (the FSM never drops the connection
+    // for an unsolicited result that might just be a dispatcher orphan).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[traced_test]
+    async fn orphan_result_id_does_not_panic_or_drop_connection() {
+        let (mut client, _state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-orphan")
+        };
+        let (mut sink, _sent) = MockSink::new();
+
+        // No pending entry registered — the result frame is purely orphaned.
+        let res = client
+            .handle_message(
+                result_inbound(9999, true, Some(serde_json::Value::Null), None),
+                Phase::Live,
+                &mut sink,
+            )
+            .await;
+
+        assert!(res.is_ok(), "orphan result must not error; got: {res:?}");
+        assert!(matches!(res.unwrap(), Phase::Live));
+
+        // The orphan must be debug-logged, not silently dropped.  Codex
+        // review locked: never silent — this is the "id-mismatch is logged"
+        // contract from acceptance criteria.
+        assert!(
+            logs_contain("orphan after timeout"),
+            "orphan result id must be logged at debug level"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Dropped receiver: dispatcher dropped its `ack_rx` (e.g. timed out);
+    // the WS client's send must silently discard the orphaned ack.  This
+    // models the timeout cleanup path — the pending_ack entry is removed
+    // and no panic occurs.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn dispatcher_dropped_receiver_silently_discards_ack() {
+        let (mut client, _state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-disp-dropped")
+        };
+        let (mut sink, _sent) = MockSink::new();
+
+        // Register a dispatcher command, then immediately drop the receiver
+        // (simulating dispatcher timeout that aborted the wait).
+        let (ack_tx, ack_rx) = oneshot::channel::<AckResult>();
+        drop(ack_rx);
+        let cmd = OutboundCommand {
+            frame: OutboundFrame {
+                domain: "light".into(),
+                service: "turn_on".into(),
+                target: None,
+                data: None,
+            },
+            ack_tx,
+        };
+        let (assigned_id, _wire) = client.register_dispatcher_command(cmd);
+        assert!(client.pending_ack.contains_key(&assigned_id));
+
+        // Now HA's reply arrives.  The send to the dropped receiver returns
+        // Err inside resolve_dispatcher_ack, which is silently swallowed.
+        let res = client
+            .handle_message(
+                result_inbound(assigned_id, true, None, None),
+                Phase::Live,
+                &mut sink,
+            )
+            .await;
+        assert!(res.is_ok(), "must not error on dropped-receiver ack send");
+
+        // Critical: the pending-ack entry is removed regardless of receiver
+        // state, so no leak.
+        assert!(
+            !client.pending_ack.contains_key(&assigned_id),
+            "pending_ack entry must be removed when ack arrives, even if receiver dropped"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Event-dispatch path preserved (Risk #1 in the plan).  Even with the
+    // dispatcher pending-ack map populated, `state_changed` events MUST
+    // continue to flow into the attached store.  This is the safety net
+    // for the cross-cutting nature of TASK-061 — the existing event-dispatch
+    // arm is unchanged and runs ahead of the result-correlation arm.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn state_changed_event_dispatch_preserved_with_pending_dispatcher_ack() {
+        let (mut client, _state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-disp-event-preserve")
+        };
+        let store = Arc::new(MockStore::new());
+        client = client.with_store(store.clone());
+        let (mut sink, _sent) = MockSink::new();
+
+        // Register a dispatcher command — pending_ack now non-empty.
+        let (ack_tx, _ack_rx) = oneshot::channel::<AckResult>();
+        let cmd = OutboundCommand {
+            frame: OutboundFrame {
+                domain: "light".into(),
+                service: "turn_on".into(),
+                target: None,
+                data: None,
+            },
+            ack_tx,
+        };
+        let _ = client.register_dispatcher_command(cmd);
+
+        // A `state_changed` event for a different entity comes in.  The
+        // dispatcher pending-ack must not affect this path.
+        let _ = client
+            .handle_message(
+                state_changed_inbound("light.living_room", "on"),
+                Phase::Live,
+                &mut sink,
+            )
+            .await
+            .expect("event flow must not error with pending dispatcher ack");
+
+        let events = store.recorded_events();
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one EntityUpdate must reach the store; got {}: {events:?}",
+            events.len()
+        );
+        let update = &events[0];
+        assert_eq!(
+            update.id.as_str(),
+            "light.living_room",
+            "dispatched event entity_id must match",
+        );
+        assert!(
+            update.entity.is_some(),
+            "non-null new_state must produce Some(entity)",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Demux ordering: when the legacy `pending` map already holds the id
+    // (existing internal callers — auth/get_states/etc.), the dispatcher
+    // pending-ack arm MUST NOT also fire.  This guards the precedence rule
+    // documented at the demux site (internal map probed first).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn internal_pending_takes_precedence_over_dispatcher_for_same_id() {
+        // CONSTRUCTED scenario — under normal operation the WS client never
+        // assigns the same id to both maps because there's exactly one id
+        // counter.  We intentionally insert into both to verify the demux
+        // order: legacy map is probed first.
+        let (mut client, _state_rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-demux-precedence")
+        };
+        let (mut sink, _sent) = MockSink::new();
+
+        // Insert legacy pending entry for id=500.
+        let internal_rx = client.register_pending(500);
+
+        // Insert dispatcher pending entry for the SAME id=500 (artificial).
+        let (ack_tx, ack_rx) = oneshot::channel::<AckResult>();
+        client.pending_ack.insert(500, ack_tx);
+
+        // Result frame for id=500 arrives.
+        let _ = client
+            .handle_message(
+                result_inbound(500, true, Some(serde_json::json!("legacy")), None),
+                Phase::Live,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+
+        // Legacy receiver fires with the parsed value.
+        let internal = internal_rx.await.unwrap().unwrap();
+        assert_eq!(internal, serde_json::json!("legacy"));
+
+        // Dispatcher receiver MUST NOT have fired — its sender is still
+        // sitting in pending_ack (precedence rule honoured).
+        assert!(
+            client.pending_ack.contains_key(&500),
+            "dispatcher pending_ack entry must remain when legacy map handled the id"
+        );
+        // And the dispatcher's ack_rx is still pending (no message available).
+        // We assert this by trying to receive non-blockingly via try_recv.
+        let mut ack_rx = ack_rx;
+        match ack_rx.try_recv() {
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => (),
+            other => panic!(
+                "dispatcher ack_rx must still be empty when legacy map handled id; got: {other:?}"
+            ),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_dispatcher_ack — direct API: returns true on hit, false on miss
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_dispatcher_ack_returns_false_for_unregistered_id() {
+        let (mut client, _rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-disp-direct-miss")
+        };
+
+        let hit = client.resolve_dispatcher_ack(
+            12345,
+            Ok(HaAckSuccess {
+                id: 12345,
+                payload: None,
+            }),
+        );
+        assert!(
+            !hit,
+            "resolve_dispatcher_ack must return false for unknown id"
+        );
+    }
+
+    #[test]
+    fn resolve_dispatcher_ack_returns_true_and_fires_oneshot_on_hit() {
+        let (mut client, _rx) = {
+            let _g = ENV_LOCK.lock().unwrap();
+            make_client("test-token-disp-direct-hit")
+        };
+
+        let (ack_tx, ack_rx) = oneshot::channel::<AckResult>();
+        client.pending_ack.insert(7, ack_tx);
+
+        let hit = client.resolve_dispatcher_ack(
+            7,
+            Ok(HaAckSuccess {
+                id: 7,
+                payload: Some(serde_json::json!(true)),
+            }),
+        );
+        assert!(hit);
+        assert!(!client.pending_ack.contains_key(&7));
+
+        // Oneshot must have fired.
+        let received = futures::executor::block_on(ack_rx).unwrap();
+        match received {
+            Ok(s) => {
+                assert_eq!(s.id, 7);
+                assert_eq!(s.payload, Some(serde_json::json!(true)));
+            }
+            Err(e) => panic!("expected Ok; got Err: {e:?}"),
+        }
     }
 }
