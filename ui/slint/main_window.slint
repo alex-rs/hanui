@@ -37,10 +37,12 @@ import { SensorTile, SensorTileVM, SensorTilePlacement } from "sensor_tile.slint
 import { EntityTile, EntityTileVM, EntityTilePlacement } from "entity_tile.slint";
 import { GestureConfigGlobal } from "gesture_config.slint";
 import { ViewRouterGlobal } from "view_router.slint";
+import { MoreInfoModal, ModalRowVM } from "more_info.slint";
 
 export { AnimationBudget } from "card_base.slint";
 export { GestureConfigGlobal } from "gesture_config.slint";
 export { ViewRouterGlobal } from "view_router.slint";
+export { ModalRowVM } from "more_info.slint";
 
 // MainWindow — the top-level Phase 1 window. Exposes three array properties
 // (one per tile kind) that `wire_window` writes from the typed VM slices,
@@ -62,6 +64,18 @@ export component MainWindow inherits Window {
     in property <[SensorTileVM]> sensor-tiles;
     in property <[EntityTileVM]> entity-tiles;
     in property <bool> status-banner-visible: false;
+
+    // ── More-info modal (TASK-066) ──────────────────────────────────────
+    // The bridge writes `more-info-visible` true/false from
+    // `ModalState::is_open`, and pushes the entity-name/state/rows once
+    // per modal-open per locked_decisions.more_info_modal (lazy-render).
+    // The shell's `close-requested` callback bubbles to the bridge to
+    // flip `more-info-visible` back to false.
+    in property <bool> more-info-visible: false;
+    in property <string> more-info-entity-name;
+    in property <string> more-info-entity-state;
+    in property <[ModalRowVM]> more-info-rows;
+    callback more-info-close-requested();
 
     title: "hanui";
     background: Theme.background;
@@ -104,6 +118,25 @@ export component MainWindow inherits Window {
             vertical-alignment: center;
             width: parent.width;
             height: parent.height;
+        }
+    }
+
+    // ── More-info modal overlay (TASK-066) ──────────────────────────────
+    // Conditional layout: only present when `more-info-visible == true`.
+    // The shell sizes itself to the parent's full surface. Tap-outside
+    // and close-button both fire `close-requested`, which we forward to
+    // the parent callback so the bridge sees a single consolidated
+    // close-event.
+    if root.more-info-visible : MoreInfoModal {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        entity-name: root.more-info-entity-name;
+        entity-state: root.more-info-entity-state;
+        body-rows: root.more-info-rows;
+        close-requested => {
+            root.more-info-close-requested();
         }
     }
 }
