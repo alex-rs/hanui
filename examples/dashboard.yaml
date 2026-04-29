@@ -1,6 +1,13 @@
 version: 1
-device_profile: rpi4
+device_profile: desktop
+home_assistant:
+  url: "ws://homeassistant.local:8123/api/websocket"
+  token_env: HA_TOKEN
+theme:
+  mode: dark
+  accent: "#03a9f4"
 default_view: home
+
 views:
   - id: home
     title: Home
@@ -8,20 +15,261 @@ views:
     sections:
       - id: overview
         title: Overview
+        grid:
+          columns: 4
+          gap: 8
         widgets:
-          - id: hallway_temperature
-            type: sensor_tile
-            entity: sensor.hallway_temperature
+          - id: living_room_light
+            type: light_tile
+            entity: light.living_room
+            name: "Living Room"
+            icon: "mdi:ceiling-light"
+            visibility: always
+            tap_action:
+              action: call-service
+              domain: light
+              service: turn_on
+              target: light.living_room
+            hold_action:
+              action: more-info
+            double_tap_action:
+              action: none
             layout:
               preferred_columns: 2
               preferred_rows: 1
+
           - id: kitchen_light
             type: light_tile
             entity: light.kitchen
+            name: "Kitchen"
+            icon: "mdi:lightbulb"
+            visibility: always
             tap_action:
               action: toggle
             hold_action:
               action: more-info
+            double_tap_action:
+              action: none
+            layout:
+              preferred_columns: 2
+              preferred_rows: 1
+
+          - id: outdoor_temperature
+            type: sensor_tile
+            entity: sensor.outdoor_temperature
+            name: "Outdoor Temp"
+            icon: "mdi:thermometer"
+            visibility: always
+            tap_action:
+              action: more-info
+            hold_action:
+              action: more-info
+            double_tap_action:
+              action: none
+            layout:
+              preferred_columns: 1
+              preferred_rows: 1
+
+          - id: hallway_temperature
+            type: sensor_tile
+            entity: sensor.hallway_temperature
+            name: "Hallway Temp"
+            icon: "mdi:thermometer"
+            visibility: always
+            tap_action:
+              action: more-info
+            hold_action:
+              action: none
+            double_tap_action:
+              action: none
+            layout:
+              preferred_columns: 1
+              preferred_rows: 1
+
+          - id: ha_docs_link
+            type: entity_tile
+            entity: sensor.ha_version
+            name: "HA Docs"
+            icon: "mdi:home-assistant"
+            visibility: always
+            tap_action:
+              action: url
+              href: "https://www.home-assistant.io/"
+            hold_action:
+              action: more-info
+            double_tap_action:
+              action: none
+            layout:
+              preferred_columns: 2
+              preferred_rows: 1
+
+      - id: climate
+        title: Climate
+        grid:
+          columns: 4
+          gap: 8
+        widgets:
+          - id: living_room_fan
+            type: entity_tile
+            entity: fan.living_room
+            name: "Living Room Fan"
+            icon: "mdi:fan"
+            visibility: always
+            tap_action:
+              action: call-service
+              domain: fan
+              service: turn_on
+              target: fan.living_room
+            hold_action:
+              action: more-info
+            double_tap_action:
+              action: none
+            layout:
+              preferred_columns: 2
+              preferred_rows: 1
+            options:
+              fan:
+                speed_count: 3
+                preset_modes:
+                  - "low"
+                  - "medium"
+                  - "high"
+
+          - id: bedroom_camera
+            type: entity_tile
+            entity: camera.bedroom
+            name: "Bedroom Camera"
+            icon: "mdi:camera"
+            visibility: profile:desktop
+            tap_action:
+              action: more-info
+            hold_action:
+              action: none
+            double_tap_action:
+              action: none
             layout:
               preferred_columns: 2
               preferred_rows: 2
+            options:
+              camera:
+                interval_seconds: 5
+
+          - id: energy_history
+            type: entity_tile
+            entity: sensor.energy_consumption
+            name: "Energy (24h)"
+            icon: "mdi:lightning-bolt"
+            visibility: always
+            tap_action:
+              action: more-info
+            hold_action:
+              action: none
+            double_tap_action:
+              action: none
+            layout:
+              preferred_columns: 2
+              preferred_rows: 1
+            options:
+              history:
+                window_seconds: 86400
+
+  - id: security
+    title: Security
+    layout: sections
+    sections:
+      - id: access
+        title: Access Control
+        grid:
+          columns: 4
+          gap: 8
+        widgets:
+          - id: front_door_lock
+            type: entity_tile
+            entity: lock.front_door
+            name: "Front Door"
+            icon: "mdi:door-closed-lock"
+            visibility: always
+            tap_action:
+              action: call-service
+              domain: lock
+              service: lock
+              target: lock.front_door
+            hold_action:
+              action: more-info
+            double_tap_action:
+              action: none
+            layout:
+              preferred_columns: 2
+              preferred_rows: 1
+            options:
+              lock:
+                pin_policy:
+                  code_format: "Number"
+
+          - id: garage_door_lock
+            type: entity_tile
+            entity: lock.garage_door
+            name: "Garage Door"
+            icon: "mdi:garage"
+            visibility: always
+            tap_action:
+              action: call-service
+              domain: lock
+              service: lock
+              target: lock.garage_door
+            hold_action:
+              action: more-info
+            double_tap_action:
+              action: none
+            layout:
+              preferred_columns: 2
+              preferred_rows: 1
+            options:
+              lock:
+                pin_policy:
+                  code_format: "Number"
+
+      - id: alarm
+        title: Alarm
+        grid:
+          columns: 4
+          gap: 8
+        widgets:
+          - id: home_alarm
+            type: entity_tile
+            entity: alarm_control_panel.home
+            name: "Home Alarm"
+            icon: "mdi:shield-home"
+            visibility: always
+            tap_action:
+              action: call-service
+              domain: alarm_control_panel
+              service: alarm_arm_home
+              target: alarm_control_panel.home
+            hold_action:
+              action: more-info
+            double_tap_action:
+              action: none
+            layout:
+              preferred_columns: 4
+              preferred_rows: 1
+            options:
+              alarm:
+                pin_policy:
+                  code_format: "Number"
+
+          - id: motion_sensor_front
+            type: sensor_tile
+            entity: binary_sensor.motion_front_door
+            name: "Front Motion"
+            icon: "mdi:motion-sensor"
+            visibility: always
+            tap_action:
+              action: more-info
+            hold_action:
+              action: more-info
+            double_tap_action:
+              action: none
+            layout:
+              preferred_columns: 2
+              preferred_rows: 1
