@@ -107,6 +107,14 @@ impl TilePlacement {
 ///
 /// The `icon: image` Slint field is absent; it is written by the Slint bridge
 /// during property wiring (TASK-015).
+///
+/// `pending` mirrors the Slint `pending: bool` field added in TASK-067. It
+/// is driven by [`crate::ui::toast::apply_pending_for_widgets`] from
+/// [`crate::ha::live_store::LiveStore::pending_for_widget`] — the
+/// cross-owner read API locked in
+/// `locked_decisions.pending_state_read_api`. Default `false`; the
+/// spinner is invisible until a dispatcher records an
+/// [`crate::ha::live_store::OptimisticEntry`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct LightTileVM {
     pub name: String,
@@ -115,6 +123,8 @@ pub struct LightTileVM {
     pub preferred_columns: i32,
     pub preferred_rows: i32,
     pub placement: TilePlacement,
+    /// Per-tile spinner gate (TASK-067). Default `false`.
+    pub pending: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +136,9 @@ pub struct LightTileVM {
 ///
 /// The `icon: image` Slint field is absent; it is written by the Slint bridge
 /// during property wiring (TASK-015).
+///
+/// `pending` is the per-tile spinner gate added in TASK-067; see
+/// [`LightTileVM`] for the full contract.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SensorTileVM {
     pub name: String,
@@ -134,6 +147,8 @@ pub struct SensorTileVM {
     pub preferred_columns: i32,
     pub preferred_rows: i32,
     pub placement: TilePlacement,
+    /// Per-tile spinner gate (TASK-067). Default `false`.
+    pub pending: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +163,9 @@ pub struct SensorTileVM {
 ///
 /// The `icon: image` Slint field is absent; it is written by the Slint bridge
 /// during property wiring (TASK-015).
+///
+/// `pending` is the per-tile spinner gate added in TASK-067; see
+/// [`LightTileVM`] for the full contract.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntityTileVM {
     pub name: String,
@@ -156,6 +174,8 @@ pub struct EntityTileVM {
     pub preferred_columns: i32,
     pub preferred_rows: i32,
     pub placement: TilePlacement,
+    /// Per-tile spinner gate (TASK-067). Default `false`.
+    pub pending: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +284,11 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                                 preferred_columns,
                                 preferred_rows,
                                 placement,
+                                // TASK-067: spinner is off at build time.
+                                // The toast/spinner driver flips this on
+                                // each refresh tick from
+                                // `LiveStore::pending_for_widget`.
+                                pending: false,
                             }),
                             WidgetKind::SensorTile => TileVM::Sensor(SensorTileVM {
                                 name,
@@ -272,6 +297,7 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                                 preferred_columns,
                                 preferred_rows,
                                 placement,
+                                pending: false,
                             }),
                             WidgetKind::EntityTile => TileVM::Entity(EntityTileVM {
                                 name,
@@ -280,6 +306,7 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                                 preferred_columns,
                                 preferred_rows,
                                 placement,
+                                pending: false,
                             }),
                         }
                     }
@@ -311,6 +338,7 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                             preferred_columns,
                             preferred_rows,
                             placement,
+                            pending: false,
                         })
                     }
                 };
@@ -435,6 +463,11 @@ pub fn split_tile_vms(
                     span_cols: vm.placement.span_cols,
                     span_rows: vm.placement.span_rows,
                 },
+                // TASK-067 spinner gate. Forwarded verbatim into the
+                // Slint-typed VM; `crate::ui::toast::apply_pending_for_widgets`
+                // is the only writer that flips it back to `true` during
+                // a refresh.
+                pending: vm.pending,
             }),
             TileVM::Sensor(vm) => sensors.push(slint_ui::SensorTileVM {
                 name: SharedString::from(vm.name.as_str()),
@@ -449,6 +482,7 @@ pub fn split_tile_vms(
                     span_cols: vm.placement.span_cols,
                     span_rows: vm.placement.span_rows,
                 },
+                pending: vm.pending,
             }),
             TileVM::Entity(vm) => entities.push(slint_ui::EntityTileVM {
                 name: SharedString::from(vm.name.as_str()),
@@ -463,6 +497,7 @@ pub fn split_tile_vms(
                     span_cols: vm.placement.span_cols,
                     span_rows: vm.placement.span_rows,
                 },
+                pending: vm.pending,
             }),
         }
     }
@@ -1590,6 +1625,7 @@ mod tests {
                 span_cols: 2,
                 span_rows: 2,
             },
+            pending: false,
         })
     }
 
@@ -1606,6 +1642,7 @@ mod tests {
                 span_cols: 2,
                 span_rows: 1,
             },
+            pending: false,
         })
     }
 
@@ -1622,6 +1659,7 @@ mod tests {
                 span_cols: 1,
                 span_rows: 1,
             },
+            pending: false,
         })
     }
 

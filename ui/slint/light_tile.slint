@@ -74,6 +74,12 @@ export struct LightTileVM {
     preferred-columns: int,
     preferred-rows: int,
     placement: TilePlacement,
+    // pending — true while an OptimisticEntry exists for this tile's
+    // entity. Drives the per-tile spinner overlay on CardBase (TASK-067).
+    // Bound from `LiveStore::pending_for_widget(widget_id)` per
+    // `locked_decisions.pending_state_read_api`; never inferred from a
+    // parallel pending-state path (Risk #14).
+    pending: bool,
 }
 
 // LightTile — wraps CardBase with the light-specific content layout.
@@ -95,6 +101,13 @@ export component LightTile inherits Rectangle {
         : Theme.state-unavailable;
 
     base := CardBase {
+        // Bind the per-tile pending-spinner gate (TASK-067). The Rust
+        // bridge writes `view-model.pending` from
+        // `LiveStore::pending_for_widget` (TASK-064 read API) on each
+        // refresh; this property feeds the spinner overlay declared on
+        // CardBase. Slint MUST read only this property — there is no
+        // parallel pending-state path (Risk #14).
+        pending: view-model.pending;
 
         VerticalLayout {
             spacing: Theme.space-2;

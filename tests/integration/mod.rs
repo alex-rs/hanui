@@ -36,6 +36,7 @@ pub mod command_tx;
 pub mod gesture_layer;
 pub mod lagged_resync;
 pub mod more_info_modal;
+pub mod toast_spinner;
 pub mod url_action;
 pub mod view_router;
 pub mod ws_client;

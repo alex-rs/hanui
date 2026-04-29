@@ -1,0 +1,99 @@
+// toast.slint — transient toast banner (TASK-067).
+//
+// Phase 3 ships a single transient banner driven by the dispatcher's toast
+// channel (TASK-064 emits `ToastEvent::BackpressureRejected`; TASK-065 will
+// also surface offline-rejection events). The component is a passive
+// renderer — every behavioural rule named in
+// `docs/plans/2026-04-28-phase-3-actions.md` § `locked_decisions.toast_behavior`
+// is enforced in Rust (`src/ui/toast.rs`):
+//
+//   * Auto-dismiss after `toast_dismiss_ms = 4000` (Rust-side timer).
+//   * Tap-to-dismiss earlier (Slint's TouchArea fires `dismissed`; Rust
+//     toggles `visible` to false).
+//   * Single visible at a time — newer replaces older immediately. The
+//     Slint side has only one toast component instance; Rust overwrites
+//     `text` and re-arms the dismiss timer on each new event.
+//   * No queue persists across view changes — Rust clears the toast on
+//     every `Navigate` outcome (TASK-068's view-router callback path).
+//
+// All colours come from `Theme` tokens — the CI hex-color gate
+// (.github/workflows/ci.yml § Gate 1) enforces no inline hex literals
+// outside `theme.slint`.
+//
+// Layout:
+//   The toast is rendered as a centered pill at the top of its parent
+//   surface (typically `MainWindow`). The parent positions and sizes the
+//   toast — this component is a `Rectangle` with no x/y on its own root,
+//   so the parent's `if root.toast-visible : Toast { ... }` block sets
+//   the placement (mirroring the status-banner pattern in
+//   `main_window.slint`).
+//
+// Out of scope (Phase 3 non-goal per ticket):
+//   * Multiple-toast queue UI — locked decision is "single visible; newer
+//     replaces older".
+//   * Per-severity icons or color tints — Phase 6 may add them; Phase 3
+//     uses one neutral banner style for every event variant.
+
+import { Theme } from "theme.slint";
+
+// Toast — transient banner with one text line and a tap-to-dismiss hit
+// surface. The component is rendered conditionally by the parent
+// (`if root.toast-visible : Toast { ... }`). Rust drives `text` on each
+// new event and triggers the conditional render via a `bool` property
+// flip on the parent.
+export component Toast inherits Rectangle {
+    // ── Public properties ──────────────────────────────────────────────
+    // The toast message text. Set by the Rust toast driver from the
+    // formatted `ToastEvent` (e.g. "Action queue full for `light.kitchen`").
+    in property <string> text;
+
+    // ── Callbacks ──────────────────────────────────────────────────────
+    // Fired when the user taps the toast surface to dismiss earlier than
+    // the auto-dismiss timer. The Rust driver also fires the same
+    // dismissal path on the timer; this callback is the user-initiated
+    // path.
+    callback dismissed();
+
+    // ── Visual chrome ──────────────────────────────────────────────────
+    // Pill-shaped banner. Background uses `banner-bg` (the same
+    // attention-orange the status banner uses) so the user reliably
+    // recognises a transient system message. `radius-pill` keeps the
+    // surface visually distinct from the rectangular tile chrome.
+    background: Theme.banner-bg;
+    border-radius: Theme.radius-pill;
+    border-width: 1px;
+    border-color: Theme.elevated;
+    height: 36px;
+
+    // Toast text. Centered horizontally + vertically. Text colour comes
+    // from `text-primary` (WCAG AA against `banner-bg` per theme.slint
+    // commentary).
+    Text {
+        text: root.text;
+        color: Theme.text-primary;
+        font-size: Theme.font-md;
+        font-weight: Theme.font-weight-medium;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        // Inset by space-4 so long messages do not crowd the pill edges.
+        x: Theme.space-4;
+        y: 0px;
+        width: parent.width - 2 * Theme.space-4;
+        height: parent.height;
+        // Slint elides with an ellipsis when the text exceeds the
+        // bounding box; the toast deliberately does NOT wrap to a second
+        // line (single-row banner per the locked design).
+        overflow: elide;
+    }
+
+    // ── Tap-to-dismiss surface ─────────────────────────────────────────
+    // Full-toast TouchArea. Tapping anywhere fires `dismissed` so the
+    // Rust driver can flip visibility off without waiting for the
+    // auto-dismiss timer.
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.dismissed();
+        }
+    }
+}

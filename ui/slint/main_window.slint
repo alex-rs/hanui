@@ -38,6 +38,7 @@ import { EntityTile, EntityTileVM, EntityTilePlacement } from "entity_tile.slint
 import { GestureConfigGlobal } from "gesture_config.slint";
 import { ViewRouterGlobal } from "view_router.slint";
 import { MoreInfoModal, ModalRowVM } from "more_info.slint";
+import { Toast } from "toast.slint";
 
 export { AnimationBudget } from "card_base.slint";
 export { GestureConfigGlobal } from "gesture_config.slint";
@@ -76,6 +77,18 @@ export component MainWindow inherits Window {
     in property <string> more-info-entity-state;
     in property <[ModalRowVM]> more-info-rows;
     callback more-info-close-requested();
+
+    // ── Toast (TASK-067) ────────────────────────────────────────────────
+    // Single transient banner. The Rust toast driver
+    // (`src/ui/toast.rs::ToastDriver`) writes `toast-text` and toggles
+    // `toast-visible`; the auto-dismiss timer (4 s per
+    // locked_decisions.toast_behavior), tap-to-dismiss path,
+    // newer-replaces-older invariant, and clear-on-navigate are all
+    // enforced in Rust. The Slint side is a passive renderer with one
+    // toast component instance.
+    in property <bool> toast-visible: false;
+    in property <string> toast-text;
+    callback toast-dismissed();
 
     title: "hanui";
     background: Theme.background;
@@ -137,6 +150,24 @@ export component MainWindow inherits Window {
         body-rows: root.more-info-rows;
         close-requested => {
             root.more-info-close-requested();
+        }
+    }
+
+    // ── Toast overlay (TASK-067) ────────────────────────────────────────
+    // Conditional render: the Toast subtree exists only while
+    // `toast-visible` is true (the Rust driver flips this on every new
+    // event and clears it on auto-dismiss / tap-dismiss / navigate).
+    // Centered horizontally with a top inset so it sits below the
+    // status banner (which occupies the top 32 px when visible).
+    // Width is bounded so the toast stays a readable pill on wide
+    // windows but hugs the available width on narrow ones.
+    if root.toast-visible : Toast {
+        x: (parent.width - self.width) / 2;
+        y: 40px;
+        width: min(360px, parent.width - 2 * Theme.space-4);
+        text: root.toast-text;
+        dismissed => {
+            root.toast-dismissed();
         }
     }
 }
