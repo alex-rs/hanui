@@ -102,6 +102,10 @@ path = "tests/smoke/mod.rs"
 [dependencies]
 slint = { version = "1.16.1", default-features = false, features = ["std", "compat-1-2", "renderer-software", "backend-winit-x11"] }
 serde = { version = "1", features = ["derive"] }
+# YAML loader for dashboard config (Phase 4 TASK-080). NOT the archived dtolnay/serde_yaml
+# crate — that crate was archived in 2024 and is explicitly unmaintained. See
+# locked_decisions.serde_yaml_crate_choice in docs/plans/2026-04-29-phase-4-layout.md.
+serde_yaml_ng = "0.10"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 anyhow = "1"
