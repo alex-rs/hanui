@@ -68,4 +68,30 @@ fn main() {
         "cargo:rustc-env=HANUI_GESTURE_TEST_INCLUDE={}",
         test_output.display()
     );
+
+    // Span-check prototype (TASK-078) — Phase 4 kill-switch gate.
+    // Compiles `examples/span_check.slint` to a separate output file so
+    // `examples/span_check.rs` can include the generated Rust bindings via
+    // the `HANUI_SPAN_CHECK_INCLUDE` env var (mirrors the gesture_test_window
+    // pattern above). This keeps the generated types for the prototype
+    // isolated from the production `MainWindow` bindings; the `include!` in
+    // `examples/span_check.rs` pulls in `SpanCheckWindow` only for that
+    // binary, not for the runtime or any integration-test binary.
+    let span_check_input = manifest_dir.join("examples/span_check.slint");
+    let span_check_output = out_dir.join("span_check.rs");
+
+    let span_check_deps = slint_build::compile_with_output_path(
+        &span_check_input,
+        &span_check_output,
+        slint_build::CompilerConfiguration::default(),
+    )
+    .expect("compile examples/span_check.slint with slint-build");
+
+    for dep in span_check_deps {
+        println!("cargo:rerun-if-changed={}", dep.display());
+    }
+    println!(
+        "cargo:rustc-env=HANUI_SPAN_CHECK_INCLUDE={}",
+        span_check_output.display()
+    );
 }

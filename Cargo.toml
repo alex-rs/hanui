@@ -11,6 +11,16 @@ build = "build.rs"
 name = "hanui"
 path = "src/main.rs"
 
+# Phase 4 kill-switch gate (TASK-078): confirms Slint GridLayout can express
+# the column/row span behaviors required by the Phase 4 schema before TASK-079
+# locks the schema. Exits 0 on GREEN (all three behaviors pass), 1 on
+# SCOPE_REDUCE (any behavior fails — CTO + founder decide schema trim before
+# TASK-079 merges). See docs/plans/2026-04-29-phase-4-layout.md
+# `locked_decisions.span_prototype_kill_switch` for the exact criteria.
+[[example]]
+name = "span_check"
+path = "examples/span_check.rs"
+
 [lib]
 name = "hanui"
 path = "src/lib.rs"
