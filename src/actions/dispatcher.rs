@@ -44,6 +44,25 @@
 //! Returns [`DispatchError::NotImplementedYet`] with a static reference to
 //! TASK-063, the ticket that owns the `xdg-open` shell-out boundary and
 //! `UrlActionMode` gating. The dispatcher does not shell out itself.
+//!
+//! # `Navigate` (TASK-068)
+//!
+//! [`Action::Navigate { view_id }`] routes through an optional
+//! [`ViewRouter`] handle. When present, the dispatcher invokes
+//! `router.navigate(view_id)` BEFORE returning
+//! [`DispatchOutcome::Navigate`], so the Slint-side `ViewRouterGlobal::current-view`
+//! property is updated synchronously on the same UI thread the gesture fired
+//! on. The dispatcher's public signature is unchanged
+//! (locked_decisions.phase4_forward_compat) — Phase 4 will populate
+//! multi-view configs and the same dispatcher routes them. When the router
+//! field is `None` (e.g. unit tests, or the dispatcher is constructed before
+//! the window exists), the dispatcher still returns
+//! [`DispatchOutcome::Navigate`]; the caller can decide what to do with the
+//! payload. Phase 3 single-view: `Navigate { view_id: "default" }` is a
+//! no-op (the global already holds `"default"`), per
+//! locked_decisions.view_router.
+
+use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
@@ -55,6 +74,7 @@ use crate::ha::entity::EntityId;
 use crate::ha::live_store::LiveStore;
 use crate::ha::services::ServiceRegistryHandle;
 use crate::ha::store::EntityStore;
+use crate::ui::view_router::ViewRouter;
 
 // ---------------------------------------------------------------------------
 // Gesture
@@ -244,7 +264,7 @@ impl std::error::Error for DispatchError {}
 /// `Dispatcher` is `Clone` so a single instance can be cloned into Slint
 /// gesture callbacks. The underlying `mpsc::Sender` is cheap to clone (it
 /// shares the same channel) and `ServiceRegistryHandle` is an `Arc`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Dispatcher {
     /// Outbound channel to the WS client task. `None` until TASK-072
     /// wires it; in that interim every WS-bound dispatch returns
@@ -255,6 +275,32 @@ pub struct Dispatcher {
     /// (TASK-048 cross-task accessor). Used for Toggle's capability
     /// fallback.
     services: ServiceRegistryHandle,
+
+    /// Optional view-router handle (TASK-068). When `Some`, the dispatcher
+    /// invokes `router.navigate(view_id)` on `Action::Navigate` before
+    /// returning [`DispatchOutcome::Navigate`]. When `None`, the dispatcher
+    /// still returns the outcome — the router is purely an additional sink
+    /// so the public signature is unchanged
+    /// (locked_decisions.phase4_forward_compat).
+    ///
+    /// Wrapped in `Arc<dyn ViewRouter>` so the dispatcher stays `Clone`
+    /// (the trait object is `?Sized` and cannot be cloned directly) and the
+    /// router can be shared across cloned dispatcher instances handed to
+    /// gesture callbacks.
+    view_router: Option<Arc<dyn ViewRouter>>,
+}
+
+// Custom `Debug` so the `dyn ViewRouter` field (which does not implement
+// `Debug`) does not block the derive. We surface only whether a router is
+// present — its identity is opaque.
+impl std::fmt::Debug for Dispatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Dispatcher")
+            .field("command_tx", &self.command_tx.is_some())
+            .field("services", &"<ServiceRegistryHandle>")
+            .field("view_router", &self.view_router.is_some())
+            .finish()
+    }
 }
 
 impl Dispatcher {
@@ -269,6 +315,7 @@ impl Dispatcher {
         Dispatcher {
             command_tx: None,
             services,
+            view_router: None,
         }
     }
 
@@ -284,7 +331,33 @@ impl Dispatcher {
         Dispatcher {
             command_tx: Some(command_tx),
             services,
+            view_router: None,
         }
+    }
+
+    /// Attach a [`ViewRouter`] sink for `Action::Navigate` (TASK-068).
+    ///
+    /// The dispatcher's public `dispatch` signature is unchanged
+    /// (locked_decisions.phase4_forward_compat) — the router is an
+    /// additional optional sink. Phase 3 wires this once at startup with a
+    /// [`crate::ui::view_router::SlintViewRouter`] backed by the main
+    /// `MainWindow` weak handle.
+    ///
+    /// `router` is wrapped in [`Arc`] internally so the dispatcher remains
+    /// `Clone` and can be cloned into gesture callbacks (TASK-062 contract).
+    #[must_use]
+    pub fn with_view_router<R: ViewRouter + 'static>(mut self, router: R) -> Self {
+        self.view_router = Some(Arc::new(router));
+        self
+    }
+
+    /// Variant of [`Dispatcher::with_view_router`] that accepts an existing
+    /// [`Arc<dyn ViewRouter>`] for callers (notably tests) that want to keep
+    /// their own clone of the router for assertions.
+    #[must_use]
+    pub fn with_view_router_arc(mut self, router: Arc<dyn ViewRouter>) -> Self {
+        self.view_router = Some(router);
+        self
     }
 
     /// Route a gesture on a widget through the action map.
@@ -326,9 +399,26 @@ impl Dispatcher {
             Action::MoreInfo => Ok(DispatchOutcome::MoreInfo {
                 entity_id: entry.entity_id.clone(),
             }),
-            Action::Navigate { view_id } => Ok(DispatchOutcome::Navigate {
-                view_id: view_id.clone(),
-            }),
+            Action::Navigate { view_id } => {
+                // TASK-068: drive the Slint `ViewRouterGlobal::current-view`
+                // property by invoking the optional view-router. Phase 3
+                // ships a single view (`"default"`); the navigate is
+                // observably a no-op for that target. Unknown view ids are
+                // logged at debug level inside the router (see
+                // `SlintViewRouter::navigate`) and the global is updated
+                // verbatim — Phase 4 will populate readers.
+                //
+                // We invoke the router BEFORE returning the outcome so a
+                // caller that consumes the `DispatchOutcome::Navigate`
+                // payload sees the global already updated. The dispatcher
+                // signature is unchanged (locked_decisions.phase4_forward_compat).
+                if let Some(router) = self.view_router.as_ref() {
+                    router.navigate(view_id);
+                }
+                Ok(DispatchOutcome::Navigate {
+                    view_id: view_id.clone(),
+                })
+            }
             Action::Url { .. } => Err(DispatchError::NotImplementedYet {
                 what: "Url",
                 ticket: "TASK-063",
@@ -939,6 +1029,195 @@ mod tests {
         }
 
         assert!(rx.try_recv().is_err(), "Navigate must NOT send a frame");
+    }
+
+    // -----------------------------------------------------------------------
+    // Navigate — TASK-068 router wiring
+    //
+    // The dispatcher invokes the optional `ViewRouter::navigate(view_id)`
+    // BEFORE returning `DispatchOutcome::Navigate`. Verified with the test-
+    // only `RecordingViewRouter` from `crate::ui::view_router::tests` so the
+    // dispatcher unit tests do not need a live Slint window.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn navigate_invokes_view_router_with_default_view_id() {
+        // Acceptance criterion: Navigate { view_id: "default" } does not
+        // panic and reaches the router with the documented payload. With
+        // the Phase 3 single-view setup, the SlintViewRouter would observe
+        // current-view already at "default" so this is a no-op on the UI;
+        // the recording router lets us assert the dispatcher actually
+        // called navigate (it cannot be silently elided).
+        use crate::ui::view_router::tests::RecordingViewRouter;
+        use crate::ui::view_router::DEFAULT_VIEW_ID;
+
+        let services = handle_from(ServiceRegistry::new());
+        let recorder = Arc::new(RecordingViewRouter::new());
+        let (tx, _rx) = mpsc::channel::<OutboundCommand>(8);
+        let dispatcher = Dispatcher::with_command_tx(services, tx)
+            .with_view_router_arc(recorder.clone() as Arc<dyn ViewRouter>);
+
+        let map = one_widget_map(
+            "w",
+            entry_with(
+                "light.kitchen",
+                Action::Navigate {
+                    view_id: DEFAULT_VIEW_ID.to_owned(),
+                },
+                Action::None,
+                Action::None,
+            ),
+        );
+        let store = store_with(vec![]);
+
+        let outcome = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect("navigate-to-default must dispatch successfully");
+
+        match outcome {
+            DispatchOutcome::Navigate { view_id } => {
+                assert_eq!(
+                    view_id, DEFAULT_VIEW_ID,
+                    "outcome must carry the requested view_id verbatim"
+                );
+            }
+            other => panic!("expected Navigate outcome, got {other:?}"),
+        }
+
+        assert_eq!(
+            recorder.calls(),
+            vec![DEFAULT_VIEW_ID.to_owned()],
+            "router must have been invoked exactly once with `default`"
+        );
+    }
+
+    #[test]
+    fn navigate_invokes_view_router_with_unknown_view_id() {
+        // Acceptance criterion: Navigate { view_id: "unknown" } does not
+        // panic and reaches the router. SlintViewRouter logs at debug
+        // level; here we only verify the dispatch path itself routes the
+        // payload through.
+        use crate::ui::view_router::tests::RecordingViewRouter;
+
+        let services = handle_from(ServiceRegistry::new());
+        let recorder = Arc::new(RecordingViewRouter::new());
+        let dispatcher =
+            Dispatcher::new(services).with_view_router_arc(recorder.clone() as Arc<dyn ViewRouter>);
+
+        let map = one_widget_map(
+            "w",
+            entry_with(
+                "light.kitchen",
+                Action::Navigate {
+                    view_id: "kitchen".to_owned(),
+                },
+                Action::None,
+                Action::None,
+            ),
+        );
+        let store = store_with(vec![]);
+
+        let outcome = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect("navigate-to-unknown must dispatch successfully (no panic)");
+        assert!(
+            matches!(outcome, DispatchOutcome::Navigate { ref view_id } if view_id == "kitchen"),
+            "outcome must be Navigate with view_id=kitchen, got {outcome:?}"
+        );
+        assert_eq!(
+            recorder.calls(),
+            vec!["kitchen".to_owned()],
+            "router must have been invoked with the unknown view id verbatim"
+        );
+    }
+
+    #[test]
+    fn navigate_without_view_router_still_returns_outcome() {
+        // The router is optional (locked_decisions.phase4_forward_compat:
+        // dispatcher signature unchanged). When no router is wired, the
+        // dispatcher still returns DispatchOutcome::Navigate so the caller
+        // can route the payload itself if needed. No panic.
+        let services = handle_from(ServiceRegistry::new());
+        let dispatcher = Dispatcher::new(services); // no view_router
+
+        let map = one_widget_map(
+            "w",
+            entry_with(
+                "light.kitchen",
+                Action::Navigate {
+                    view_id: "default".to_owned(),
+                },
+                Action::None,
+                Action::None,
+            ),
+        );
+        let store = store_with(vec![]);
+
+        let outcome = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect("navigate must succeed even without a view router");
+        assert!(
+            matches!(outcome, DispatchOutcome::Navigate { ref view_id } if view_id == "default"),
+            "outcome must still be Navigate when no router is wired, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn navigate_router_invoked_only_for_navigate_action() {
+        // Defensive: confirm that other Action variants do NOT call the
+        // router. A mis-wired dispatcher could call navigate on every
+        // dispatch — this test pins the contract that the router is only
+        // touched by `Action::Navigate`.
+        use crate::ui::view_router::tests::RecordingViewRouter;
+
+        let services = handle_from(ServiceRegistry::new());
+        let recorder = Arc::new(RecordingViewRouter::new());
+        let (tx, _rx) = mpsc::channel::<OutboundCommand>(8);
+        let dispatcher = Dispatcher::with_command_tx(services, tx)
+            .with_view_router_arc(recorder.clone() as Arc<dyn ViewRouter>);
+
+        let map = one_widget_map(
+            "w",
+            entry_with(
+                "light.kitchen",
+                Action::None,
+                Action::MoreInfo,
+                Action::CallService {
+                    domain: "light".to_owned(),
+                    service: "turn_on".to_owned(),
+                    target: None,
+                    data: None,
+                },
+            ),
+        );
+        let store = store_with(vec![make_entity("light.kitchen", "on")]);
+
+        // Tap (None) → no router call.
+        let _ = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect("None must dispatch as NoOp");
+        assert!(
+            recorder.calls().is_empty(),
+            "router must NOT be called for Action::None"
+        );
+
+        // Hold (MoreInfo) → no router call.
+        let _ = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Hold, &store, &map)
+            .expect("MoreInfo must dispatch");
+        assert!(
+            recorder.calls().is_empty(),
+            "router must NOT be called for Action::MoreInfo"
+        );
+
+        // DoubleTap (CallService) → no router call.
+        let _ = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::DoubleTap, &store, &map)
+            .expect("CallService must dispatch");
+        assert!(
+            recorder.calls().is_empty(),
+            "router must NOT be called for Action::CallService"
+        );
     }
 
     // -----------------------------------------------------------------------

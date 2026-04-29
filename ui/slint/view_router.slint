@@ -1,0 +1,39 @@
+// view_router.slint — Slint-side mirror of the in-app view router (TASK-068).
+//
+// Phase 3 ships a single view (`"default"`); the router exists as a wired stub
+// so Phase 4 can populate multi-view configurations from YAML without
+// retrofitting the dispatcher (locked_decisions.view_router and
+// locked_decisions.phase4_forward_compat in
+// `docs/plans/2026-04-28-phase-3-actions.md`).
+//
+// Why a separate file:
+//   * `main_window.slint` re-exports `ViewRouterGlobal` so
+//     `slint::include_modules!()` surfaces a public Rust handle that the
+//     bridge / dispatcher can write to via `window.global::<ViewRouterGlobal>()`.
+//   * Keeping the global definition in its own file mirrors the layout
+//     established by `gesture_config.slint` (TASK-059): each Slint global has
+//     a single source-of-truth file rather than being wedged into a tile or
+//     window component.
+//
+// Locked decision (`docs/plans/2026-04-28-phase-3-actions.md`):
+//   * `current-view: SharedString` — driven by `Action::Navigate { view_id }`
+//     through the Rust `Dispatcher` -> `ViewRouter` indirection. Slint code
+//     reads this property to decide which view to render once Phase 4 adds
+//     multi-view layouts. Phase 3 always holds `"default"` because no other
+//     view is wired in either Rust or Slint.
+//
+// The default value `"default"` mirrors the single Phase 3 view name baked
+// into the dispatcher's no-op handling: `Navigate { view_id: "default" }` is
+// the only nav target that is currently a no-op-confirmed.
+
+export global ViewRouterGlobal {
+    // The currently-rendered view's id. Phase 3 always holds `"default"`;
+    // Phase 4 populates multi-view configs and this property mediates the
+    // active-view selection (which `if`-block, which model row, etc.).
+    //
+    // The Rust side mutates this via `window.global::<ViewRouterGlobal>()
+    // .set_current_view(SharedString::from(view_id))`. Slint code that adds
+    // multi-view rendering reads this property; Phase 3 has no readers
+    // because the single rendered view does not branch on it.
+    in-out property <string> current-view: "default";
+}
