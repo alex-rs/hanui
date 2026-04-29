@@ -1,4 +1,8 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
+
+use crate::actions::timing::ActionTimingOverride;
 
 // ---------------------------------------------------------------------------
 // UrlActionMode (TASK-063)
@@ -107,6 +111,60 @@ const fn matches_bytes(a: &[u8], b: &[u8]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// BlankingPolicy (TASK-081)
+// ---------------------------------------------------------------------------
+
+/// Screen-blanking policy for a device profile.
+///
+/// Controls whether the display is blanked after a period of inactivity and,
+/// if so, after how long. The Phase 5 blanking driver reads this value at
+/// startup.
+///
+/// # Variants
+///
+/// * [`Self::Never`] — blanking is disabled; the display stays on
+///   indefinitely. Default for the `desktop` profile where the launcher
+///   manages screen power via OS settings.
+/// * [`Self::Idle(Duration)`] — blank the display after the given idle period.
+///   Default for `rpi4` and `opi_zero3` kiosk profiles; the canonical Phase 4
+///   preset value is `Duration::from_secs(300)` (5 minutes) per
+///   `locked_decisions.blanking_policy_yaml_config`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlankingPolicy {
+    /// Never blank; the OS/launcher handles display power.
+    Never,
+    /// Blank after the given idle duration.
+    Idle(Duration),
+}
+
+// ---------------------------------------------------------------------------
+// Density (TASK-081)
+// ---------------------------------------------------------------------------
+
+/// Grid-density hint for the Phase 4 layout engine.
+///
+/// Controls the horizontal and vertical spacing between tiles when the layout
+/// engine packs the grid. `DeviceProfile.density` sets the default; a future
+/// YAML override (`density` field) may override it at load time.
+///
+/// # Variants
+///
+/// * [`Self::Compact`] — tighter spacing, suitable for small or lower-DPI
+///   displays (e.g. the `opi_zero3` 5-inch panel).
+/// * [`Self::Regular`] — the standard spacing used by the `rpi4` preset.
+/// * [`Self::Spacious`] — wider gaps for high-DPI or large displays. Default
+///   for the `desktop` profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Density {
+    /// Tighter tile spacing for small displays.
+    Compact,
+    /// Standard tile spacing.
+    Regular,
+    /// Wider tile spacing for large / high-DPI displays.
+    Spacious,
+}
+
+// ---------------------------------------------------------------------------
 // DeviceProfile
 // ---------------------------------------------------------------------------
 
@@ -119,8 +177,13 @@ const fn matches_bytes(a: &[u8], b: &[u8]) -> bool {
 /// Source of truth for numeric caps: `docs/PHASES.md` "Performance budgets"
 /// table. When updating this struct, keep field names and values in sync with
 /// that table.
+///
+/// Group A fields were present in Phase 3. Group B fields are new in Phase 4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceProfile {
+    // -----------------------------------------------------------------------
+    // Group A — Phase 3 carryover
+    // -----------------------------------------------------------------------
     /// Number of Tokio worker threads for the async runtime.
     ///
     /// Phase 1: `main.rs` runtime builder reads this field; no `num_cpus`
@@ -205,9 +268,213 @@ pub struct DeviceProfile {
     /// gate on the `xdg-open` shell-out path, and that `href` is sourced from
     /// the action spec — never from live entity state.
     pub url_action_mode: UrlActionMode,
+
+    // -----------------------------------------------------------------------
+    // Group B — Phase 4 new fields
+    // -----------------------------------------------------------------------
+    /// Target frame period p95 budget in milliseconds.
+    ///
+    /// Phase 5 health socket asserts that p95 frame period stays at or below
+    /// this value. Desktop = 16 ms (60 fps), rpi4 = 33 ms (30 fps),
+    /// opi_zero3 = 50 ms (20 fps).
+    pub target_frame_period_ms: u32,
+
+    /// Idle CPU percentage cap enforced at Phase 5 acceptance.
+    pub idle_cpu_pct_cap: u8,
+
+    /// Maximum number of widgets allowed per view.
+    ///
+    /// Phase 4 validator rejects dashboard YAML whose views exceed this cap.
+    pub max_widgets_per_view: usize,
+
+    /// Maximum number of simultaneously active camera streams.
+    ///
+    /// Phase 6b decoder pool enforces this cap; requests above it are queued.
+    pub max_simultaneous_camera_streams: usize,
+
+    /// Whether touch input is expected on this device.
+    ///
+    /// Phase 4 uses this to decide whether swipe-navigation is instantiated.
+    pub touch_input: bool,
+
+    /// Maximum number of pending optimistic entries per entity.
+    ///
+    /// Phase 3 dispatcher enforces this; new dispatches at the cap are
+    /// rejected with a user-visible error.
+    pub pending_optimistic_per_entity: usize,
+
+    /// Maximum number of pending optimistic entries across all entities.
+    ///
+    /// Phase 3 dispatcher enforces the global cap in addition to the per-entity cap.
+    pub pending_optimistic_global: usize,
+
+    /// Offline action queue capacity.
+    ///
+    /// Phase 3 offline queue enforces this; the oldest entry is aged out when
+    /// a new entry would overflow.
+    pub offline_queue_cap: usize,
+
+    /// Maximum number of attributes shown in the `AttributesBody` more-info
+    /// panel (Phase 3).
+    pub attributes_body_max_attrs: usize,
+
+    /// Maximum number of characters shown per attribute value in the
+    /// `AttributesBody` more-info panel (Phase 3).
+    pub attributes_body_max_chars: usize,
+
+    /// Auto-dismiss delay for toast notifications in milliseconds.
+    ///
+    /// Phase 3 toast layer dismisses toasts after this delay. Also
+    /// tap-to-dismiss is always available regardless of this value.
+    pub toast_dismiss_ms: u64,
+
+    /// Default camera polling interval in seconds (Phase 6b schema).
+    pub camera_interval_default_s: u32,
+
+    /// Minimum camera polling interval in seconds (Phase 6b schema validation).
+    pub camera_interval_min_s: u32,
+
+    /// Default history window in seconds (Phase 6b schema).
+    pub history_window_default_s: u32,
+
+    /// Maximum history window in seconds (Phase 6b schema).
+    pub history_window_max_s: u32,
+
+    /// HTTP cache total size in bytes (Phase 6.0 http.rs).
+    pub http_cache_bytes: usize,
+
+    /// HTTP cache TTL in seconds (Phase 6.0 http.rs).
+    pub http_cache_ttl_s: u32,
+
+    /// SmallVec inline capacity for the dependency index (Phase 6b visibility
+    /// evaluator). Entries above this threshold spill to the heap.
+    pub dep_index_inline_cap: usize,
+
+    /// Number of fixed histogram buckets used by the Phase 5 frame-period
+    /// metrics collector.
+    pub frame_histogram_buckets: usize,
+
+    /// SoC temperature ceiling in degrees Celsius (Phase 5 thermal soak).
+    ///
+    /// The desktop profile has no SoC sensor; this field is 0 for desktop.
+    pub soc_temp_ceiling_c: u8,
+
+    /// Reconnect burst RSS allowance above the idle steady-state in megabytes.
+    ///
+    /// Phase 2 soak asserts that peak RSS during a reconnect cycle does not
+    /// exceed `idle_rss_mb_cap + reconnect_burst_rss_mb`.
+    pub reconnect_burst_rss_mb: usize,
+
+    /// Screen-blanking policy.
+    ///
+    /// Phase 5 blanking driver reads this value at startup.
+    pub blanking_policy: BlankingPolicy,
+
+    /// Optional per-profile overrides for action and gesture timing knobs.
+    ///
+    /// `None` means "use `ActionTiming::default()` unchanged". When `Some`,
+    /// the dispatcher applies each non-`None` field on top of the defaults at
+    /// startup.
+    pub timing_overrides: Option<ActionTimingOverride>,
+
+    /// Grid-density hint for the Phase 4 layout engine.
+    pub density: Density,
 }
 
-/// Desktop preset — the active profile for Phase 1, Phase 2, and Phase 3.
+// ---------------------------------------------------------------------------
+// Presets
+// ---------------------------------------------------------------------------
+
+/// Raspberry Pi 4 kiosk preset.
+///
+/// Values are sourced from the "rpi4" column of the Performance budgets table
+/// in `docs/PHASES.md`. When updating this const, keep field names and values
+/// in sync with that table.
+pub const PROFILE_RPI4: DeviceProfile = DeviceProfile {
+    // Group A
+    tokio_workers: 2,
+    max_entities: 4_096,
+    max_simultaneous_animations: 3,
+    animation_framerate_cap: 30,
+    max_image_px: 1_280,
+    ws_payload_cap: 16 * 1024 * 1024,
+    snapshot_buffer_events: 5_000,
+    idle_rss_mb_cap: 80,
+    cpu_smoke_budget_pct: 30,
+    url_action_mode: default_url_action_mode("rpi4"),
+    // Group B
+    target_frame_period_ms: 33,
+    idle_cpu_pct_cap: 5,
+    max_widgets_per_view: 32,
+    max_simultaneous_camera_streams: 2,
+    touch_input: true,
+    pending_optimistic_per_entity: 4,
+    pending_optimistic_global: 64,
+    offline_queue_cap: 64,
+    attributes_body_max_attrs: 32,
+    attributes_body_max_chars: 256,
+    toast_dismiss_ms: 4_000,
+    camera_interval_default_s: 10,
+    camera_interval_min_s: 5,
+    history_window_default_s: 6 * 3_600,
+    history_window_max_s: 24 * 3_600,
+    http_cache_bytes: 32 * 1024 * 1024,
+    http_cache_ttl_s: 300,
+    dep_index_inline_cap: 8,
+    frame_histogram_buckets: 100,
+    soc_temp_ceiling_c: 75,
+    reconnect_burst_rss_mb: 20,
+    blanking_policy: BlankingPolicy::Idle(Duration::from_secs(300)),
+    timing_overrides: None,
+    density: Density::Regular,
+};
+
+/// Orange Pi Zero 3 kiosk preset.
+///
+/// Values are sourced from the "opi_zero3" column of the Performance budgets
+/// table in `docs/PHASES.md`. When updating this const, keep field names and
+/// values in sync with that table.
+pub const PROFILE_OPI_ZERO3: DeviceProfile = DeviceProfile {
+    // Group A
+    tokio_workers: 2,
+    max_entities: 2_048,
+    max_simultaneous_animations: 2,
+    animation_framerate_cap: 20,
+    max_image_px: 800,
+    ws_payload_cap: 8 * 1024 * 1024,
+    snapshot_buffer_events: 2_500,
+    idle_rss_mb_cap: 60,
+    cpu_smoke_budget_pct: 50,
+    url_action_mode: default_url_action_mode("opi_zero3"),
+    // Group B
+    target_frame_period_ms: 50,
+    idle_cpu_pct_cap: 10,
+    max_widgets_per_view: 20,
+    max_simultaneous_camera_streams: 1,
+    touch_input: true,
+    pending_optimistic_per_entity: 4,
+    pending_optimistic_global: 32,
+    offline_queue_cap: 32,
+    attributes_body_max_attrs: 32,
+    attributes_body_max_chars: 256,
+    toast_dismiss_ms: 4_000,
+    camera_interval_default_s: 30,
+    camera_interval_min_s: 10,
+    history_window_default_s: 3 * 3_600,
+    history_window_max_s: 12 * 3_600,
+    http_cache_bytes: 16 * 1024 * 1024,
+    http_cache_ttl_s: 300,
+    dep_index_inline_cap: 8,
+    frame_histogram_buckets: 100,
+    soc_temp_ceiling_c: 80,
+    reconnect_burst_rss_mb: 20,
+    blanking_policy: BlankingPolicy::Idle(Duration::from_secs(300)),
+    timing_overrides: None,
+    density: Density::Compact,
+};
+
+/// Desktop dev-VM preset — the active profile for Phase 1, Phase 2, Phase 3,
+/// and Phase 4.
 ///
 /// Values are sourced verbatim from the "desktop" column of the Performance
 /// budgets table in `docs/PHASES.md`. When updating this const, keep field
@@ -216,10 +483,8 @@ pub struct DeviceProfile {
 /// `url_action_mode` is [`UrlActionMode::Always`] per
 /// `locked_decisions.url_action_gating` — the desktop profile is the dev VM
 /// where shelling out to `xdg-open` is the expected behaviour.
-///
-/// rpi4 / opi_zero3 presets land in Phase 5. Their `url_action_mode` will be
-/// [`UrlActionMode::Never`] per [`default_url_action_mode`].
-pub const DEFAULT_PROFILE: DeviceProfile = DeviceProfile {
+pub const PROFILE_DESKTOP: DeviceProfile = DeviceProfile {
+    // Group A
     tokio_workers: 4,
     max_entities: 16_384,
     max_simultaneous_animations: 8,
@@ -228,49 +493,81 @@ pub const DEFAULT_PROFILE: DeviceProfile = DeviceProfile {
     ws_payload_cap: 16 * 1024 * 1024,
     snapshot_buffer_events: 10_000,
     idle_rss_mb_cap: 120,
-    cpu_smoke_budget_pct: 30,
+    cpu_smoke_budget_pct: 15,
     url_action_mode: default_url_action_mode("desktop"),
+    // Group B
+    target_frame_period_ms: 16,
+    idle_cpu_pct_cap: 5,
+    max_widgets_per_view: 64,
+    max_simultaneous_camera_streams: 4,
+    touch_input: false,
+    pending_optimistic_per_entity: 8,
+    pending_optimistic_global: 256,
+    offline_queue_cap: 256,
+    attributes_body_max_attrs: 64,
+    attributes_body_max_chars: 512,
+    toast_dismiss_ms: 4_000,
+    camera_interval_default_s: 5,
+    camera_interval_min_s: 1,
+    history_window_default_s: 24 * 3_600,
+    history_window_max_s: 168 * 3_600,
+    http_cache_bytes: 128 * 1024 * 1024,
+    http_cache_ttl_s: 600,
+    dep_index_inline_cap: 8,
+    frame_histogram_buckets: 100,
+    soc_temp_ceiling_c: 0,
+    reconnect_burst_rss_mb: 40,
+    blanking_policy: BlankingPolicy::Never,
+    timing_overrides: None,
+    density: Density::Spacious,
 };
+
+/// Select a device profile by name.
+///
+/// Returns a reference to the matching preset constant:
+/// * `"rpi4"` → `&PROFILE_RPI4`
+/// * `"opi_zero3"` → `&PROFILE_OPI_ZERO3`
+/// * `"desktop"` → `&PROFILE_DESKTOP`
+/// * `None` or any unrecognised value → `&PROFILE_DESKTOP` (conservative
+///   fallback; the desktop profile is always a safe default on the dev VM).
+///
+/// This is the single entry point for runtime profile selection. Phase 4
+/// callers pass the YAML `profile:` field value here; the returned reference
+/// is `'static` so it can be stored in a `OnceLock` or passed through `Arc`.
+#[must_use]
+pub fn select_profile(yaml_override: Option<&str>) -> &'static DeviceProfile {
+    match yaml_override {
+        Some("rpi4") => &PROFILE_RPI4,
+        Some("opi_zero3") => &PROFILE_OPI_ZERO3,
+        Some("desktop") | None => &PROFILE_DESKTOP,
+        Some(_) => &PROFILE_DESKTOP,
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn default_profile_is_copy() {
+    fn profile_desktop_is_copy() {
         // Verify that DeviceProfile is Copy by value-passing it.
-        let p = DEFAULT_PROFILE;
+        let p = PROFILE_DESKTOP;
         let _q = p; // would fail to compile if not Copy
         assert_eq!(p.tokio_workers, 4);
-    }
-
-    #[test]
-    fn default_profile_desktop_values_match_phases_md() {
-        assert_eq!(DEFAULT_PROFILE.tokio_workers, 4);
-        assert_eq!(DEFAULT_PROFILE.max_entities, 16_384);
-        assert_eq!(DEFAULT_PROFILE.max_simultaneous_animations, 8);
-        assert_eq!(DEFAULT_PROFILE.animation_framerate_cap, 60);
-        assert_eq!(DEFAULT_PROFILE.max_image_px, 2_048);
-        // Phase 2 budget fields — values from docs/PHASES.md Performance
-        // budgets table, desktop column.
-        assert_eq!(DEFAULT_PROFILE.ws_payload_cap, 16 * 1024 * 1024);
-        assert_eq!(DEFAULT_PROFILE.snapshot_buffer_events, 10_000);
-        assert_eq!(DEFAULT_PROFILE.idle_rss_mb_cap, 120);
-        assert_eq!(DEFAULT_PROFILE.cpu_smoke_budget_pct, 30);
     }
 
     // -----------------------------------------------------------------------
     // UrlActionMode defaults — pinned by locked_decisions.url_action_gating
     //
     // The Phase 3 plan locks: rpi4 / opi_zero3 → Never; desktop → Always. The
-    // Phase 3 active profile is desktop, so DEFAULT_PROFILE.url_action_mode
-    // must be Always; the kiosk profiles (Phase 5 land their full preset
-    // structs) read their value via default_url_action_mode().
+    // Phase 3 active profile is desktop, so PROFILE_DESKTOP.url_action_mode
+    // must be Always; the kiosk profiles read their value via
+    // default_url_action_mode().
     // -----------------------------------------------------------------------
 
     #[test]
-    fn default_profile_url_action_mode_is_always_for_desktop() {
-        assert_eq!(DEFAULT_PROFILE.url_action_mode, UrlActionMode::Always);
+    fn profile_desktop_url_action_mode_is_always_for_desktop() {
+        assert_eq!(PROFILE_DESKTOP.url_action_mode, UrlActionMode::Always);
     }
 
     #[test]
@@ -387,5 +684,164 @@ mod tests {
             result.is_err(),
             "PascalCase `Always` must NOT deserialize; only kebab-case `always` is accepted"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // select_profile — TASK-081
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn select_profile_rpi4_returns_rpi4_preset() {
+        let p = select_profile(Some("rpi4"));
+        assert_eq!(p.tokio_workers, 2);
+        assert_eq!(p.max_entities, 4_096);
+    }
+
+    #[test]
+    fn select_profile_opi_zero3_returns_opi_zero3_preset() {
+        let p = select_profile(Some("opi_zero3"));
+        assert_eq!(p.tokio_workers, 2);
+        assert_eq!(p.max_entities, 2_048);
+    }
+
+    #[test]
+    fn select_profile_desktop_returns_desktop_preset() {
+        let p = select_profile(Some("desktop"));
+        assert_eq!(p.tokio_workers, 4);
+    }
+
+    #[test]
+    fn select_profile_none_returns_desktop_preset() {
+        let p = select_profile(None);
+        assert_eq!(p.tokio_workers, 4);
+    }
+
+    #[test]
+    fn select_profile_unrecognised_returns_desktop_preset() {
+        let p = select_profile(Some("future-tablet"));
+        assert_eq!(p.tokio_workers, 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // preset_values_match_phases_md_budgets_table — TASK-081 table-pin test
+    //
+    // Every numeric field of every preset is asserted explicitly. ~30 fields
+    // × 3 presets ≈ 90 assertions. This test is verbose by design — a future
+    // struct edit without a matching table edit MUST fail CI.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn preset_values_match_phases_md_budgets_table() {
+        // --- PROFILE_RPI4 ---
+        assert_eq!(PROFILE_RPI4.tokio_workers, 2);
+        assert_eq!(PROFILE_RPI4.max_entities, 4_096);
+        assert_eq!(PROFILE_RPI4.max_simultaneous_animations, 3);
+        assert_eq!(PROFILE_RPI4.animation_framerate_cap, 30);
+        assert_eq!(PROFILE_RPI4.max_image_px, 1_280);
+        assert_eq!(PROFILE_RPI4.ws_payload_cap, 16 * 1024 * 1024);
+        assert_eq!(PROFILE_RPI4.snapshot_buffer_events, 5_000);
+        assert_eq!(PROFILE_RPI4.idle_rss_mb_cap, 80);
+        assert_eq!(PROFILE_RPI4.cpu_smoke_budget_pct, 30);
+        assert_eq!(PROFILE_RPI4.url_action_mode, UrlActionMode::Never);
+        assert_eq!(PROFILE_RPI4.target_frame_period_ms, 33);
+        assert_eq!(PROFILE_RPI4.idle_cpu_pct_cap, 5);
+        assert_eq!(PROFILE_RPI4.max_widgets_per_view, 32);
+        assert_eq!(PROFILE_RPI4.max_simultaneous_camera_streams, 2);
+        const { assert!(PROFILE_RPI4.touch_input) };
+        assert_eq!(PROFILE_RPI4.pending_optimistic_per_entity, 4);
+        assert_eq!(PROFILE_RPI4.pending_optimistic_global, 64);
+        assert_eq!(PROFILE_RPI4.offline_queue_cap, 64);
+        assert_eq!(PROFILE_RPI4.attributes_body_max_attrs, 32);
+        assert_eq!(PROFILE_RPI4.attributes_body_max_chars, 256);
+        assert_eq!(PROFILE_RPI4.toast_dismiss_ms, 4_000);
+        assert_eq!(PROFILE_RPI4.camera_interval_default_s, 10);
+        assert_eq!(PROFILE_RPI4.camera_interval_min_s, 5);
+        assert_eq!(PROFILE_RPI4.history_window_default_s, 6 * 3_600);
+        assert_eq!(PROFILE_RPI4.history_window_max_s, 24 * 3_600);
+        assert_eq!(PROFILE_RPI4.http_cache_bytes, 32 * 1024 * 1024);
+        assert_eq!(PROFILE_RPI4.http_cache_ttl_s, 300);
+        assert_eq!(PROFILE_RPI4.dep_index_inline_cap, 8);
+        assert_eq!(PROFILE_RPI4.frame_histogram_buckets, 100);
+        assert_eq!(PROFILE_RPI4.soc_temp_ceiling_c, 75);
+        assert_eq!(PROFILE_RPI4.reconnect_burst_rss_mb, 20);
+        assert!(
+            matches!(PROFILE_RPI4.blanking_policy, BlankingPolicy::Idle(d) if d == Duration::from_secs(300))
+        );
+        assert!(PROFILE_RPI4.timing_overrides.is_none());
+        assert_eq!(PROFILE_RPI4.density, Density::Regular);
+
+        // --- PROFILE_OPI_ZERO3 ---
+        assert_eq!(PROFILE_OPI_ZERO3.tokio_workers, 2);
+        assert_eq!(PROFILE_OPI_ZERO3.max_entities, 2_048);
+        assert_eq!(PROFILE_OPI_ZERO3.max_simultaneous_animations, 2);
+        assert_eq!(PROFILE_OPI_ZERO3.animation_framerate_cap, 20);
+        assert_eq!(PROFILE_OPI_ZERO3.max_image_px, 800);
+        assert_eq!(PROFILE_OPI_ZERO3.ws_payload_cap, 8 * 1024 * 1024);
+        assert_eq!(PROFILE_OPI_ZERO3.snapshot_buffer_events, 2_500);
+        assert_eq!(PROFILE_OPI_ZERO3.idle_rss_mb_cap, 60);
+        assert_eq!(PROFILE_OPI_ZERO3.cpu_smoke_budget_pct, 50);
+        assert_eq!(PROFILE_OPI_ZERO3.url_action_mode, UrlActionMode::Never);
+        assert_eq!(PROFILE_OPI_ZERO3.target_frame_period_ms, 50);
+        assert_eq!(PROFILE_OPI_ZERO3.idle_cpu_pct_cap, 10);
+        assert_eq!(PROFILE_OPI_ZERO3.max_widgets_per_view, 20);
+        assert_eq!(PROFILE_OPI_ZERO3.max_simultaneous_camera_streams, 1);
+        const { assert!(PROFILE_OPI_ZERO3.touch_input) };
+        assert_eq!(PROFILE_OPI_ZERO3.pending_optimistic_per_entity, 4);
+        assert_eq!(PROFILE_OPI_ZERO3.pending_optimistic_global, 32);
+        assert_eq!(PROFILE_OPI_ZERO3.offline_queue_cap, 32);
+        assert_eq!(PROFILE_OPI_ZERO3.attributes_body_max_attrs, 32);
+        assert_eq!(PROFILE_OPI_ZERO3.attributes_body_max_chars, 256);
+        assert_eq!(PROFILE_OPI_ZERO3.toast_dismiss_ms, 4_000);
+        assert_eq!(PROFILE_OPI_ZERO3.camera_interval_default_s, 30);
+        assert_eq!(PROFILE_OPI_ZERO3.camera_interval_min_s, 10);
+        assert_eq!(PROFILE_OPI_ZERO3.history_window_default_s, 3 * 3_600);
+        assert_eq!(PROFILE_OPI_ZERO3.history_window_max_s, 12 * 3_600);
+        assert_eq!(PROFILE_OPI_ZERO3.http_cache_bytes, 16 * 1024 * 1024);
+        assert_eq!(PROFILE_OPI_ZERO3.http_cache_ttl_s, 300);
+        assert_eq!(PROFILE_OPI_ZERO3.dep_index_inline_cap, 8);
+        assert_eq!(PROFILE_OPI_ZERO3.frame_histogram_buckets, 100);
+        assert_eq!(PROFILE_OPI_ZERO3.soc_temp_ceiling_c, 80);
+        assert_eq!(PROFILE_OPI_ZERO3.reconnect_burst_rss_mb, 20);
+        assert!(
+            matches!(PROFILE_OPI_ZERO3.blanking_policy, BlankingPolicy::Idle(d) if d == Duration::from_secs(300))
+        );
+        assert!(PROFILE_OPI_ZERO3.timing_overrides.is_none());
+        assert_eq!(PROFILE_OPI_ZERO3.density, Density::Compact);
+
+        // --- PROFILE_DESKTOP ---
+        assert_eq!(PROFILE_DESKTOP.tokio_workers, 4);
+        assert_eq!(PROFILE_DESKTOP.max_entities, 16_384);
+        assert_eq!(PROFILE_DESKTOP.max_simultaneous_animations, 8);
+        assert_eq!(PROFILE_DESKTOP.animation_framerate_cap, 60);
+        assert_eq!(PROFILE_DESKTOP.max_image_px, 2_048);
+        assert_eq!(PROFILE_DESKTOP.ws_payload_cap, 16 * 1024 * 1024);
+        assert_eq!(PROFILE_DESKTOP.snapshot_buffer_events, 10_000);
+        assert_eq!(PROFILE_DESKTOP.idle_rss_mb_cap, 120);
+        assert_eq!(PROFILE_DESKTOP.cpu_smoke_budget_pct, 15);
+        assert_eq!(PROFILE_DESKTOP.url_action_mode, UrlActionMode::Always);
+        assert_eq!(PROFILE_DESKTOP.target_frame_period_ms, 16);
+        assert_eq!(PROFILE_DESKTOP.idle_cpu_pct_cap, 5);
+        assert_eq!(PROFILE_DESKTOP.max_widgets_per_view, 64);
+        assert_eq!(PROFILE_DESKTOP.max_simultaneous_camera_streams, 4);
+        const { assert!(!PROFILE_DESKTOP.touch_input) };
+        assert_eq!(PROFILE_DESKTOP.pending_optimistic_per_entity, 8);
+        assert_eq!(PROFILE_DESKTOP.pending_optimistic_global, 256);
+        assert_eq!(PROFILE_DESKTOP.offline_queue_cap, 256);
+        assert_eq!(PROFILE_DESKTOP.attributes_body_max_attrs, 64);
+        assert_eq!(PROFILE_DESKTOP.attributes_body_max_chars, 512);
+        assert_eq!(PROFILE_DESKTOP.toast_dismiss_ms, 4_000);
+        assert_eq!(PROFILE_DESKTOP.camera_interval_default_s, 5);
+        assert_eq!(PROFILE_DESKTOP.camera_interval_min_s, 1);
+        assert_eq!(PROFILE_DESKTOP.history_window_default_s, 24 * 3_600);
+        assert_eq!(PROFILE_DESKTOP.history_window_max_s, 168 * 3_600);
+        assert_eq!(PROFILE_DESKTOP.http_cache_bytes, 128 * 1024 * 1024);
+        assert_eq!(PROFILE_DESKTOP.http_cache_ttl_s, 600);
+        assert_eq!(PROFILE_DESKTOP.dep_index_inline_cap, 8);
+        assert_eq!(PROFILE_DESKTOP.frame_histogram_buckets, 100);
+        assert_eq!(PROFILE_DESKTOP.soc_temp_ceiling_c, 0);
+        assert_eq!(PROFILE_DESKTOP.reconnect_burst_rss_mb, 40);
+        assert_eq!(PROFILE_DESKTOP.blanking_policy, BlankingPolicy::Never);
+        assert!(PROFILE_DESKTOP.timing_overrides.is_none());
+        assert_eq!(PROFILE_DESKTOP.density, Density::Spacious);
     }
 }

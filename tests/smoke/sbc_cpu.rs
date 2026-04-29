@@ -13,7 +13,7 @@
 //! consumes" — a proxy for whether the aarch64 code has a gross regression
 //! (e.g. spinning mutex, tight retry loop) that would manifest on real hardware.
 //!
-//! Budget: `DEFAULT_PROFILE.cpu_smoke_budget_pct` = 30 %.  This is
+//! Budget: `PROFILE_DESKTOP.cpu_smoke_budget_pct` = 30 %.  This is
 //! deliberately generous: QEMU user-mode adds ~3–5× emulation overhead vs
 //! native; a real rpi4 running the same workload at 50 ev/s should land well
 //! below 10 % CPU.  The budget catches regressions, not performance
@@ -52,7 +52,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hanui::dashboard::profiles::DEFAULT_PROFILE;
+use hanui::dashboard::profiles::PROFILE_DESKTOP;
 use hanui::ha::client::WsClient;
 use hanui::ha::live_store::LiveStore;
 use hanui::platform::config::Config;
@@ -146,7 +146,7 @@ async fn wait_for_state(
 // The CPU smoke scenario
 // ---------------------------------------------------------------------------
 
-/// 60 s churn at 50 ev/s — average CPU% must stay ≤ DEFAULT_PROFILE.cpu_smoke_budget_pct.
+/// 60 s churn at 50 ev/s — average CPU% must stay ≤ PROFILE_DESKTOP.cpu_smoke_budget_pct.
 ///
 /// Scenario:
 /// 1. Start mock WS server and script a full happy-path handshake.
@@ -234,7 +234,7 @@ async fn sbc_cpu_smoke_50evs_60s_below_budget() {
     // Assert CPU budget
     // -----------------------------------------------------------------------
 
-    let budget_pct = f64::from(DEFAULT_PROFILE.cpu_smoke_budget_pct);
+    let budget_pct = f64::from(PROFILE_DESKTOP.cpu_smoke_budget_pct);
 
     match (cpu_start, cpu_end) {
         (Some(start), Some(end)) => {
@@ -249,7 +249,7 @@ async fn sbc_cpu_smoke_50evs_60s_below_budget() {
             assert!(
                 avg_cpu_pct <= budget_pct,
                 "sbc_cpu_smoke: average CPU% {avg_cpu_pct:.1}% exceeds \
-                 DEFAULT_PROFILE.cpu_smoke_budget_pct={budget_pct}% \
+                 PROFILE_DESKTOP.cpu_smoke_budget_pct={budget_pct}% \
                  (cpu_secs={cpu_secs:.2} wall_secs={wall_secs:.2}). \
                  Check for hot-path regressions in the WS+LiveStore loop."
             );

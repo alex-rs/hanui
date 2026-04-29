@@ -165,6 +165,47 @@ impl Default for ActionTiming {
 }
 
 // ---------------------------------------------------------------------------
+// ActionTimingOverride
+// ---------------------------------------------------------------------------
+
+/// Per-profile override knobs that a [`DeviceProfile`] may apply on top of the
+/// [`ActionTiming`] defaults.
+///
+/// All fields are `Option<_>`: `None` means "keep the `ActionTiming` default
+/// for this field". This lets a profile tune one or two knobs (e.g. only
+/// `tap_max_ms`) without having to specify the entire set.
+///
+/// # Phase 4 role
+///
+/// Phase 4 `DeviceProfile.timing_overrides` carries an
+/// `Option<ActionTimingOverride>`.  When `None`, the dispatcher uses
+/// [`ActionTiming::default()`] unchanged.  When `Some`, the dispatcher
+/// applies each non-`None` field on top of the defaults at startup —
+/// the merge is the caller's responsibility, not done here.
+///
+/// # Derive rationale
+///
+/// `Default` is derived so an all-`None` value is expressible as
+/// `ActionTimingOverride::default()`, which keeps the Phase 4 const presets
+/// terse.  `Copy` + `Eq` are derived for the same reasons as [`ActionTiming`]:
+/// the struct is small, lives on the stack, and is compared in tests.
+///
+/// [`DeviceProfile`]: crate::dashboard::profiles::DeviceProfile
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ActionTimingOverride {
+    /// Override for the tap classification threshold (ms). `None` = use default (200 ms).
+    pub tap_max_ms: Option<u64>,
+    /// Override for the hold-action trigger threshold (ms). `None` = use default (500 ms).
+    pub hold_min_ms: Option<u64>,
+    /// Override for the double-tap gap window (ms). `None` = use default (300 ms).
+    pub double_tap_max_gap_ms: Option<u64>,
+    /// Override for the optimistic-entry revert deadline (ms). `None` = use default (3 000 ms).
+    pub optimistic_timeout_ms: Option<u64>,
+    /// Override for the offline-queue age-out (ms). `None` = use default (60 000 ms).
+    pub queue_max_age_ms: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -286,5 +327,42 @@ mod tests {
                 serde_json::from_str(&json).expect("deserialize must succeed");
             assert_eq!(decoded, variant);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // ActionTimingOverride — TASK-081
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn action_timing_override_default_is_all_none() {
+        let o = ActionTimingOverride::default();
+        assert!(o.tap_max_ms.is_none());
+        assert!(o.hold_min_ms.is_none());
+        assert!(o.double_tap_max_gap_ms.is_none());
+        assert!(o.optimistic_timeout_ms.is_none());
+        assert!(o.queue_max_age_ms.is_none());
+    }
+
+    #[test]
+    fn action_timing_override_is_copy() {
+        let a = ActionTimingOverride {
+            tap_max_ms: Some(150),
+            ..ActionTimingOverride::default()
+        };
+        let b = a; // Copy
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn action_timing_override_partial_set_preserves_none_fields() {
+        let o = ActionTimingOverride {
+            optimistic_timeout_ms: Some(5000),
+            ..ActionTimingOverride::default()
+        };
+        assert!(o.tap_max_ms.is_none());
+        assert!(o.hold_min_ms.is_none());
+        assert!(o.double_tap_max_gap_ms.is_none());
+        assert_eq!(o.optimistic_timeout_ms, Some(5000));
+        assert!(o.queue_max_age_ms.is_none());
     }
 }

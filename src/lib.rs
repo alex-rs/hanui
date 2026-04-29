@@ -40,7 +40,7 @@ use anyhow::{bail, Context, Result};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use tracing::info;
 
-use crate::dashboard::profiles::DEFAULT_PROFILE;
+use crate::dashboard::profiles::PROFILE_DESKTOP;
 use crate::dashboard::view_spec::default_dashboard;
 use crate::ha::client::{full_jitter, ClientError, SnapshotApplier, WsClient};
 use crate::ha::live_store::LiveStore;
@@ -61,7 +61,7 @@ use crate::ui::bridge::{build_tiles, split_tile_vms, wire_window, LiveBridge, Ma
 /// 1. Initialise the tracing subscriber from `RUST_LOG`
 ///    (default: `info,hanui=debug`).
 /// 2. Force `SLINT_BACKEND=software` unless already set by the launcher.
-/// 3. Build a multi-thread Tokio runtime with `DEFAULT_PROFILE.tokio_workers`
+/// 3. Build a multi-thread Tokio runtime with `PROFILE_DESKTOP.tokio_workers`
 ///    threads.
 /// 4. Populate the icon cache via `assets::icons::init()`.
 /// 5. Build the chosen [`EntityStore`] and call [`build_tiles`] for the
@@ -82,7 +82,7 @@ pub fn run() -> Result<()> {
 
     // Hold the runtime in scope until run() returns; Drop joins spawned tasks.
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(DEFAULT_PROFILE.tokio_workers)
+        .worker_threads(PROFILE_DESKTOP.tokio_workers)
         .enable_all()
         .build()
         .context("build Tokio runtime")?;

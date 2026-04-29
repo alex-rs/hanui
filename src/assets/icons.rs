@@ -20,7 +20,7 @@
 //! # Downscaling
 //!
 //! Before rasterizing, the target render size is clamped so that its longest
-//! dimension does not exceed `DEFAULT_PROFILE.max_image_px` (2 048 px for the
+//! dimension does not exceed `PROFILE_DESKTOP.max_image_px` (2 048 px for the
 //! desktop profile).  Because these MDI icons have a 24 × 24 viewBox they will
 //! never exceed the cap in practice, but the cap is enforced unconditionally so
 //! the resolver is correct for any future icon addition.
@@ -48,7 +48,7 @@ use std::sync::{Arc, OnceLock};
 
 use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
 
-use crate::dashboard::profiles::DEFAULT_PROFILE;
+use crate::dashboard::profiles::PROFILE_DESKTOP;
 
 // ---------------------------------------------------------------------------
 // Embedded SVG assets
@@ -113,7 +113,7 @@ static ICONS: OnceLock<HashMap<&'static str, Arc<SyncImage>>> = OnceLock::new();
 /// condition.
 pub fn init() {
     ICONS.get_or_init(|| {
-        let max_px = DEFAULT_PROFILE.max_image_px;
+        let max_px = PROFILE_DESKTOP.max_image_px;
         let mut map = HashMap::new();
         map.insert(
             "mdi:lightbulb",
