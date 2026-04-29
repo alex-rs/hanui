@@ -1,6 +1,6 @@
 // build.rs — Slint compilation entry points.
 //
-// Compiles three Slint entry points:
+// Compiles four Slint entry points:
 //
 //   1. `ui/slint/main_window.slint` — production `MainWindow` and the
 //      `AnimationBudget` / `GestureConfigGlobal` re-exports the bridge wires.
@@ -20,6 +20,13 @@
 //      production `MainWindow` symbol set. The TASK-086 bridge wires the View
 //      via the production `MainWindow` import chain; this separate compile is
 //      for the harness path only.
+//
+//   4. `ui/slint/view_switcher.slint` — Phase 4 density-gated view navigator
+//      (TASK-086). Compiled to a distinct output file via
+//      `HANUI_VIEW_SWITCHER_INCLUDE` so bridge.rs tests can directly
+//      instantiate `ViewSwitcher` without pulling in the full production
+//      `MainWindow` symbol set. Production wiring uses this same include path
+//      inside `src/ui/bridge.rs`'s `view_switcher_slint` submodule.
 //
 // Why two compiles instead of co-locating `GestureTestWindow` inside
 // `main_window.slint`: the test wrapper carries no production code path
@@ -135,5 +142,32 @@ fn main() {
     println!(
         "cargo:rustc-env=HANUI_VIEW_INCLUDE={}",
         view_output.display()
+    );
+
+    // ViewSwitcher component (TASK-086) — density-gated view navigator.
+    //
+    // Compiles `ui/slint/view_switcher.slint` to a separate output file so
+    // the bridge's `view_switcher_slint` submodule and its `#[cfg(test)]`
+    // density × view-count table tests can instantiate `ViewSwitcher` without
+    // pulling in the full production `MainWindow` symbol set.
+    //
+    // This compile ensures `view_switcher.slint` is in the build graph:
+    // `cargo build` will fail if the component has a syntax or type error.
+    let view_switcher_input = manifest_dir.join("ui/slint/view_switcher.slint");
+    let view_switcher_output = out_dir.join("view_switcher.rs");
+
+    let view_switcher_deps = slint_build::compile_with_output_path(
+        &view_switcher_input,
+        &view_switcher_output,
+        slint_build::CompilerConfiguration::default(),
+    )
+    .expect("compile ui/slint/view_switcher.slint with slint-build");
+
+    for dep in view_switcher_deps {
+        println!("cargo:rerun-if-changed={}", dep.display());
+    }
+    println!(
+        "cargo:rustc-env=HANUI_VIEW_SWITCHER_INCLUDE={}",
+        view_switcher_output.display()
     );
 }
