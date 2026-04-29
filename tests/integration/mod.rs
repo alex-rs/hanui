@@ -35,5 +35,6 @@ pub mod slint_harness;
 pub mod command_tx;
 pub mod gesture_layer;
 pub mod lagged_resync;
+pub mod more_info_modal;
 pub mod view_router;
 pub mod ws_client;

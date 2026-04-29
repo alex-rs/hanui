@@ -10,4 +10,5 @@
 //! `Action::Navigate { view_id }` payload (TASK-068, single-view stub).
 
 pub mod bridge;
+pub mod more_info;
 pub mod view_router;

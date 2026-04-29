@@ -1,0 +1,222 @@
+// more_info.slint — generic more-info modal shell (TASK-066).
+//
+// Phase 3 ships this as the *generic* shell consumed by `MainWindow`'s
+// overlay layer. The shell renders:
+//
+//   * Header — entity name + state value (typed `SharedString` properties
+//     written by the bridge from the entity snapshot at modal-open time).
+//   * Body slot — a `for row in rows` loop over the modal's
+//     `[ModalRowVM]` array property. The row VM is the Slint-typed mirror
+//     of `src/ui/more_info.rs::ModalRow`. Phase 6 per-domain bodies plug
+//     in by replacing the *Rust* body implementation behind the
+//     `MoreInfoBody` trait — the Slint shell does NOT change shape.
+//   * Footer — close button.
+//   * Tap-outside / scrim — a full-window TouchArea behind the modal panel
+//     fires `close-requested` so the user can dismiss the modal by tapping
+//     anywhere outside it.
+//
+// All colors come from `Theme` tokens (no inline hex literals — gate
+// enforced by `.github/workflows/ci.yml` § Gate 1).
+//
+// Lazy-render contract (locked_decisions.more_info_modal):
+//   The Rust `ModalState::open_with` builds the row list ONCE when the
+//   modal opens; the bridge then writes `body-rows` to this component and
+//   `visible` to true. While `visible == true`, entity-tick updates do NOT
+//   rebuild rows — only a close+reopen does. The Slint side is a passive
+//   renderer; the lazy-render invariant is enforced in Rust.
+//
+// Phase 6 forward-compat:
+//   The shell does NOT bake any per-domain styling. A future light/climate
+//   body computes its own `ModalRowVM` list in Rust and writes it through
+//   the same `body-rows` property. If a future body needs MORE than rows
+//   (e.g. a slider for light brightness), it must add a new typed property
+//   to the shell in a Phase 6 ticket — Phase 3 deliberately does NOT
+//   pre-allocate every Phase 6 body's surface here.
+
+import { Theme } from "theme.slint";
+
+// ModalRowVM — Slint-typed mirror of `src/ui/more_info.rs::ModalRow`.
+//
+// The Rust bridge converts the `Vec<ModalRow>` produced by
+// `MoreInfoBody::render_rows` into a `Vec<ModalRowVM>` and wraps it in
+// a `ModelRc<ModalRowVM>` before writing to `body-rows`. The two structs
+// are kept in lock-step by the bridge (TASK-066 acceptance includes a
+// Rust-side test that the row-shape is preserved end-to-end through the
+// Slint property write).
+export struct ModalRowVM {
+    key: string,
+    value: string,
+}
+
+// MoreInfoModal — overlay shell.
+//
+// Visibility:
+//   `visible` is bound by the parent (MainWindow) so the shell is laid
+//   out only when the modal is open. The component is intentionally a
+//   `Rectangle` (not a `Window`) — Slint windows cannot be embedded;
+//   the overlay-as-Rectangle pattern matches the existing status-banner
+//   approach in `main_window.slint`.
+//
+// Coordinate system:
+//   The overlay sizes itself to its parent via `width/height: 100%`,
+//   draws a translucent scrim across the full surface, and centers the
+//   modal panel. The panel uses `min-width/max-width` constraints so it
+//   stays readable on small screens (≤ 320 px) without becoming
+//   unreadably wide on a desktop window.
+//
+// Tap-outside and close-button both fire the same `close-requested`
+// callback; the parent (MainWindow) is responsible for hiding the modal
+// (typically by setting `more-info-visible` to `false`). This decoupling
+// keeps the Slint shell free of dispatcher knowledge — only the bridge
+// layer in Rust drives state transitions.
+export component MoreInfoModal inherits Rectangle {
+    // ── Public properties ───────────────────────────────────────────────
+    // Header text. Written by the bridge from the entity snapshot at
+    // modal-open time. `entity-name` falls back to the entity_id when
+    // `friendly_name` is missing (decided in Rust, not here).
+    in property <string> entity-name;
+    in property <string> entity-state;
+    // Body rows. Populated by the bridge from
+    // `MoreInfoBody::render_rows`. The shell does NOT compute rows
+    // itself — Phase 6 swap-in happens at the Rust layer.
+    in property <[ModalRowVM]> body-rows;
+
+    // ── Callbacks ───────────────────────────────────────────────────────
+    // Fires on tap-outside the panel OR on close-button click. Parent
+    // (MainWindow) owns the visibility flip; the shell does not toggle
+    // itself.
+    callback close-requested();
+
+    // ── Scrim (tap-outside dismissal) ────────────────────────────────────
+    // Translucent backdrop covering the full overlay area. The scrim
+    // captures pointer events outside the modal panel and routes them to
+    // `close-requested`. The scrim color uses the elevated-surface token
+    // with reduced opacity rather than a hard-coded RGBA — keeping the
+    // hex-color gate happy and the scrim re-themable in Phase 4.
+    Rectangle {
+        background: Theme.background;
+        opacity: 0.65;
+
+        TouchArea {
+            mouse-cursor: pointer;
+            clicked => {
+                root.close-requested();
+            }
+        }
+    }
+
+    // ── Modal panel ─────────────────────────────────────────────────────
+    // Centered, max-width-bounded panel. The panel itself owns a
+    // TouchArea that swallows clicks so a tap inside the panel does NOT
+    // bubble up and trigger the scrim's `clicked`. (Slint TouchAreas do
+    // not propagate pointer events through siblings, so the scrim and
+    // panel TouchAreas are mutually exclusive consumers — this matches
+    // the standard modal idiom in Slint.)
+    Rectangle {
+        background: Theme.surface;
+        border-radius: Theme.radius-lg;
+        border-width: 1px;
+        border-color: Theme.elevated;
+        // Center via fixed sizing — Slint's layout engine centers a
+        // child Rectangle when its parent has no other layout
+        // container, by anchoring it at parent.width/2 - self.width/2.
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: min(420px, parent.width - 2 * Theme.space-4);
+        height: min(560px, parent.height - 2 * Theme.space-4);
+
+        // Click-swallow TouchArea — prevents tap-inside from triggering
+        // the scrim's close.
+        TouchArea {
+            mouse-cursor: default;
+        }
+
+        VerticalLayout {
+            padding: Theme.space-4;
+            spacing: Theme.space-3;
+
+            // ── Header ──────────────────────────────────────────────────
+            VerticalLayout {
+                spacing: Theme.space-1;
+                Text {
+                    text: root.entity-name;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-xl;
+                    font-weight: Theme.font-weight-bold;
+                }
+                Text {
+                    text: root.entity-state;
+                    color: Theme.text-secondary;
+                    font-size: Theme.font-md;
+                }
+            }
+
+            // Divider between header and body.
+            Rectangle {
+                height: 1px;
+                background: Theme.elevated;
+            }
+
+            // ── Body slot ───────────────────────────────────────────────
+            // `for row[i] in body-rows` is the Phase 3 default body
+            // rendering. Phase 6 per-domain bodies replace the Rust
+            // `MoreInfoBody` impl; the Slint shell never changes.
+            VerticalLayout {
+                spacing: Theme.space-2;
+                for row[i] in root.body-rows : HorizontalLayout {
+                    spacing: Theme.space-2;
+                    Text {
+                        text: row.key;
+                        color: Theme.text-secondary;
+                        font-size: Theme.font-sm;
+                        width: 40%;
+                    }
+                    Text {
+                        text: row.value;
+                        color: Theme.text-primary;
+                        font-size: Theme.font-sm;
+                        width: 60%;
+                    }
+                }
+            }
+
+            // Spacer pushes the footer to the bottom.
+            Rectangle {
+                vertical-stretch: 1;
+            }
+
+            // ── Footer ──────────────────────────────────────────────────
+            // Close button. The TouchArea is the click target; the
+            // wrapping Rectangle styles the button surface using theme
+            // tokens. Slint's built-in `Button` widget pulls in widget
+            // styling we do not need here, so we roll a minimal version
+            // matching the rest of the dashboard's chrome.
+            Rectangle {
+                height: 36px;
+                background: close-touch.pressed ? Theme.elevated : Theme.accent;
+                border-radius: Theme.radius-md;
+                horizontal-stretch: 0;
+                width: 100px;
+                x: (parent.width - self.width) - Theme.space-4 - 1px;
+
+                Text {
+                    text: "Close";
+                    color: Theme.text-primary;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-medium;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: parent.width;
+                    height: parent.height;
+                }
+
+                close-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        root.close-requested();
+                    }
+                }
+            }
+        }
+    }
+}
