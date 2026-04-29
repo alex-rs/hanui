@@ -55,6 +55,7 @@ ops/pre-receive/*
 !ops/checks/coverage-ratchet.js
 !ops/checks/__tests__/
 !ops/checks/forbidden-tokens.sh
+!ops/checks/schema-doc-cotravel.sh
 !ops/pre-receive/test-deletion.sh
 # ops/ha/ contents are tracked; HA runtime writes are filtered by ops/ha/.gitignore.
 # === Coverage tooling outputs (coverage/baseline.json is the only tracked file) ===

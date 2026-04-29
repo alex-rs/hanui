@@ -1,20 +1,25 @@
-# ci.yml — per-PR gate set for hanui Phase 1
+# ci.yml — per-PR gate set for hanui Phase 1+4
 #
-# This is the authoritative rule book for Phase 1. When a remote is added,
+# This is the authoritative rule book for Phase 1+4. When a remote is added,
 # this file runs unchanged on GitHub Actions.
 #
 # Gate set:
 #   1. rustfmt            — formatting enforced
 #   2. clippy             — warnings-as-errors
-#   3. forbidden-tokens   — blocks .only/.skip/xit/fdescribe/#[allow(dead_code)]
+#   3. schema-doc cotravel — any PR touching src/dashboard/schema.rs must also touch
+#                            docs/DASHBOARD_SCHEMA.md (and vice versa), scoped to
+#                            field additions/removals (Risk #12 mitigation, TASK-093).
+#                            Self-test runs first so a broken script never silently passes.
+#                            Blast-radius: <1 PR/month post-lock. FP rate: <1%.
+#   4. forbidden-tokens   — blocks .only/.skip/xit/fdescribe/#[allow(dead_code)]
 #                           unless accompanied by waiver (ISSUE-### + docs/waivers.yaml)
-#   4. gitleaks           — secret scan on full repo history
-#   5. hex-color grep     — bans inline hex literals in ui/slint/**/*.slint;
+#   5. gitleaks           — secret scan on full repo history
+#   6. hex-color grep     — bans inline hex literals in ui/slint/**/*.slint;
 #                           escape hatch: "// theme-allow:" restricted to theme.slint only
-#   6. serde_json crate   — bans any serde_json crate path under src/ui/**
-#   7. cargo test         — full unit + integration test suite (TZ=UTC, two-pass for
+#   7. serde_json crate   — bans any serde_json crate path under src/ui/**
+#   8. cargo test         — full unit + integration test suite (TZ=UTC, two-pass for
 #                           order-dependence detection)
-#   8. coverage ratchet   — per-file line coverage must not drop below coverage/baseline.json;
+#   9. coverage ratchet   — per-file line coverage must not drop below coverage/baseline.json;
 #                           cargo-llvm-cov@0.8.5 generates coverage/current.json, then
 #                           ops/checks/coverage-ratchet.js enforces per-file pct >= baseline.
 #                           Ratchet regression tests run first so a broken ratchet script
@@ -114,6 +119,29 @@ jobs:
       # ── clippy ───────────────────────────────────────────────────────────────
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
+
+      # ── schema-doc co-travel ─────────────────────────────────────────────────
+      # Enforces locked_decisions.schema_finalization_gate part (b) from
+      # docs/plans/2026-04-29-phase-4-layout.md (TASK-093):
+      # any PR that adds/removes a field declaration in src/dashboard/schema.rs
+      # must also add/remove a field heading in docs/DASHBOARD_SCHEMA.md (and
+      # vice versa). Scoped to field additions/removals (Risk #12 mitigation) so
+      # doc-only typo PRs pass. Self-test runs first so a broken script never
+      # silently passes.
+      #
+      # Blast-radius: PRs touching src/dashboard/schema.rs or docs/DASHBOARD_SCHEMA.md
+      # without the paired file change. Expected frequency: <1 PR/month once the
+      # schema is locked (Phase 4 freeze). FP rate: <1% (structured-grep scoping).
+      #
+      # Runs only on pull_request events (not on push to main) so the merge commit
+      # itself — which has no "base ref" in the same sense — is not checked.
+      - name: schema-doc cotravel (self-test)
+        if: github.event_name == 'pull_request'
+        run: bash ops/checks/schema-doc-cotravel.sh --self-test
+
+      - name: schema-doc cotravel
+        if: github.event_name == 'pull_request'
+        run: bash ops/checks/schema-doc-cotravel.sh
 
       # ── forbidden-tokens ─────────────────────────────────────────────────────
       # Checks for forbidden tokens that require a waiver entry in docs/waivers.yaml
