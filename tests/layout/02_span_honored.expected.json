@@ -1,0 +1,10 @@
+{
+  "sections": [
+    {
+      "section_id": "main",
+      "positions": [
+        {"widget_id": "w1", "col": 0, "row": 0, "span_cols": 3, "span_rows": 1}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "sections": [
+    {
+      "section_id": "main",
+      "positions": [
+        {"widget_id": "light1",  "col": 0, "row": 0, "span_cols": 2, "span_rows": 1},
+        {"widget_id": "sensor1", "col": 2, "row": 0, "span_cols": 1, "span_rows": 1},
+        {"widget_id": "entity1", "col": 3, "row": 0, "span_cols": 1, "span_rows": 1},
+        {"widget_id": "light2",  "col": 0, "row": 1, "span_cols": 2, "span_rows": 2},
+        {"widget_id": "sensor2", "col": 2, "row": 1, "span_cols": 2, "span_rows": 1}
+      ]
+    }
+  ]
+}
