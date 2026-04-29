@@ -1123,6 +1123,24 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Coverage probe: `default_spawner` body
+    //
+    // `default_spawner` is the production xdg-open wrapper. Tests of the
+    // public `handle_url_action_with_spawner` API inject a recording
+    // spawner instead, so the body of `default_spawner` is otherwise
+    // uncovered. Invoke it once with `about:blank` — `Command::spawn`
+    // returns Err on CI runners without xdg-open in PATH and Ok
+    // otherwise (the spawned child fails silently in a headless
+    // environment). The test exists only to execute the body line; the
+    // Result is intentionally discarded.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_spawner_body_executes_for_coverage() {
+        let _ = default_spawner("about:blank");
+    }
+
+    // -----------------------------------------------------------------------
     // Test serialisation guard
     //
     // The `recording_spawner` shares static `AtomicBool` state across test

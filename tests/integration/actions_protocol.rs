@@ -422,6 +422,8 @@ mod url_dispatcher_modes_recorder {
     pub(super) static SPAWN_COUNT: AtomicUsize = AtomicUsize::new(0);
     pub(super) static SPAWN_FAILS: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+    pub(super) static SPAWN_FAILS_LONG: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     pub(super) static SPAWN_LAST_HREF: std::sync::Mutex<Option<String>> =
         std::sync::Mutex::new(None);
     pub(super) static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -429,20 +431,35 @@ mod url_dispatcher_modes_recorder {
     pub(super) fn reset(force_fail: bool) {
         SPAWN_COUNT.store(0, Ordering::SeqCst);
         SPAWN_FAILS.store(force_fail, Ordering::SeqCst);
+        SPAWN_FAILS_LONG.store(false, Ordering::SeqCst);
+        *SPAWN_LAST_HREF.lock().unwrap() = None;
+    }
+
+    pub(super) fn reset_with_long_failure() {
+        SPAWN_COUNT.store(0, Ordering::SeqCst);
+        SPAWN_FAILS.store(true, Ordering::SeqCst);
+        SPAWN_FAILS_LONG.store(true, Ordering::SeqCst);
         *SPAWN_LAST_HREF.lock().unwrap() = None;
     }
 
     /// Recording spawner with `fn`-pointer signature (no closure capture).
     /// Records the href so the Always-mode test can assert it was forwarded
     /// verbatim, and toggles between Ok and `NotFound` based on SPAWN_FAILS.
+    /// When SPAWN_FAILS_LONG is set, the failure carries a >256-byte
+    /// message so the dispatcher's UTF-8-aware truncation branch executes.
     pub(super) fn recording_spawner(href: &str) -> io::Result<()> {
         SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
         *SPAWN_LAST_HREF.lock().unwrap() = Some(href.to_owned());
         if SPAWN_FAILS.load(Ordering::SeqCst) {
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "test forced spawn failure",
-            ))
+            let message = if SPAWN_FAILS_LONG.load(Ordering::SeqCst) {
+                // 4-byte codepoint × 80 = 320 bytes — past the 256 cap.
+                // Forces the truncation branch in dispatcher.rs to walk
+                // backwards from byte 256 to the nearest char boundary.
+                "🟥".repeat(80)
+            } else {
+                "test forced spawn failure".to_owned()
+            };
+            Err(io::Error::new(io::ErrorKind::NotFound, message))
         } else {
             Ok(())
         }
@@ -636,6 +653,69 @@ async fn url_through_dispatcher_modes() {
         assert_eq!(SPAWN_COUNT.load(Ordering::SeqCst), 1);
         assert_eq!(drain_commands(&mut rx, 1).len(), 0);
     }
+
+    // -------- Long spawn-failure message (>256 bytes, multi-byte) — exercises
+    //          the dispatcher's UTF-8-aware truncation branch. The reason is
+    //          ≤256 bytes AND a valid UTF-8 prefix of the original message
+    //          (so no codepoint is split mid-byte).
+    {
+        url_dispatcher_modes_recorder::reset_with_long_failure();
+        let services = empty_handle();
+        let (dispatcher, mut rx) = make_dispatcher_with_recorder(services);
+        let dispatcher = dispatcher
+            .with_url_action_mode(UrlActionMode::Always)
+            .with_url_spawner(recording_spawner);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("url_widget"), Gesture::Tap, &store, &map)
+            .expect_err("long-message forced spawn failure must surface as UrlSpawnFailed");
+        match err {
+            DispatchError::UrlSpawnFailed { reason } => {
+                assert!(
+                    reason.len() <= 256,
+                    "truncated reason must be ≤256 bytes, got {}",
+                    reason.len()
+                );
+                // `reason` stores `io_err.to_string()` directly — the
+                // dispatcher does NOT prepend "failed to spawn xdg-open:"
+                // at storage time (that wrapping happens at
+                // DispatchError::Display time). The forced error message
+                // is "🟥".repeat(80); truncated to ≤256 bytes the result
+                // is some whole number of 🟥 codepoints — never a
+                // half-codepoint at the boundary.
+                assert!(
+                    reason.chars().all(|c| c == '🟥'),
+                    "every char in the truncated reason must be the 🟥 codepoint, got: {reason}"
+                );
+                // String guarantees valid UTF-8 — the assertion above
+                // would not even compile-as-iterable if the truncation
+                // had broken UTF-8.
+                assert!(
+                    !reason.contains("example.org"),
+                    "UrlSpawnFailed.reason must not leak the href"
+                );
+            }
+            other => panic!("expected UrlSpawnFailed, got {other:?}"),
+        }
+        assert_eq!(SPAWN_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(drain_commands(&mut rx, 1).len(), 0);
+    }
+}
+
+/// Coverage probe: the `Dispatcher` `Debug` impl is otherwise never
+/// invoked by tests. Format the dispatcher with `{:?}` so the impl body
+/// (notably the new `url_action_mode` and `url_spawner` fields) executes.
+#[test]
+fn dispatcher_debug_impl_executes_for_coverage() {
+    let services = empty_handle();
+    let (tx, _rx) = mpsc::channel::<OutboundCommand>(1);
+    let dispatcher = Dispatcher::with_command_tx(services, tx);
+    let s = format!("{dispatcher:?}");
+    // Sanity: the Debug output must mention the struct name and the new
+    // url-action-mode / url-spawner fields.
+    assert!(s.contains("Dispatcher"));
+    assert!(s.contains("url_action_mode"));
+    assert!(s.contains("url_spawner"));
 }
 
 // 6. None → no-op
