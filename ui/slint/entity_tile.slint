@@ -59,17 +59,13 @@ export struct EntityTileVM {
 // Both name and state render in text-primary / text-secondary respectively
 // (no domain-specific colour switching). This tile is the rendering
 // fallback when a domain-specific tile is not yet implemented.
+//
+// Press feedback + gesture detection live on CardBase (TASK-060). Tile-
+// level TouchArea removed to avoid double-capture (Risk #4).
 export component EntityTile inherits Rectangle {
     in property <EntityTileVM> view-model;
 
-    property <bool> pressed: touch.pressed;
-
-    touch := TouchArea {
-        // No callbacks wired in Phase 1 — see Out of scope above.
-    }
-
     base := CardBase {
-        pressed: pressed;
 
         VerticalLayout {
             spacing: Theme.space-2;

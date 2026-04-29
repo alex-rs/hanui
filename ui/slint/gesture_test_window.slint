@@ -1,0 +1,70 @@
+// gesture_test_window.slint — Window root used by TASK-060 integration tests.
+//
+// CardBase (defined in `card_base.slint`) inherits Rectangle, not Window, and
+// is intended for use as the chrome wrapper inside tile components. Slint's
+// `slint::include_modules!()` only emits a top-level Rust `ComponentHandle`
+// for components rooted in a Window, so to drive the gesture state machine
+// from a Rust test we need a thin Window-root wrapper that:
+//
+//   1. Hosts a single CardBase whose TouchArea fills the window.
+//   2. Forwards CardBase's `tap` / `hold` / `double-tap` callbacks to
+//      out-counter properties so the test can assert event counts without
+//      depending on a Rust-side counter struct (everything stays inside the
+//      Slint property graph the dispatcher will hit in production).
+//
+// This file is intentionally separate from `main_window.slint` and is NOT
+// instantiated by the production binary — `build.rs` compiles it as a
+// secondary entry point via `slint_build::compile_with_output_path` and
+// `src/ui/bridge.rs` uses an explicit `include!` (not the
+// `slint::include_modules!()` macro) to pick up the generated bindings.
+//
+// Per locked_decisions.gesture_config: the test mutates
+// `GestureConfigGlobal.arm-double-tap-timer` directly to exercise both
+// branches; the production path writes it from `GestureConfig::default()`
+// via `wire_window` (TASK-059).
+
+import { CardBase } from "card_base.slint";
+import { GestureConfigGlobal } from "gesture_config.slint";
+
+export { GestureConfigGlobal } from "gesture_config.slint";
+
+// GestureTestWindow — a Window hosting one full-window CardBase so a test
+// can dispatch pointer events at any in-window coordinate and the
+// CardBase TouchArea will receive them.
+//
+// Counter properties:
+//   * `tap-count` — incremented on every `tap` callback fire.
+//   * `hold-count` — incremented on every `hold` callback fire.
+//   * `double-tap-count` — incremented on every `double-tap` callback fire.
+//
+// Tests assert exact counter values after dispatching synthetic event
+// sequences and waiting on Slint's animation tick to elapse the timer
+// thresholds. The counters are `out` so the Rust test reads them via
+// the generated `get_<name>` accessors; they are written only from
+// callback handlers inside this file.
+export component GestureTestWindow inherits Window {
+    title: "GestureTestWindow";
+    preferred-width: 200px;
+    preferred-height: 200px;
+
+    out property <int> tap-count: 0;
+    out property <int> hold-count: 0;
+    out property <int> double-tap-count: 0;
+
+    card := CardBase {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+
+        tap => {
+            root.tap-count = root.tap-count + 1;
+        }
+        hold => {
+            root.hold-count = root.hold-count + 1;
+        }
+        double-tap => {
+            root.double-tap-count = root.double-tap-count + 1;
+        }
+    }
+}

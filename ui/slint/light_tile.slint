@@ -78,14 +78,13 @@ export struct LightTileVM {
 
 // LightTile — wraps CardBase with the light-specific content layout.
 //
-// Press feedback is inherited from CardBase via the local `pressed` property
-// driven by the TouchArea. Keyboard focus wiring (focused) is left for the
-// Phase 3 action dispatcher; CardBase already paints the focus ring when set.
+// Press feedback and gesture detection both live on CardBase (TASK-060):
+// the single TouchArea inside CardBase captures pointer events for the
+// whole tile, fires the tap/hold/double-tap callbacks, and exposes
+// `pressed` as an out-property that this tile reads for visual feedback.
+// Tile-level TouchAreas were removed to avoid double-capture (Risk #4).
 export component LightTile inherits Rectangle {
     in property <LightTileVM> view-model;
-
-    // Drives CardBase's press visual. The TouchArea below sets it.
-    property <bool> pressed: touch.pressed;
 
     // Resolved state colour. "on" → state-on (warm amber), "off" →
     // state-off (muted slate), anything else → state-unavailable. Pulled
@@ -95,15 +94,7 @@ export component LightTile inherits Rectangle {
         : view-model.state == "off" ? Theme.state-off
         : Theme.state-unavailable;
 
-    // Touch capture. Press/release flips `pressed`; the Phase 3 action
-    // dispatcher will subscribe to clicked/long-pressed via callbacks
-    // declared on this component (out of scope here — TASK-013 § Out of scope).
-    touch := TouchArea {
-        // No callbacks wired in Phase 1 — see Out of scope above.
-    }
-
     base := CardBase {
-        pressed: pressed;
 
         VerticalLayout {
             spacing: Theme.space-2;
