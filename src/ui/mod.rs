@@ -8,7 +8,12 @@
 //! production [`view_router::SlintViewRouter`] impl that drives the
 //! `ViewRouterGlobal::current-view` Slint property from the dispatcher's
 //! `Action::Navigate { view_id }` payload (TASK-068, single-view stub).
+//!
+//! Phase 3: [`toast`] adds the toast banner state + driver (TASK-067) and the
+//! per-tile spinner update path that binds to
+//! [`crate::ha::live_store::LiveStore::pending_for_widget`].
 
 pub mod bridge;
 pub mod more_info;
+pub mod toast;
 pub mod view_router;

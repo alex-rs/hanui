@@ -52,6 +52,11 @@ export struct EntityTileVM {
     preferred-columns: int,
     preferred-rows: int,
     placement: EntityTilePlacement,
+    // pending — true while an OptimisticEntry exists for this tile's
+    // entity. Drives the per-tile spinner overlay on CardBase (TASK-067).
+    // Bound from `LiveStore::pending_for_widget(widget_id)` per
+    // `locked_decisions.pending_state_read_api`.
+    pending: bool,
 }
 
 // EntityTile — wraps CardBase with a neutral content layout.
@@ -66,6 +71,11 @@ export component EntityTile inherits Rectangle {
     in property <EntityTileVM> view-model;
 
     base := CardBase {
+        // Bind the per-tile pending-spinner gate (TASK-067). See
+        // `light_tile.slint` for the binding contract; the Rust bridge
+        // writes `view-model.pending` from `LiveStore::pending_for_widget`
+        // (TASK-064 read API) on each refresh.
+        pending: view-model.pending;
 
         VerticalLayout {
             spacing: Theme.space-2;
