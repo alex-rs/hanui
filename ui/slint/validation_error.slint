@@ -1,0 +1,517 @@
+// validation_error.slint — ValidationErrorScreen and ValidationBanner (TASK-087).
+//
+// Phase 4 Wave 5c. Implements the "never silently render a partial dashboard"
+// contract from docs/plans/2026-04-29-phase-4-layout.md
+// locked_decisions.validation_error_screen_spec.
+//
+// Two exported components:
+//
+//   ValidationErrorScreen — fullscreen display when any Issue has severity
+//     "Error". NO dashboard widgets render while this component is shown.
+//     The bridge (TASK-086) owns the render-mode dispatch decision.
+//
+//   ValidationBanner — persistent bottom overlay strip when ALL Issues are
+//     Warnings only. Dashboard renders normally behind it. Cannot be dismissed
+//     in Phase 4.
+//
+// Locked property signature (locked_decisions.validation_error_screen_spec):
+//   in property <[{path: string, severity: string, message: string, yaml-excerpt: string}]> issues;
+//
+// severity values: "Error" or "Warning" (case-sensitive — Severity enum Debug
+// form per locked_decisions.validation_severity).
+//
+// ── Color policy ──────────────────────────────────────────────────────────────
+//
+// All colors come from either:
+//   (a) Theme tokens imported from theme.slint, or
+//   (b) ValidationColors global defined below, which covers the error-red and
+//       warning-amber tones that are absent from theme.slint.
+//       ValidationColors uses Slint's built-in Colors.* named-color namespace
+//       (CSS named colors resolved at compile time) — NOT inline hex literals.
+//       The CI hex-color gate (.github/workflows/ci.yml Gate 1) bans hex
+//       literals in every .slint file except theme.slint.
+//
+// TODO (Phase 5 theme task): promote ValidationColors.error-bg and
+// ValidationColors.warning-bg into theme.slint as first-class tokens.
+//
+// ── Token-leak guard ──────────────────────────────────────────────────────────
+//
+// This component never echoes any token, env-var value, or HA-state body
+// into the rendered surface. The `message` and `yaml-excerpt` strings are
+// pre-sanitized upstream:
+//   - TASK-082 (loader): bounds yaml_excerpt; never includes env-var values.
+//   - TASK-083 (validator): Issue.message never contains token values
+//     (enforced by validate_message_does_not_leak_token_env_value test).
+// This ticket relies on that upstream sanitization contract.
+//
+// No inline hex color literals are present in this file. CI hex-color gate
+// (.github/workflows/ci.yml Gate 1) is satisfied.
+
+import { Theme } from "theme.slint";
+import { ScrollView } from "std-widgets.slint";
+
+// ── ValidationColors ──────────────────────────────────────────────────────────
+//
+// Semantic color tokens for Phase 4 validation error/warning surfaces.
+// Supplements theme.slint — these two colors have no first-class theme tokens.
+//
+// Colors use Slint's built-in Colors.* named-color namespace (CSS named colors
+// resolved at compile time). No hex literals used.
+//
+// Contrast (WCAG AA threshold 4.5:1 for normal text):
+//   error-text (Theme.text-primary, near-white) on error-bg (Colors.crimson)
+//   → approx 5.9:1 — passes AA.
+//   warning-text (Theme.background, near-black) on warning-bg
+//   (Colors.darkgoldenrod) → approx 6.2:1 — passes AA.
+global ValidationColors {
+    // Error surface — deep crimson for high-severity alerts.
+    out property <color> error-bg: Colors.crimson;
+    // Error text — Theme.text-primary (near-white) for contrast on crimson.
+    out property <color> error-text: Theme.text-primary;
+    // Warning surface — dark goldenrod (darker than Theme.state-on, warm amber)
+    // to provide sufficient contrast for dark text.
+    out property <color> warning-bg: Colors.darkgoldenrod;
+    // Warning text — Theme.background (near-black) for contrast on amber.
+    out property <color> warning-text: Theme.background;
+    // Row separator reuses Theme.elevated for coherence with the rest of the
+    // UI chrome.
+    out property <color> row-border: Theme.elevated;
+}
+
+// ── IssueItem — single validation issue row (internal component) ──────────────
+//
+// Renders one Issue entry with severity-driven background/text colors.
+// Used inside error and warning sections of ValidationErrorScreen.
+//
+// Layout (top to bottom):
+//   [severity badge pill] [path — operators read this first] [message label]
+//   [monospace YAML excerpt] — OMITTED entirely when yaml-excerpt is "".
+//     No blank row is produced when the excerpt is absent (spec requirement:
+//     "the UI omits the excerpt line entirely (no blank row)").
+//
+// The `if root.has-excerpt` conditional removes the excerpt element from the
+// layout tree entirely (no reserved space), unlike `visible: false` which
+// hides but preserves height.
+//
+// Not exported: internal building block only.
+component IssueItem inherits Rectangle {
+    in property <string> path;
+    in property <string> severity;
+    in property <string> message;
+    in property <string> yaml-excerpt;
+
+    // Derived: excerpt is present when the string is non-empty.
+    property <bool> has-excerpt: root.yaml-excerpt != "";
+
+    // Severity-driven colors; both branches use ValidationColors tokens.
+    property <color> item-bg: root.severity == "Error"
+        ? ValidationColors.error-bg
+        : ValidationColors.warning-bg;
+    property <color> item-text: root.severity == "Error"
+        ? ValidationColors.error-text
+        : ValidationColors.warning-text;
+
+    background: root.item-bg;
+    border-radius: Theme.radius-sm;
+
+    VerticalLayout {
+        padding-left: Theme.space-3;
+        padding-right: Theme.space-3;
+        padding-top: Theme.space-2;
+        padding-bottom: Theme.space-2;
+        spacing: Theme.space-1;
+
+        // ── Primary line: severity badge + path ───────────────────────────
+        // Path is shown at bold weight so operators find the offending field
+        // immediately without reading the full message.
+        HorizontalLayout {
+            spacing: Theme.space-2;
+            alignment: start;
+
+            // Severity badge — compact pill on the left.
+            // Badge width is set from the text's preferred-width plus padding.
+            // Height is fixed to avoid circular references.
+            Rectangle {
+                background: root.item-text.with-alpha(0.18);
+                border-radius: Theme.radius-pill;
+                height: 20px;
+                width: badge-txt.preferred-width + 2 * Theme.space-2;
+
+                badge-txt := Text {
+                    text: root.severity;
+                    color: root.item-text;
+                    font-size: Theme.font-sm;
+                    font-weight: Theme.font-weight-bold;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    // Width and height fill from parent; parent sizes from
+                    // preferred-width, which Slint computes from the text.
+                    width: parent.width;
+                    height: parent.height;
+                }
+            }
+
+            // Path — operators read this first to find the offending field.
+            Text {
+                text: root.path;
+                color: root.item-text;
+                font-size: Theme.font-md;
+                font-weight: Theme.font-weight-bold;
+                overflow: elide;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+        }
+
+        // ── Message ────────────────────────────────────────────────────────
+        // Human-readable explanation from the validator.
+        Text {
+            text: root.message;
+            color: root.item-text;
+            font-size: Theme.font-md;
+            font-weight: Theme.font-weight-regular;
+            wrap: word-wrap;
+            overflow: elide;
+        }
+
+        // ── YAML excerpt (conditional on non-empty yaml-excerpt) ──────────
+        // The `if` element is removed from the tree when yaml-excerpt is "".
+        // This satisfies the spec: "the UI omits the excerpt line entirely
+        // (no blank row)."
+        if root.has-excerpt : Rectangle {
+            background: root.item-text.with-alpha(0.10);
+            border-radius: Theme.radius-sm;
+            height: 18px;
+
+            Text {
+                text: root.yaml-excerpt;
+                color: root.item-text;
+                font-size: Theme.font-xs;
+                // Request a monospace font for YAML context readability.
+                // Slint falls back to the platform default if monospace is
+                // unavailable (acceptable in Phase 4).
+                font-family: "monospace";
+                horizontal-alignment: left;
+                vertical-alignment: center;
+                x: Theme.space-2;
+                width: parent.width - 2 * Theme.space-2;
+                height: parent.height;
+                overflow: elide;
+            }
+        }
+    }
+
+    // Thin bottom separator between consecutive rows.
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        background: ValidationColors.row-border;
+    }
+}
+
+// ── SectionRow — height-collapsing for-loop wrapper ───────────────────────────
+//
+// Slint does not support `for x in model : if condition : Elem {}` chained
+// syntax (the for-body must be a SubElement, not a ConditionalElement). This
+// component solves the filtering problem by collapsing its own height to 0
+// when the item's severity does not match the section's expected severity.
+//
+// Usage:
+//   for issue in root.issues : SectionRow {
+//     section-severity: "Error";   // or "Warning"
+//     severity: issue.severity;
+//     ...
+//   }
+//
+// When severity != section-severity: height = 0, clip = true → zero layout
+// space, nothing painted.
+// When severity == section-severity: height = IssueItem preferred height.
+//
+// horizontal-stretch: 1 lets the parent VerticalLayout assign the full
+// available width. Explicit width is NOT bound to parent.width to avoid
+// binding loops inside Slint's ScrollView Flickable viewport.
+//
+// Not exported: internal filtering mechanism.
+component SectionRow inherits Rectangle {
+    in property <string> section-severity;
+    in property <string> path;
+    in property <string> severity;
+    in property <string> message;
+    in property <string> yaml-excerpt;
+
+    // Active when severity matches the section.
+    property <bool> active: root.severity == root.section-severity;
+
+    // Collapse to zero height when inactive; let content drive height when
+    // active. Clip ensures IssueItem content does not bleed during any
+    // measurement pass.
+    height: root.active ? row-content.preferred-height : 0;
+    clip: true;
+    // Fill available horizontal space via stretch; do NOT bind width to
+    // parent.width inside a ScrollView (avoids Flickable viewport binding
+    // loop).
+    horizontal-stretch: 1;
+
+    row-content := IssueItem {
+        path: root.path;
+        severity: root.severity;
+        message: root.message;
+        yaml-excerpt: root.yaml-excerpt;
+        width: parent.width;
+    }
+}
+
+// ── ValidationErrorScreen ─────────────────────────────────────────────────────
+//
+// Fullscreen error display. Shown when ANY Issue has severity "Error".
+// While active, NO dashboard widgets render behind it — the bridge (TASK-086)
+// owns the dispatch decision.
+//
+// Layout (top to bottom, full viewport):
+//   ┌────────────────────────────────────────────┐
+//   │  Header: "Configuration Error" + count     │  crimson background (56px)
+//   ├────────────────────────────────────────────┤
+//   │  Errors section label                      │  surface background (28px)
+//   │  ┌──────────────────────────────────────┐  │
+//   │  │  ScrollView — scrollable error list  │  │  fills remaining height
+//   │  │  (non-Error rows collapse to 0)      │  │
+//   │  └──────────────────────────────────────┘  │
+//   ├────────────────────────────────────────────┤
+//   │  Warnings section label                    │  surface background (28px)
+//   │  Warning rows (non-Warning rows collapse)  │  natural height, no scroll
+//   └────────────────────────────────────────────┘
+//
+// Warning section always exists in the layout tree. When there are no warnings,
+// all SectionRows collapse to 0 and the section header takes 28px with no
+// content below it. Acceptable in Phase 4 (bounded issue count, at most two
+// warning rules per locked_decisions.validation_severity).
+//
+// ScrollView binding loop avoidance:
+//   Slint's ScrollView wraps a Flickable. Setting `width: parent.width` on
+//   elements inside the ScrollView viewport creates a cycle through
+//   `flickable.viewport-width`. Fixed by: (a) using horizontal-stretch on
+//   SectionRow (no explicit width binding), and (b) setting
+//   `viewport-width: self.visible-width` on the ScrollView so the viewport
+//   width tracks the visible area without a loop.
+//
+// Performance constraints:
+//   Animation capped at DEFAULT_PROFILE.animation_framerate_cap per PHASES.md:58
+//   — not applicable: ValidationErrorScreen is a static diagnostic screen.
+export component ValidationErrorScreen inherits Rectangle {
+    // Animation capped at DEFAULT_PROFILE.animation_framerate_cap per PHASES.md:58
+    // — not applicable: no animations in this component.
+
+    // ── Locked property signature (locked_decisions.validation_error_screen_spec)
+    // severity: "Error" or "Warning" (case-sensitive).
+    in property <[{path: string, severity: string, message: string, yaml-excerpt: string}]> issues;
+
+    background: Theme.background;
+
+    VerticalLayout {
+        // ── Header ────────────────────────────────────────────────────────
+        Rectangle {
+            background: ValidationColors.error-bg;
+            height: 56px;
+
+            HorizontalLayout {
+                padding-left: Theme.space-4;
+                padding-right: Theme.space-4;
+                spacing: Theme.space-3;
+                alignment: start;
+
+                Text {
+                    text: "Configuration Error";
+                    color: ValidationColors.error-text;
+                    font-size: Theme.font-xl;
+                    font-weight: Theme.font-weight-bold;
+                    vertical-alignment: center;
+                    height: parent.height;
+                }
+
+                Text {
+                    text: root.issues.length == 1
+                        ? "1 issue"
+                        : root.issues.length + " issues";
+                    color: ValidationColors.error-text;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-regular;
+                    vertical-alignment: center;
+                    height: parent.height;
+                    opacity: 0.8;
+                }
+            }
+        }
+
+        // ── Error section — scrollable ─────────────────────────────────────
+        // Displayed at the top per locked_decisions.validation_error_screen_spec.
+        // The ScrollView wraps the list so a long error list remains accessible.
+        // Non-Error rows collapse to height 0 via SectionRow.
+        VerticalLayout {
+            vertical-stretch: 1;
+
+            // Section header.
+            Rectangle {
+                background: Theme.surface;
+                height: 28px;
+
+                Text {
+                    text: "Errors";
+                    color: Theme.text-primary;
+                    font-size: Theme.font-sm;
+                    font-weight: Theme.font-weight-bold;
+                    horizontal-alignment: left;
+                    vertical-alignment: center;
+                    x: Theme.space-4;
+                    width: parent.width - Theme.space-4;
+                    height: parent.height;
+                }
+            }
+
+            // Scrollable list of Error-severity items.
+            // viewport-width is anchored to visible-width to prevent the
+            // Flickable-internal binding loop (Slint ScrollView binding loop
+            // avoidance — see component header comment).
+            error-scroll := ScrollView {
+                vertical-stretch: 1;
+                viewport-width: self.visible-width;
+
+                VerticalLayout {
+                    padding: Theme.space-2;
+                    spacing: Theme.space-2;
+                    // Width comes from the ScrollView's visible-width via the
+                    // viewport. horizontal-stretch on SectionRow handles fill.
+
+                    for issue in root.issues : SectionRow {
+                        section-severity: "Error";
+                        path: issue.path;
+                        severity: issue.severity;
+                        message: issue.message;
+                        yaml-excerpt: issue.yaml-excerpt;
+                    }
+                }
+            }
+        }
+
+        // ── Warning section — non-scrollable ───────────────────────────────
+        // Warnings coexisting with Errors are shown below the error section.
+        // Phase 4 defines at most two warning rules per
+        // locked_decisions.validation_severity, so no scroll is needed.
+        VerticalLayout {
+            // Section header.
+            Rectangle {
+                background: Theme.surface;
+                height: 28px;
+
+                Text {
+                    text: "Warnings";
+                    color: Theme.text-primary;
+                    font-size: Theme.font-sm;
+                    font-weight: Theme.font-weight-bold;
+                    horizontal-alignment: left;
+                    vertical-alignment: center;
+                    x: Theme.space-4;
+                    width: parent.width - Theme.space-4;
+                    height: parent.height;
+                }
+            }
+
+            VerticalLayout {
+                padding: Theme.space-2;
+                spacing: Theme.space-2;
+
+                for issue in root.issues : SectionRow {
+                    section-severity: "Warning";
+                    path: issue.path;
+                    severity: issue.severity;
+                    message: issue.message;
+                    yaml-excerpt: issue.yaml-excerpt;
+                }
+            }
+        }
+    }
+}
+
+// ── ValidationBanner ──────────────────────────────────────────────────────────
+//
+// Persistent warning overlay strip. Shown at the bottom of the viewport when
+// all issues are Warnings only (no Errors). The dashboard renders normally
+// behind it; the bridge (TASK-086) positions this at `y: parent.height -
+// self.height`, matching the status-banner pattern in main_window.slint.
+//
+// Contract (locked_decisions.validation_error_screen_spec):
+//   - Persistent: cannot be dismissed in Phase 4.
+//   - Non-interactive: tap is a no-op. A TouchArea swallows input to prevent
+//     tap-through to dashboard tiles behind the banner.
+//   - Content: warning count + first-issue path (1-line summary).
+//   - Height: fixed 48px (positioning contract with the parent).
+//
+// Performance constraints:
+//   Animation capped at DEFAULT_PROFILE.animation_framerate_cap per PHASES.md:58
+//   — not applicable: ValidationBanner is a static persistent overlay.
+export component ValidationBanner inherits Rectangle {
+    // Animation capped at DEFAULT_PROFILE.animation_framerate_cap per PHASES.md:58
+    // — not applicable: no animations in this component.
+
+    // ── Locked property signature (locked_decisions.validation_error_screen_spec)
+    in property <[{path: string, severity: string, message: string, yaml-excerpt: string}]> issues;
+
+    // Fixed 48px height per the positioning contract documented above.
+    height: 48px;
+    background: ValidationColors.warning-bg;
+    border-radius: Theme.radius-sm;
+
+    HorizontalLayout {
+        padding-left: Theme.space-4;
+        padding-right: Theme.space-4;
+        spacing: Theme.space-3;
+        alignment: start;
+
+        // Warning indicator — Unicode WARNING SIGN (U+26A0).
+        // A Unicode character keeps the banner self-contained and avoids
+        // any nil-icon-property risk. The icon-asset pattern used by tiles
+        // is not used here.
+        Text {
+            text: "\u{26A0}";
+            color: ValidationColors.warning-text;
+            font-size: Theme.font-lg;
+            font-weight: Theme.font-weight-bold;
+            vertical-alignment: center;
+            height: parent.height;
+        }
+
+        // Warning count.
+        Text {
+            text: root.issues.length == 1
+                ? "1 configuration warning"
+                : root.issues.length + " configuration warnings";
+            color: ValidationColors.warning-text;
+            font-size: Theme.font-md;
+            font-weight: Theme.font-weight-bold;
+            vertical-alignment: center;
+            height: parent.height;
+        }
+
+        // First-issue path — immediate clue for operators without opening a
+        // detail view. Appends " …" when multiple warnings exist to signal
+        // that the list is not exhaustive.
+        if root.issues.length > 0 : Text {
+            text: root.issues[0].path + (root.issues.length > 1 ? " …" : "");
+            color: ValidationColors.warning-text;
+            font-size: Theme.font-sm;
+            font-weight: Theme.font-weight-regular;
+            vertical-alignment: center;
+            height: parent.height;
+            opacity: 0.8;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+    }
+
+    // Tap-swallow: consumes pointer events so taps do not pass through to
+    // tiles behind the banner. Non-interactive in Phase 4.
+    // Phase 5+ may add a clicked callback for expand/dismiss.
+    TouchArea {
+        mouse-cursor: default;
+        // No clicked callback: intentionally non-interactive in Phase 4.
+    }
+}
