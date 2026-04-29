@@ -300,6 +300,45 @@ mod tests {
         assert_eq!(default_url_action_mode(""), UrlActionMode::Never);
     }
 
+    #[test]
+    fn default_url_action_mode_same_length_different_bytes_falls_back_to_never() {
+        // Exercises the byte-mismatch branch inside the `matches_bytes` loop
+        // (`return false` after `if a[i] != b[i]`): a profile name whose byte
+        // length equals a known target's length but whose bytes differ must
+        // NOT match and must fall through to the conservative `Never`
+        // fallback. Without this test the loader's inputs always differ in
+        // length from every target, so the loop-body mismatch path never
+        // executes and per-file coverage drops below the 100 % baseline.
+        //
+        // "rpi5" is the natural same-length adversarial input for "rpi4":
+        // 4 bytes, identical at indices 0..2, differs at index 3
+        // ('5' = 0x35 vs '4' = 0x34). The length-guard branch at the top of
+        // `matches_bytes` is bypassed; only the per-byte comparison can
+        // reject the input.
+        assert_eq!(default_url_action_mode("rpi5"), UrlActionMode::Never);
+    }
+
+    #[test]
+    fn default_url_action_mode_case_sensitivity_pins_documented_behaviour() {
+        // `matches_bytes`' rustdoc states: "Comparison is exact (not
+        // case-insensitive) because the canonical profile names in
+        // docs/PHASES.md are lowercase." This test pins that contract: a
+        // casing-only variant of the canonical "desktop" name must NOT
+        // resolve to `Always` — it falls through to `Never`. "Desktop" is
+        // 7 bytes (identical length to "desktop"), so the length-guard
+        // branch in `matches_bytes` does NOT short-circuit; the per-byte
+        // mismatch at index 0 ('D' = 0x44 vs 'd' = 0x64) is what rejects
+        // the input. This guards against a refactor that "helpfully" adds
+        // case-folding — which would silently broaden the shell-out gate on
+        // the kiosk profiles if a YAML override mis-cased the name.
+        assert_eq!(
+            default_url_action_mode("Desktop"),
+            UrlActionMode::Never,
+            "case-sensitive comparison must reject mixed-case `Desktop` and \
+             fall through to the conservative `Never` fallback — not `Always`"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // UrlActionMode serde — kebab-case wire form
     //
