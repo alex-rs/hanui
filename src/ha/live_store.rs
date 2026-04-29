@@ -31,12 +31,30 @@
 //! one call returns a receiver tied to only the first id; callers that need
 //! multi-id subscriptions should issue one `subscribe` call per id.
 //!
-//! # Phase 3 command channel
+//! # Phase 3 command channel (TASK-072)
 //!
-//! The `command_tx` field is `None` throughout Phase 2.  Phase 3's dispatcher
-//! will populate it via a setter so `LiveStore` can forward commands to the WS
-//! client without bridging through `src/main.rs`.
+//! `command_tx` is the dispatcher → WS client write seam locked by
+//! `docs/plans/2026-04-28-phase-3-actions.md`
+//! § `locked_decisions.command_tx_wiring` and `locked_decisions.ws_command_ack_envelope`.
 //!
+//! The field is `None` throughout Phase 2 and is populated by `src/lib.rs`
+//! at startup (after the WS client task launches) via
+//! [`LiveStore::set_command_tx`]. A Phase 3 dispatcher (TASK-062) clones the
+//! returned [`mpsc::Sender<OutboundCommand>`][OutboundCommand] and pushes
+//! [`OutboundCommand`] envelopes onto it; the WS client task drains the matching
+//! receiver, allocates the next monotonic id, registers the envelope's
+//! `ack_tx` in its pending-ack map, and serializes the wire JSON.
+//!
+//! ## Reconnect repopulation (Risk #11)
+//!
+//! When the WS client task exits/restarts, the receiver end is dropped. The
+//! reconnect loop in `src/lib.rs::run_ws_client` calls [`LiveStore::set_command_tx`]
+//! again with a fresh sender as part of the next attempt; in the gap, dispatch
+//! attempts return [`DispatchError::ChannelClosed`][crate::actions::dispatcher::DispatchError]
+//! (the dispatcher's existing handling of a closed `mpsc::Sender`) and surface as
+//! a toast — never panic.
+//!
+//! [`OutboundCommand`]: crate::ha::client::OutboundCommand
 //! [`EntityStore`]: super::store::EntityStore
 
 use std::collections::HashMap;
@@ -44,8 +62,8 @@ use std::sync::{Arc, RwLock};
 
 use tokio::sync::{broadcast, mpsc};
 
+use crate::ha::client::OutboundCommand;
 use crate::ha::entity::{Entity, EntityId};
-use crate::ha::protocol::OutboundMsg;
 use crate::ha::services::{ServiceMeta, ServiceRegistry, ServiceRegistryHandle};
 use crate::ha::store::{EntityStore, EntityUpdate};
 
@@ -73,13 +91,24 @@ pub struct LiveStore {
     /// silently discarded (no receiver is a normal, non-error condition).
     senders: RwLock<HashMap<EntityId, broadcast::Sender<EntityUpdate>>>,
 
-    /// Phase 3 command channel.
+    /// Phase 3 command channel — dispatcher → WS client task seam (TASK-072).
     ///
-    /// `None` throughout Phase 2.  Phase 3's service-call dispatcher populates
-    /// this field so `LiveStore` can forward `OutboundMsg` frames to the WS
-    /// client task.  Using `Option` avoids dead-code while reserving the field
-    /// — Phase 3 will not need a struct reshape.
-    pub command_tx: Option<mpsc::Sender<OutboundMsg>>,
+    /// Wrapped in [`RwLock`] (not `Mutex`) because the read path is far hotter
+    /// than the write path: every dispatch acquires a read-lock to clone the
+    /// sender, while writes only happen at startup and on WS client task
+    /// restart (the reconnect FSM repopulation per
+    /// `locked_decisions.command_tx_wiring`). `RwLock` lets concurrent
+    /// dispatchers proceed without contention.
+    ///
+    /// `None` until [`LiveStore::set_command_tx`] is called by the
+    /// orchestrator in `src/lib.rs::run_ws_client`. While `None`, a dispatcher
+    /// constructed from `LiveStore.command_tx()` will return
+    /// [`DispatchError::ChannelNotWired`][crate::actions::dispatcher::DispatchError]
+    /// for every WS-bound action; while `Some(closed)` (between WS task exit
+    /// and the next [`set_command_tx`][LiveStore::set_command_tx] call), it
+    /// returns [`DispatchError::ChannelClosed`][crate::actions::dispatcher::DispatchError]
+    /// (Risk #11). Either way, the dispatcher never panics.
+    command_tx: RwLock<Option<mpsc::Sender<OutboundCommand>>>,
 
     /// Shared handle to the populated service registry (TASK-048).
     ///
@@ -112,7 +141,7 @@ impl LiveStore {
         LiveStore {
             snapshot: RwLock::new(Arc::new(HashMap::new())),
             senders: RwLock::new(HashMap::new()),
-            command_tx: None,
+            command_tx: RwLock::new(None),
             services_handle: ServiceRegistry::new_handle(),
         }
     }
@@ -169,6 +198,64 @@ impl LiveStore {
             .read()
             .expect("ServiceRegistry RwLock poisoned");
         guard.lookup(domain, service).cloned()
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3 command channel (TASK-072)
+    // -----------------------------------------------------------------------
+
+    /// Install the dispatcher → WS client command sender.
+    ///
+    /// Called by `src/lib.rs::run_ws_client` once per WS attempt, **after**
+    /// the WS client task has been spawned with the matching
+    /// [`mpsc::Receiver<OutboundCommand>`]. Replaces any prior sender (the
+    /// reconnect FSM repopulation case per
+    /// `locked_decisions.command_tx_wiring`); the old sender — if still held
+    /// — becomes inert when its receiver is dropped, so the next dispatch on
+    /// a stale clone surfaces as
+    /// [`DispatchError::ChannelClosed`][crate::actions::dispatcher::DispatchError].
+    ///
+    /// Takes `&self` (not `&mut self`) so the orchestrator can call this
+    /// through an `Arc<LiveStore>` without exclusive access.
+    ///
+    /// [`OutboundCommand`]: crate::ha::client::OutboundCommand
+    pub fn set_command_tx(&self, tx: mpsc::Sender<OutboundCommand>) {
+        let mut guard = self
+            .command_tx
+            .write()
+            .expect("LiveStore command_tx RwLock poisoned");
+        *guard = Some(tx);
+    }
+
+    /// Return a clone of the current command sender, if any.
+    ///
+    /// `mpsc::Sender` is cheap to clone (an `Arc` bump). Phase 3 dispatchers
+    /// hold their own clone — typically passed to
+    /// [`Dispatcher::with_command_tx`][crate::actions::dispatcher::Dispatcher::with_command_tx]
+    /// at construction. Returns `None` until [`LiveStore::set_command_tx`]
+    /// has been called.
+    pub fn command_tx(&self) -> Option<mpsc::Sender<OutboundCommand>> {
+        let guard = self
+            .command_tx
+            .read()
+            .expect("LiveStore command_tx RwLock poisoned");
+        guard.as_ref().cloned()
+    }
+
+    /// Drop the currently-installed command sender, if any.
+    ///
+    /// Called by `src/lib.rs::run_ws_client` when the WS client task exits
+    /// so that subsequent dispatches see `None` (and return
+    /// [`DispatchError::ChannelNotWired`][crate::actions::dispatcher::DispatchError]
+    /// rather than racing the next reconnect's
+    /// [`set_command_tx`][LiveStore::set_command_tx] call against a still-Some
+    /// stale sender). Idempotent: clearing an already-`None` field is a no-op.
+    pub fn clear_command_tx(&self) {
+        let mut guard = self
+            .command_tx
+            .write()
+            .expect("LiveStore command_tx RwLock poisoned");
+        *guard = None;
     }
 
     /// Replace the entire entity map atomically.
@@ -612,6 +699,154 @@ mod tests {
             count += 1;
         });
         assert_eq!(count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // command_tx setter / getter / clear (TASK-072)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn command_tx_initial_value_is_none() {
+        let store = LiveStore::new();
+        assert!(
+            store.command_tx().is_none(),
+            "fresh LiveStore must have command_tx = None"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_command_tx_round_trip_delivers_to_receiver() {
+        // Acceptance: set_command_tx installs a sender that round-trips an
+        // OutboundCommand to the receiver end.  The receiver here stands in
+        // for the WS client's drain task.
+        use crate::ha::client::{OutboundCommand, OutboundFrame};
+        use tokio::sync::oneshot;
+
+        let store = LiveStore::new();
+        let (tx, mut rx) = mpsc::channel::<OutboundCommand>(4);
+        store.set_command_tx(tx);
+
+        let cloned = store
+            .command_tx()
+            .expect("command_tx must be Some after set_command_tx");
+
+        let (ack_tx, _ack_rx) = oneshot::channel();
+        cloned
+            .send(OutboundCommand {
+                frame: OutboundFrame {
+                    domain: "light".to_owned(),
+                    service: "turn_on".to_owned(),
+                    target: None,
+                    data: None,
+                },
+                ack_tx,
+            })
+            .await
+            .expect("send through installed command_tx must succeed");
+
+        let received = rx
+            .recv()
+            .await
+            .expect("receiver must yield the dispatched OutboundCommand");
+        assert_eq!(received.frame.domain, "light");
+        assert_eq!(received.frame.service, "turn_on");
+    }
+
+    #[tokio::test]
+    async fn set_command_tx_replaces_prior_sender() {
+        // Reconnect-repopulation invariant per locked_decisions.command_tx_wiring:
+        // a second set_command_tx call replaces the prior sender so the next
+        // dispatch reaches the NEW receiver, not the stale one.
+        use crate::ha::client::{OutboundCommand, OutboundFrame};
+        use tokio::sync::oneshot;
+
+        let store = LiveStore::new();
+
+        // Install sender #1, then drop its receiver (simulating WS task exit).
+        let (tx1, rx1) = mpsc::channel::<OutboundCommand>(4);
+        store.set_command_tx(tx1);
+        drop(rx1);
+
+        // Install sender #2 — fresh receiver.
+        let (tx2, mut rx2) = mpsc::channel::<OutboundCommand>(4);
+        store.set_command_tx(tx2);
+
+        // Cloning command_tx now must yield the NEW sender (talks to rx2).
+        let cloned = store
+            .command_tx()
+            .expect("command_tx must be Some after second set_command_tx");
+        let (ack_tx, _ack_rx) = oneshot::channel();
+        cloned
+            .send(OutboundCommand {
+                frame: OutboundFrame {
+                    domain: "switch".to_owned(),
+                    service: "toggle".to_owned(),
+                    target: None,
+                    data: None,
+                },
+                ack_tx,
+            })
+            .await
+            .expect("send through replacement command_tx must succeed");
+
+        let received = rx2
+            .recv()
+            .await
+            .expect("replacement receiver must yield the dispatch");
+        assert_eq!(received.frame.domain, "switch");
+        assert_eq!(received.frame.service, "toggle");
+    }
+
+    #[tokio::test]
+    async fn clear_command_tx_unsets_sender() {
+        // After clear_command_tx, command_tx() returns None — caller-visible
+        // signal that no WS task is currently draining.
+        let (tx, _rx) = mpsc::channel::<crate::ha::client::OutboundCommand>(1);
+        let store = LiveStore::new();
+        store.set_command_tx(tx);
+        assert!(store.command_tx().is_some());
+        store.clear_command_tx();
+        assert!(
+            store.command_tx().is_none(),
+            "clear_command_tx must reset the field to None"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_receiver_makes_clone_send_fail() {
+        // Risk #11: when the WS task exits, the receiver is dropped; any
+        // dispatch that still holds a clone of the old sender must observe a
+        // closed-channel error rather than panic.  This is the boundary the
+        // dispatcher's DispatchError::ChannelClosed path keys on.
+        use crate::ha::client::{OutboundCommand, OutboundFrame};
+        use tokio::sync::oneshot;
+
+        let store = LiveStore::new();
+        let (tx, rx) = mpsc::channel::<OutboundCommand>(1);
+        store.set_command_tx(tx);
+        let cloned = store
+            .command_tx()
+            .expect("command_tx must be Some after set_command_tx");
+
+        // Simulate WS task exit: drop the receiver.
+        drop(rx);
+
+        let (ack_tx, _ack_rx) = oneshot::channel();
+        let result = cloned
+            .send(OutboundCommand {
+                frame: OutboundFrame {
+                    domain: "light".to_owned(),
+                    service: "toggle".to_owned(),
+                    target: None,
+                    data: None,
+                },
+                ack_tx,
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "send on a sender whose receiver was dropped must return Err"
+        );
     }
 
     // -----------------------------------------------------------------------

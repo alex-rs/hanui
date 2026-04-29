@@ -78,7 +78,7 @@ use std::time::{Duration, Instant};
 use futures::{SinkExt, StreamExt};
 use jiff::Timestamp;
 use rand::Rng;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -408,6 +408,24 @@ pub(crate) enum Phase {
     Live,
 }
 
+/// Selector branch for [`WsClient::run`]'s combined inbound / outbound select.
+///
+/// TASK-072: when a dispatcher [`OutboundCommand`] receiver is attached, the
+/// run loop must race the WebSocket read against `command_rx.recv()` so the
+/// dispatcher path is non-blocking with respect to inbound HA frames.  This
+/// enum exists only so the `tokio::select!` produces a single typed value
+/// the outer match can dispatch on; without it the two branches' types
+/// (`Option<Result<Message, _>>` vs. `Option<OutboundCommand>`) would need
+/// to be smuggled out of the macro via captures.
+enum Either {
+    /// The WebSocket read produced an inbound frame (or the connection
+    /// closed).
+    Inbound(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>),
+    /// The dispatcher command channel produced an envelope (or the sender
+    /// was dropped, indicated by `None`).
+    Outbound(Option<OutboundCommand>),
+}
+
 // ---------------------------------------------------------------------------
 // Pending-request map
 // ---------------------------------------------------------------------------
@@ -699,6 +717,27 @@ pub struct WsClient {
     /// [`LiveStore`]: crate::ha::live_store::LiveStore
     /// [`LiveStore::services_lookup`]: crate::ha::live_store::LiveStore::services_lookup
     pub(crate) services: ServiceRegistryHandle,
+
+    /// Phase 3 dispatcher → WS client command receiver (TASK-072).
+    ///
+    /// `None` for protocol-only tests and the Phase 1 fixture path. When
+    /// `Some(rx)`, [`WsClient::run`] drains it concurrently with the inbound
+    /// stream via `tokio::select!`: each [`OutboundCommand`] is registered via
+    /// [`WsClient::register_dispatcher_command`] (allocates the next id +
+    /// stores the envelope's `ack_tx` in `pending_ack`) and the resulting wire
+    /// JSON is written onto the socket with the assigned id.
+    ///
+    /// `Option<mpsc::Receiver<OutboundCommand>>` (taken at the start of `run`)
+    /// keeps the seam strictly additive — existing internal frames (auth /
+    /// subscribe_events / get_states / get_services) flow exactly as before
+    /// when `command_rx` is `None`.
+    ///
+    /// Per `locked_decisions.command_tx_wiring`: the matching sender lives in
+    /// [`LiveStore.command_tx`][crate::ha::live_store::LiveStore]. The
+    /// reconnect FSM in `src/lib.rs::run_ws_client` re-creates the channel
+    /// each attempt and re-installs the new sender on the LiveStore via
+    /// [`LiveStore::set_command_tx`][crate::ha::live_store::LiveStore::set_command_tx].
+    pub(crate) command_rx: Option<mpsc::Receiver<OutboundCommand>>,
 }
 
 impl WsClient {
@@ -720,6 +759,7 @@ impl WsClient {
             stable_live_threshold: STABLE_LIVE_DURATION,
             store: None,
             services: ServiceRegistry::new_handle(),
+            command_rx: None,
         }
     }
 
@@ -772,6 +812,39 @@ impl WsClient {
     pub fn with_registry(mut self, services: ServiceRegistryHandle) -> Self {
         self.services = services;
         self
+    }
+
+    /// Attach a Phase 3 dispatcher → WS client command receiver (TASK-072).
+    ///
+    /// Strictly additive: when present, [`WsClient::run`] drains the receiver
+    /// concurrently with the inbound stream via `tokio::select!` and forwards
+    /// each [`OutboundCommand`] onto the socket via
+    /// [`WsClient::register_dispatcher_command`] (which allocates the id and
+    /// registers the envelope's `ack_tx` in `pending_ack`).  When absent
+    /// (protocol-only tests, Phase 1 fixture path), the FSM behaves exactly
+    /// as before.
+    ///
+    /// Per `locked_decisions.command_tx_wiring`: the orchestrator in
+    /// `src/lib.rs::run_ws_client` is the sole production caller — it
+    /// constructs a fresh `(tx, rx)` per reconnect attempt, installs `tx`
+    /// on the [`LiveStore`][crate::ha::live_store::LiveStore] via
+    /// [`set_command_tx`][crate::ha::live_store::LiveStore::set_command_tx],
+    /// and hands `rx` to this builder.
+    pub fn with_command_rx(mut self, command_rx: mpsc::Receiver<OutboundCommand>) -> Self {
+        self.command_rx = Some(command_rx);
+        self
+    }
+
+    /// Install (or replace) the dispatcher → WS client command receiver
+    /// post-construction.
+    ///
+    /// Companion to [`WsClient::with_command_rx`] for callers that need to
+    /// re-wire the receiver between [`WsClient::run`] invocations — the
+    /// reconnect loop in `src/lib.rs::run_ws_client` calls this on every
+    /// attempt because the previous attempt's receiver is consumed inside
+    /// `run` (taken via `Option::take` at loop entry).
+    pub fn set_command_rx(&mut self, command_rx: mpsc::Receiver<OutboundCommand>) {
+        self.command_rx = Some(command_rx);
     }
 
     /// Transition the FSM to a new `ConnectionState` and publish via watch.
@@ -956,6 +1029,13 @@ impl WsClient {
 
     /// Connect to HA and run the FSM until `Failed` or a transport error.
     ///
+    /// TASK-072: when [`with_command_rx`][WsClient::with_command_rx] has been
+    /// called, the inner loop concurrently drains a Phase 3 dispatcher's
+    /// command channel via `tokio::select!` (see [`Either`] below).  The
+    /// existing internal frame flow (auth / subscribe_events / get_states /
+    /// get_services) is unchanged — `command_rx = None` is the protocol-only
+    /// configuration.
+    ///
     /// Returns `Err(ClientError::AuthInvalid)` on auth failure (no reconnect).
     /// Returns `Err(ClientError::OverflowCircuitBreaker)` when the circuit
     /// breaker trips.  Returns transport errors as `Err(ClientError::Transport)`.
@@ -987,42 +1067,109 @@ impl WsClient {
         let mut phase = Phase::Authenticating;
         self.set_state(ConnectionState::Authenticating);
 
+        // TASK-072: take ownership of the optional command receiver for the
+        // duration of this connection.  Re-installed on the next call to
+        // `run` (the reconnect FSM constructs a fresh channel per attempt and
+        // hands the new receiver via `with_command_rx`).
+        let mut command_rx = self.command_rx.take();
+
         loop {
-            let msg = match read.next().await {
-                Some(Ok(m)) => m,
-                Some(Err(e)) => {
-                    tracing::warn!(error = %e, "WebSocket transport error");
-                    return Err(ClientError::Transport(e));
+            // Race the inbound stream against an OutboundCommand from the
+            // dispatcher (Phase 3, locked_decisions.ws_command_ack_envelope).
+            //
+            // Branch A — inbound text/binary/close: identical to the
+            // pre-TASK-072 read loop.  Existing TASK-035 mock-WS integration
+            // tests construct a `WsClient` without `with_command_rx`, so
+            // `command_rx` is `None`, the second select arm parks forever,
+            // and the read arm dominates exactly as before.
+            //
+            // Branch B — OutboundCommand on `command_rx`: register with
+            // `pending_ack`, render wire JSON with the assigned id, write to
+            // socket.  A `None` from `recv()` (sender dropped — typically
+            // means LiveStore replaced its sender via the reconnect
+            // repopulation path) drops the local receiver Option and
+            // continues; subsequent iterations only race the read arm.
+            let either = if let Some(rx) = command_rx.as_mut() {
+                tokio::select! {
+                    biased;
+                    inbound = read.next() => Either::Inbound(inbound),
+                    cmd = rx.recv() => Either::Outbound(cmd),
                 }
-                None => {
-                    tracing::warn!("WebSocket stream closed by server");
-                    return Err(ClientError::Transport(
-                        tokio_tungstenite::tungstenite::Error::ConnectionClosed,
-                    ));
-                }
+            } else {
+                Either::Inbound(read.next().await)
             };
 
-            let bytes = match msg {
-                Message::Text(text) => text.into_bytes(),
-                Message::Binary(b) => b,
-                Message::Close(_) => {
-                    tracing::info!("received WS Close frame");
-                    return Err(ClientError::Transport(
-                        tokio_tungstenite::tungstenite::Error::ConnectionClosed,
-                    ));
-                }
-                _ => continue,
-            };
+            match either {
+                Either::Inbound(msg) => {
+                    let msg = match msg {
+                        Some(Ok(m)) => m,
+                        Some(Err(e)) => {
+                            tracing::warn!(error = %e, "WebSocket transport error");
+                            return Err(ClientError::Transport(e));
+                        }
+                        None => {
+                            tracing::warn!("WebSocket stream closed by server");
+                            return Err(ClientError::Transport(
+                                tokio_tungstenite::tungstenite::Error::ConnectionClosed,
+                            ));
+                        }
+                    };
 
-            let inbound = match serde_json::from_slice::<InboundMsg>(&bytes) {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to parse inbound message; skipping");
-                    continue;
-                }
-            };
+                    let bytes = match msg {
+                        Message::Text(text) => text.into_bytes(),
+                        Message::Binary(b) => b,
+                        Message::Close(_) => {
+                            tracing::info!("received WS Close frame");
+                            return Err(ClientError::Transport(
+                                tokio_tungstenite::tungstenite::Error::ConnectionClosed,
+                            ));
+                        }
+                        _ => continue,
+                    };
 
-            phase = self.handle_message(inbound, phase, &mut write).await?;
+                    let inbound = match serde_json::from_slice::<InboundMsg>(&bytes) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to parse inbound message; skipping");
+                            continue;
+                        }
+                    };
+
+                    phase = self.handle_message(inbound, phase, &mut write).await?;
+                }
+                Either::Outbound(Some(cmd)) => {
+                    // Allocate id + register ack_tx in pending_ack + render
+                    // wire JSON.  We do NOT gate on FSM phase: dispatchers
+                    // upstream of the FSM's stable-Live transition are a
+                    // legitimate edge case (HA returns success=false / the
+                    // pending-ack matches on result-frame demux later); the
+                    // important invariant is that the id allocation and the
+                    // pending-map registration happen here, not in the
+                    // dispatcher.
+                    let (id, wire) = self.register_dispatcher_command(cmd);
+                    if let Err(e) = write.send(Message::Text(wire)).await {
+                        tracing::warn!(
+                            error = %e,
+                            cmd_id = id,
+                            "failed to write dispatcher OutboundCommand to socket"
+                        );
+                        return Err(ClientError::Transport(e));
+                    }
+                    tracing::debug!(cmd_id = id, "dispatched OutboundCommand to HA");
+                }
+                Either::Outbound(None) => {
+                    // Sender was dropped — typically because LiveStore
+                    // re-installed a fresh sender (and the corresponding
+                    // receiver replaces this one on the next reconnect).
+                    // Stop racing the command arm and let the inbound arm
+                    // dominate the rest of this connection's lifetime.
+                    tracing::debug!(
+                        "command_rx returned None (sender dropped); \
+                         continuing without command-drain on this connection"
+                    );
+                    command_rx = None;
+                }
+            }
         }
     }
 

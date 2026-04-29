@@ -302,7 +302,12 @@ fn run_with_live_store(runtime: &tokio::runtime::Runtime) -> Result<()> {
     // TASK-048: also forward the shared `services_handle` into the WS task so
     // the `Phase::Services → Live` write site mutates the SAME registry the
     // `LiveStore` reads from.
-    let store_for_ws: Arc<dyn SnapshotApplier> = store.clone();
+    // TASK-072: hand the concrete `Arc<LiveStore>` to the reconnect loop so it
+    // can call `set_command_tx` / `clear_command_tx` on each attempt
+    // (locked_decisions.command_tx_wiring).  The trait coercion to
+    // `Arc<dyn SnapshotApplier>` happens inside `run_ws_client` for the WS
+    // client's internal use.
+    let store_for_ws = store.clone();
     let ws_handle = runtime.spawn(run_ws_client(
         config,
         state_tx,
@@ -357,6 +362,17 @@ fn build_ws_client_with_store(
         .with_registry(services_handle)
 }
 
+/// Capacity of the dispatcher → WS client command channel (TASK-072).
+///
+/// Per `locked_decisions.ws_command_ack_envelope`, the WS client task is the
+/// sole id authority; it drains commands as fast as it can serialize them onto
+/// the socket.  A capacity of 32 absorbs short bursts (e.g. a finger that
+/// hammers the same tile during a slow round-trip) without blocking the Slint
+/// UI thread on `mpsc::Sender::send`.  The dispatcher's `try_send` path
+/// (TASK-062) returns `ChannelClosed` rather than blocking when the buffer is
+/// full, so the UI never stalls.
+const COMMAND_CHANNEL_BUFFER: usize = 32;
+
 /// WS reconnect loop — the outer wrapper around `WsClient::run`.
 ///
 /// Re-runs `WsClient::run` after a jittered exponential-backoff window on
@@ -386,21 +402,70 @@ fn build_ws_client_with_store(
 /// registry the `LiveStore` exposes via `services_lookup`.  This is what
 /// makes the `ServiceRegistry` reachable from a task other than this one.
 ///
+/// # TASK-072
+///
+/// Takes the concrete `Arc<LiveStore>` (rather than `Arc<dyn SnapshotApplier>`)
+/// so this loop can repopulate `LiveStore.command_tx` on each reconnect
+/// attempt per `locked_decisions.command_tx_wiring`.  Per attempt:
+///
+/// 1. Construct a fresh `mpsc::channel::<OutboundCommand>(COMMAND_CHANNEL_BUFFER)`.
+/// 2. `live_store.set_command_tx(tx)` — replaces any prior sender so
+///    in-flight dispatcher clones become inert when the matching receiver is
+///    dropped at the end of the current `run()` call.
+/// 3. Build the [`WsClient`] with `with_command_rx(rx)` — the receiver is
+///    consumed for the duration of `run()`.
+/// 4. On `run()` exit, call `live_store.clear_command_tx()` so a dispatcher
+///    that fires between attempts sees `None` (and returns
+///    `DispatchError::ChannelNotWired`, the dispatcher's existing handling
+///    of the no-channel case) rather than racing the next `set_command_tx`
+///    call against a stale `Some(closed)` sender.  Risk #11 mitigation:
+///    every error path is non-fatal for the dispatcher.
+///
+/// The drain task itself lives **inside** `WsClient::run` (alongside the
+/// inbound stream) via `tokio::select!`; this keeps id allocation and the
+/// `pending_ack` map exclusively under the WS client's `&mut self`, matching
+/// the seam locked by `locked_decisions.ws_command_ack_envelope`.
+///
 /// [`ServiceRegistryHandle`]: crate::ha::services::ServiceRegistryHandle
 async fn run_ws_client(
     config: Config,
     state_tx: tokio::sync::watch::Sender<ConnectionState>,
-    store: Arc<dyn SnapshotApplier>,
+    store: Arc<LiveStore>,
     services_handle: crate::ha::services::ServiceRegistryHandle,
 ) {
     use rand::rngs::SmallRng;
     use rand::SeedableRng;
 
-    let mut client = build_ws_client_with_store(config, state_tx, store, services_handle);
+    // The trait coercion happens here so the rest of `run_ws_client` keeps a
+    // concrete `Arc<LiveStore>` for `set_command_tx` / `clear_command_tx`.
+    let snapshot_applier: Arc<dyn SnapshotApplier> = store.clone();
+
+    let mut client =
+        build_ws_client_with_store(config, state_tx, snapshot_applier, services_handle);
     let mut rng = SmallRng::from_entropy();
 
     loop {
-        match client.run().await {
+        // TASK-072: per-attempt command channel.  Built fresh each iteration
+        // so the prior receiver's drop (when the previous `run()` returned)
+        // cannot survive into the next attempt.  The new sender is installed
+        // BEFORE `client.run()` starts so a dispatcher that fires the moment
+        // we transition to Live does not race the wiring step.
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(COMMAND_CHANNEL_BUFFER);
+        store.set_command_tx(cmd_tx);
+        client.set_command_rx(cmd_rx);
+
+        let outcome = client.run().await;
+
+        // Whatever the outcome, the receiver `client.command_rx` was taken at
+        // the start of `run` and dropped when `run` returned (success or
+        // error path); the LiveStore-side sender is now talking to a closed
+        // receiver.  Clear the field so dispatchers between attempts observe
+        // `ChannelNotWired` rather than `ChannelClosed`-on-stale.  The next
+        // iteration will install a fresh sender before any further dispatch
+        // can land.
+        store.clear_command_tx();
+
+        match outcome {
             Ok(()) => {
                 tracing::info!("WsClient::run returned Ok; exiting reconnect loop");
                 return;
