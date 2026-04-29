@@ -25,19 +25,16 @@
 //! events, not about wire framing — keeping the suite fast (no port binding)
 //! and deterministic (no socket scheduling).
 //!
-//! # Url + dispatcher integration gap
+//! # Url + dispatcher integration (TASK-075)
 //!
-//! [`Action::Url`] currently returns
-//! [`DispatchError::NotImplementedYet { ticket: "TASK-063" }`] when routed
-//! through the dispatcher. TASK-063 shipped the `Url` handler
-//! ([`hanui::actions::url::handle_url_action`]) and the
-//! [`UrlActionMode { Always | Never | Ask }`] enum, but did NOT wire those
-//! into the dispatcher itself — the dispatcher still falls through to the
-//! `NotImplementedYet` arm. The handler-level integration tests live in
-//! `tests/integration/url_action.rs` (TASK-063); the dispatcher-level wiring
-//! is captured here by [`url_through_dispatcher_returns_not_implemented_yet`]
-//! and the `#[ignore]`-annotated [`url_through_dispatcher_modes`] which
-//! documents the follow-up work for TASK-063b.
+//! [`Action::Url`] is wired through the dispatcher under the
+//! [`UrlActionMode`] gate. The handler-level integration tests live in
+//! `tests/integration/url_action.rs` (TASK-063 — handler API); the
+//! dispatcher-level wiring is captured here by
+//! [`url_through_dispatcher_modes`], which exercises every mode (`Always`,
+//! `Never`, `Ask`), the invalid-href rejection path, and the spawn-failure
+//! path. `Url` is never WS-bound in any mode — every assertion checks for
+//! zero `OutboundCommand` frames.
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -54,7 +51,9 @@ use hanui::actions::dispatcher::{
 use hanui::actions::map::{WidgetActionEntry, WidgetActionMap, WidgetId};
 use hanui::actions::queue::OfflineQueue;
 use hanui::actions::timing::{ActionOverlapStrategy, ActionTiming};
+use hanui::actions::url::{TOAST_ASK_PHASE_6, TOAST_BLOCKED_BY_PROFILE};
 use hanui::actions::Action;
+use hanui::dashboard::profiles::UrlActionMode;
 use hanui::ha::client::{event_to_entity_update, HaAckSuccess, OutboundCommand};
 use hanui::ha::entity::{Entity, EntityId};
 use hanui::ha::live_store::LiveStore;
@@ -405,20 +404,83 @@ async fn navigate_emits_ui_outcome_and_no_frame() {
     assert_eq!(drain_commands(&mut rx, 1).len(), 0);
 }
 
-// 5. Url through dispatcher — currently returns NotImplementedYet
-//    (TASK-063b will swap in the wiring; the handler exists today and is
-//    covered by tests/integration/url_action.rs against the public
-//    `handle_url_action_with_spawner` API).
+// 5. Url through dispatcher — TASK-075 wires the handler with the
+//    UrlActionMode gate. This test exercises every mode's observable plus
+//    the two error paths (invalid href, spawn failure). The previous
+//    `url_through_dispatcher_returns_not_implemented_yet` assertion was
+//    deleted in TASK-075 because its inverse — dispatch returning a routed
+//    outcome — is exactly what this ticket flips.
+//
+// Spawner state is shared across `#[tokio::test]` instances via statics
+// because `Spawner = fn(&str) -> io::Result<()>` cannot capture closures.
+// The test serialises with a Mutex so concurrent libtest threads do not
+// race on SPAWN_COUNT / SPAWN_FAILS.
+mod url_dispatcher_modes_recorder {
+    use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(super) static SPAWN_COUNT: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static SPAWN_FAILS: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    pub(super) static SPAWN_FAILS_LONG: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    pub(super) static SPAWN_LAST_HREF: std::sync::Mutex<Option<String>> =
+        std::sync::Mutex::new(None);
+    pub(super) static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(super) fn reset(force_fail: bool) {
+        SPAWN_COUNT.store(0, Ordering::SeqCst);
+        SPAWN_FAILS.store(force_fail, Ordering::SeqCst);
+        SPAWN_FAILS_LONG.store(false, Ordering::SeqCst);
+        *SPAWN_LAST_HREF.lock().unwrap() = None;
+    }
+
+    pub(super) fn reset_with_long_failure() {
+        SPAWN_COUNT.store(0, Ordering::SeqCst);
+        SPAWN_FAILS.store(true, Ordering::SeqCst);
+        SPAWN_FAILS_LONG.store(true, Ordering::SeqCst);
+        *SPAWN_LAST_HREF.lock().unwrap() = None;
+    }
+
+    /// Recording spawner with `fn`-pointer signature (no closure capture).
+    /// Records the href so the Always-mode test can assert it was forwarded
+    /// verbatim, and toggles between Ok and `NotFound` based on SPAWN_FAILS.
+    /// When SPAWN_FAILS_LONG is set, the failure carries a >256-byte
+    /// message so the dispatcher's UTF-8-aware truncation branch executes.
+    pub(super) fn recording_spawner(href: &str) -> io::Result<()> {
+        SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
+        *SPAWN_LAST_HREF.lock().unwrap() = Some(href.to_owned());
+        if SPAWN_FAILS.load(Ordering::SeqCst) {
+            let message = if SPAWN_FAILS_LONG.load(Ordering::SeqCst) {
+                // 4-byte codepoint × 80 = 320 bytes — past the 256 cap.
+                // Forces the truncation branch in dispatcher.rs to walk
+                // backwards from byte 256 to the nearest char boundary.
+                "🟥".repeat(80)
+            } else {
+                "test forced spawn failure".to_owned()
+            };
+            Err(io::Error::new(io::ErrorKind::NotFound, message))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[tokio::test]
-async fn url_through_dispatcher_returns_not_implemented_yet() {
-    let services = empty_handle();
-    let (dispatcher, mut rx) = make_dispatcher_with_recorder(services);
+async fn url_through_dispatcher_modes() {
+    use std::sync::atomic::Ordering;
+    use url_dispatcher_modes_recorder::{
+        recording_spawner, reset, SPAWN_COUNT, SPAWN_LAST_HREF, TEST_SERIAL,
+    };
+
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+
     let map = one_widget_map(
         "url_widget",
         entry_with(
             "light.kitchen",
             Action::Url {
-                href: "https://example.org/".to_owned(),
+                href: "https://example.org/path".to_owned(),
             },
             Action::None,
             Action::None,
@@ -426,41 +488,234 @@ async fn url_through_dispatcher_returns_not_implemented_yet() {
     );
     let store = LiveStore::new();
 
-    let err = dispatcher
-        .dispatch(&WidgetId::from("url_widget"), Gesture::Tap, &store, &map)
-        .expect_err("Url through dispatcher is deferred to TASK-063 wiring");
-    match err {
-        DispatchError::NotImplementedYet { what, ticket } => {
-            assert_eq!(what, "Url");
-            assert_eq!(ticket, "TASK-063");
-        }
-        other => panic!("expected NotImplementedYet, got {other:?}"),
+    // -------- Always: spawner called once, Ok(UrlOpened), zero frames.
+    {
+        reset(false);
+        let services = empty_handle();
+        let (dispatcher, mut rx) = make_dispatcher_with_recorder(services);
+        let dispatcher = dispatcher
+            .with_url_action_mode(UrlActionMode::Always)
+            .with_url_spawner(recording_spawner);
+
+        let outcome = dispatcher
+            .dispatch(&WidgetId::from("url_widget"), Gesture::Tap, &store, &map)
+            .expect("Always mode must succeed for a valid href");
+        assert!(
+            matches!(outcome, DispatchOutcome::UrlOpened),
+            "Always mode must return UrlOpened, got {outcome:?}"
+        );
+        assert_eq!(
+            SPAWN_COUNT.load(Ordering::SeqCst),
+            1,
+            "Always mode must invoke the spawner exactly once"
+        );
+        assert_eq!(
+            SPAWN_LAST_HREF.lock().unwrap().as_deref(),
+            Some("https://example.org/path"),
+            "spawner must receive the href verbatim"
+        );
+        assert_eq!(
+            drain_commands(&mut rx, 1).len(),
+            0,
+            "Url is never WS-bound: zero OutboundCommand frames in Always mode"
+        );
     }
-    assert_eq!(drain_commands(&mut rx, 1).len(), 0);
+
+    // -------- Never: no spawn, Ok(UrlBlockedToast(TOAST_BLOCKED_BY_PROFILE)).
+    {
+        reset(false);
+        let services = empty_handle();
+        let (dispatcher, mut rx) = make_dispatcher_with_recorder(services);
+        let dispatcher = dispatcher
+            .with_url_action_mode(UrlActionMode::Never)
+            .with_url_spawner(recording_spawner);
+
+        let outcome = dispatcher
+            .dispatch(&WidgetId::from("url_widget"), Gesture::Tap, &store, &map)
+            .expect("Never mode must return Ok with a blocked-toast outcome");
+        match outcome {
+            DispatchOutcome::UrlBlockedToast { text } => {
+                assert_eq!(text, TOAST_BLOCKED_BY_PROFILE);
+            }
+            other => panic!("expected UrlBlockedToast, got {other:?}"),
+        }
+        assert_eq!(
+            SPAWN_COUNT.load(Ordering::SeqCst),
+            0,
+            "Never mode must NOT invoke the spawner"
+        );
+        assert_eq!(drain_commands(&mut rx, 1).len(), 0);
+    }
+
+    // -------- Ask: no spawn, Ok(UrlAskToast(TOAST_ASK_PHASE_6)).
+    {
+        reset(false);
+        let services = empty_handle();
+        let (dispatcher, mut rx) = make_dispatcher_with_recorder(services);
+        let dispatcher = dispatcher
+            .with_url_action_mode(UrlActionMode::Ask)
+            .with_url_spawner(recording_spawner);
+
+        let outcome = dispatcher
+            .dispatch(&WidgetId::from("url_widget"), Gesture::Tap, &store, &map)
+            .expect("Ask mode must return Ok with the Phase-6 deferred toast");
+        match outcome {
+            DispatchOutcome::UrlAskToast { text } => {
+                assert_eq!(text, TOAST_ASK_PHASE_6);
+            }
+            other => panic!("expected UrlAskToast, got {other:?}"),
+        }
+        assert_eq!(SPAWN_COUNT.load(Ordering::SeqCst), 0);
+        assert_eq!(drain_commands(&mut rx, 1).len(), 0);
+    }
+
+    // -------- Invalid href in any mode: UrlInvalidHref, no spawn.
+    //          The classic shell-meta payload `;rm -rf /` must be rejected
+    //          BEFORE the Always branch reaches the spawner.
+    {
+        let bad_map = one_widget_map(
+            "url_widget",
+            entry_with(
+                "light.kitchen",
+                Action::Url {
+                    href: "https://example.org/;rm -rf /".to_owned(),
+                },
+                Action::None,
+                Action::None,
+            ),
+        );
+        for mode in [
+            UrlActionMode::Always,
+            UrlActionMode::Never,
+            UrlActionMode::Ask,
+        ] {
+            reset(false);
+            let services = empty_handle();
+            let (dispatcher, mut rx) = make_dispatcher_with_recorder(services);
+            let dispatcher = dispatcher
+                .with_url_action_mode(mode)
+                .with_url_spawner(recording_spawner);
+
+            let err = dispatcher
+                .dispatch(
+                    &WidgetId::from("url_widget"),
+                    Gesture::Tap,
+                    &store,
+                    &bad_map,
+                )
+                .expect_err("shell-meta href must be rejected pre-spawn");
+            match err {
+                DispatchError::UrlInvalidHref { reason } => {
+                    assert!(
+                        reason.contains("metacharacter") || reason.contains("shell"),
+                        "rejection reason must cite shell metacharacter, got: {reason}"
+                    );
+                }
+                other => panic!("expected UrlInvalidHref, got {other:?} (mode {mode:?})"),
+            }
+            assert_eq!(
+                SPAWN_COUNT.load(Ordering::SeqCst),
+                0,
+                "spawner must NOT be invoked for an invalid href (mode {mode:?})"
+            );
+            assert_eq!(drain_commands(&mut rx, 1).len(), 0);
+        }
+    }
+
+    // -------- Spawn failure in Always mode: UrlSpawnFailed, reason
+    //          carries the io::Error Display form but NOT the href.
+    {
+        reset(true); // recording spawner returns NotFound on call.
+        let services = empty_handle();
+        let (dispatcher, mut rx) = make_dispatcher_with_recorder(services);
+        let dispatcher = dispatcher
+            .with_url_action_mode(UrlActionMode::Always)
+            .with_url_spawner(recording_spawner);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("url_widget"), Gesture::Tap, &store, &map)
+            .expect_err("forced spawn failure must surface as UrlSpawnFailed");
+        match err {
+            DispatchError::UrlSpawnFailed { reason } => {
+                assert!(
+                    !reason.contains("example.org"),
+                    "UrlSpawnFailed.reason must NOT leak the href, got: {reason}"
+                );
+                assert!(
+                    reason.contains("test forced spawn failure")
+                        || reason.contains("not found")
+                        || reason.contains("No such"),
+                    "reason must surface the underlying io::Error Display form, got: {reason}"
+                );
+            }
+            other => panic!("expected UrlSpawnFailed, got {other:?}"),
+        }
+        assert_eq!(SPAWN_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(drain_commands(&mut rx, 1).len(), 0);
+    }
+
+    // -------- Long spawn-failure message (>256 bytes, multi-byte) — exercises
+    //          the dispatcher's UTF-8-aware truncation branch. The reason is
+    //          ≤256 bytes AND a valid UTF-8 prefix of the original message
+    //          (so no codepoint is split mid-byte).
+    {
+        url_dispatcher_modes_recorder::reset_with_long_failure();
+        let services = empty_handle();
+        let (dispatcher, mut rx) = make_dispatcher_with_recorder(services);
+        let dispatcher = dispatcher
+            .with_url_action_mode(UrlActionMode::Always)
+            .with_url_spawner(recording_spawner);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("url_widget"), Gesture::Tap, &store, &map)
+            .expect_err("long-message forced spawn failure must surface as UrlSpawnFailed");
+        match err {
+            DispatchError::UrlSpawnFailed { reason } => {
+                assert!(
+                    reason.len() <= 256,
+                    "truncated reason must be ≤256 bytes, got {}",
+                    reason.len()
+                );
+                // `reason` stores `io_err.to_string()` directly — the
+                // dispatcher does NOT prepend "failed to spawn xdg-open:"
+                // at storage time (that wrapping happens at
+                // DispatchError::Display time). The forced error message
+                // is "🟥".repeat(80); truncated to ≤256 bytes the result
+                // is some whole number of 🟥 codepoints — never a
+                // half-codepoint at the boundary.
+                assert!(
+                    reason.chars().all(|c| c == '🟥'),
+                    "every char in the truncated reason must be the 🟥 codepoint, got: {reason}"
+                );
+                // String guarantees valid UTF-8 — the assertion above
+                // would not even compile-as-iterable if the truncation
+                // had broken UTF-8.
+                assert!(
+                    !reason.contains("example.org"),
+                    "UrlSpawnFailed.reason must not leak the href"
+                );
+            }
+            other => panic!("expected UrlSpawnFailed, got {other:?}"),
+        }
+        assert_eq!(SPAWN_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(drain_commands(&mut rx, 1).len(), 0);
+    }
 }
 
-/// Documentation-only placeholder for the dispatcher-level Url + UrlActionMode
-/// integration once TASK-063b lands the wiring. Today the dispatcher returns
-/// `NotImplementedYet` (asserted by
-/// [`url_through_dispatcher_returns_not_implemented_yet`] above). The handler
-/// itself is fully tested in `tests/integration/url_action.rs` against the
-/// public `handle_url_action_with_spawner` seam: Always → spawner, Never →
-/// blocked toast, Ask → "Phase 6" toast. When TASK-063b wires the handler
-/// into `Dispatcher::dispatch`, this test should:
-///
-/// * Construct a dispatcher with a [`hanui::dashboard::profiles::UrlActionMode`]
-///   selection per scenario.
-/// * Assert each mode's observable: spawner-call count for `Always`, toast
-///   text for `Never` / `Ask`, and (in all cases) zero `OutboundCommand`
-///   frames on the WS recorder — `Url` is never a WS-bound action.
-///
-/// Until then this test stays `#[ignore]` so CI does not fail and so the
-/// follow-up ticket has a greppable handle in the test suite.
-#[ignore = "TASK-063b: dispatcher Url-handler wiring is not in this ticket; \
-            handler-level integration tests live in tests/integration/url_action.rs"]
-#[tokio::test]
-async fn url_through_dispatcher_modes() {
-    // Intentionally empty: the documented gap above explains the deferral.
+/// Coverage probe: the `Dispatcher` `Debug` impl is otherwise never
+/// invoked by tests. Format the dispatcher with `{:?}` so the impl body
+/// (notably the new `url_action_mode` and `url_spawner` fields) executes.
+#[test]
+fn dispatcher_debug_impl_executes_for_coverage() {
+    let services = empty_handle();
+    let (tx, _rx) = mpsc::channel::<OutboundCommand>(1);
+    let dispatcher = Dispatcher::with_command_tx(services, tx);
+    let s = format!("{dispatcher:?}");
+    // Sanity: the Debug output must mention the struct name and the new
+    // url-action-mode / url-spawner fields.
+    assert!(s.contains("Dispatcher"));
+    assert!(s.contains("url_action_mode"));
+    assert!(s.contains("url_spawner"));
 }
 
 // 6. None → no-op
@@ -1094,9 +1349,10 @@ async fn offline_toggle_returns_err_queue_empty_and_emits_toast() {
 }
 
 // 19. Url disconnected → Err, queue empty, toast emitted.
-//     Url action is non-idempotent (idempotency_marker) so even though the
-//     dispatcher's normal-path arm is `NotImplementedYet`, the offline branch
-//     fires first when the connection is not Live.
+//     Url action is non-idempotent (idempotency_marker) so the offline
+//     branch fires before the live-path UrlActionMode gate (TASK-075) can
+//     even consult `url_action_mode`. The offline gate is the test seam
+//     here.
 #[tokio::test]
 async fn offline_url_returns_err_queue_empty_and_emits_toast() {
     let services = empty_handle();
