@@ -669,7 +669,7 @@ views:
     );
 }
 
-/// `widgets[].options` camera variant: round-trips with `kind: camera`.
+/// `widgets[].options` camera variant: round-trips with externally-tagged form.
 #[test]
 fn field_widget_options_camera_round_trips() {
     let yaml = r#"version: 1
@@ -692,8 +692,8 @@ views:
               preferred_columns: 2
               preferred_rows: 1
             options:
-              kind: camera
-              interval_seconds: 10
+              camera:
+                interval_seconds: 10
 "#;
     let d = assert_round_trips("widget.options:camera", yaml);
     let opts = d.views[0].sections[0].widgets[0]
@@ -711,7 +711,7 @@ views:
     );
 }
 
-/// `widgets[].options` history variant: round-trips with `kind: history`.
+/// `widgets[].options` history variant: round-trips with externally-tagged form.
 #[test]
 fn field_widget_options_history_round_trips() {
     let yaml = r#"version: 1
@@ -734,8 +734,8 @@ views:
               preferred_columns: 2
               preferred_rows: 1
             options:
-              kind: history
-              window_seconds: 3600
+              history:
+                window_seconds: 3600
 "#;
     let d = assert_round_trips("widget.options:history", yaml);
     let opts = d.views[0].sections[0].widgets[0]
@@ -753,7 +753,7 @@ views:
     );
 }
 
-/// `widgets[].options` fan variant: round-trips with `kind: fan`.
+/// `widgets[].options` fan variant: round-trips with externally-tagged form.
 #[test]
 fn field_widget_options_fan_round_trips() {
     let yaml = r#"version: 1
@@ -776,12 +776,12 @@ views:
               preferred_columns: 2
               preferred_rows: 1
             options:
-              kind: fan
-              speed_count: 3
-              preset_modes:
-                - Low
-                - Medium
-                - High
+              fan:
+                speed_count: 3
+                preset_modes:
+                  - Low
+                  - Medium
+                  - High
 "#;
     let d = assert_round_trips("widget.options:fan", yaml);
     let opts = d.views[0].sections[0].widgets[0]
@@ -800,7 +800,7 @@ views:
     }
 }
 
-/// `widgets[].options` lock variant: round-trips with `kind: lock` +
+/// `widgets[].options` lock variant: round-trips with externally-tagged form +
 /// `pin_policy.code_format`.
 #[test]
 fn field_widget_options_lock_round_trips() {
@@ -824,9 +824,9 @@ views:
               preferred_columns: 2
               preferred_rows: 1
             options:
-              kind: lock
-              pin_policy:
-                code_format: "Number"
+              lock:
+                pin_policy:
+                  code_format: "Number"
 "#;
     let d = assert_round_trips("widget.options:lock", yaml);
     let opts = d.views[0].sections[0].widgets[0]
@@ -841,7 +841,7 @@ views:
     }
 }
 
-/// `widgets[].options` alarm variant: round-trips with `kind: alarm` +
+/// `widgets[].options` alarm variant: round-trips with externally-tagged form +
 /// `pin_policy.code_format`.
 #[test]
 fn field_widget_options_alarm_round_trips() {
@@ -865,9 +865,9 @@ views:
               preferred_columns: 4
               preferred_rows: 1
             options:
-              kind: alarm
-              pin_policy:
-                code_format: "Any"
+              alarm:
+                pin_policy:
+                  code_format: "Any"
 "#;
     let d = assert_round_trips("widget.options:alarm", yaml);
     let opts = d.views[0].sections[0].widgets[0]
