@@ -40,6 +40,25 @@ harness = false
 test = false
 required-features = ["bench"]
 
+# TASK-064 per-dispatch CPU micro-bench. Same shape as benches/churn.rs:
+# a tokio #[test] scenario gated on the `bench` feature so plain
+# `cargo test` never includes it. The CI-hard gate (median < 5 ms per
+# dispatch — see `docs/backlog/TASK-064.md`) runs in nightly CI only.
+[[test]]
+name = "dispatcher_bench"
+path = "benches/dispatcher.rs"
+required-features = ["bench"]
+
+# Pair the [[test]] target above with an explicit [[bench]] entry so
+# Cargo's auto-discovery does not silently produce a second target for
+# the same source path (mirrors the churn-bench pattern).
+[[bench]]
+name = "dispatcher_bench"
+path = "benches/dispatcher.rs"
+harness = false
+test = false
+required-features = ["bench"]
+
 [[test]]
 name = "soak_tests"
 path = "tests/soak_tests.rs"
