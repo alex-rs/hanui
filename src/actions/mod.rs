@@ -14,10 +14,15 @@
 
 pub mod dispatcher;
 pub mod map;
+pub mod queue;
 pub mod schema;
 pub mod timing;
 pub mod url;
 
+pub use queue::{
+    is_service_allowlisted, FlushOutcome, OfflineQueue, QueueEntry, QueueError,
+    DEFAULT_OFFLINE_QUEUE_CAPACITY, DEFAULT_QUEUE_MAX_AGE_MS,
+};
 pub use schema::{Action, ActionSpec, Idempotency};
 pub use timing::{ActionOverlapStrategy, ActionTiming, GestureConfig};
 pub use url::{handle_url_action, UrlError, UrlOutcome};
