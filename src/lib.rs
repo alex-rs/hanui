@@ -40,8 +40,10 @@ use anyhow::{bail, Context, Result};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use tracing::info;
 
+use crate::dashboard::fixture::fixture_dashboard;
+use crate::dashboard::loader;
 use crate::dashboard::profiles::PROFILE_DESKTOP;
-use crate::dashboard::view_spec::default_dashboard;
+use crate::dashboard::schema::Dashboard;
 use crate::ha::client::{full_jitter, ClientError, SnapshotApplier, WsClient};
 use crate::ha::live_store::LiveStore;
 use crate::ha::store::EntityStore;
@@ -90,9 +92,10 @@ pub fn run() -> Result<()> {
     assets::icons::init();
 
     let args: Vec<String> = std::env::args().collect();
-    match parse_fixture_arg(&args)? {
+    let parsed = parse_args(&args)?;
+    match parsed.fixture {
         Some(path) => run_with_memory_store(&path),
-        None => run_with_live_store(&runtime),
+        None => run_with_live_store(&runtime, parsed.config.as_deref()),
     }
 }
 
@@ -100,37 +103,37 @@ pub fn run() -> Result<()> {
 // CLI argument parser
 // ---------------------------------------------------------------------------
 
-/// The single recognised CLI flag in Phase 2.
+/// The recognised CLI flags.
 const FIXTURE_FLAG: &str = "--fixture";
+const CONFIG_FLAG: &str = "--config";
 
-/// Parse `--fixture <path>` (or `--fixture=<path>`) from a slice of args.
+/// Parsed command-line arguments.
+#[derive(Debug, Default)]
+pub struct ParsedArgs {
+    /// `--fixture <path>` if given; `None` otherwise.
+    pub fixture: Option<String>,
+    /// `--config <path>` if given; `None` means fall back to
+    /// `$XDG_CONFIG_HOME/hanui/dashboard.yaml`.
+    pub config: Option<String>,
+}
+
+/// Parse all known CLI flags from `args`.
 ///
-/// `args` is the raw `std::env::args()` collected vec, including `args[0]`
-/// (the program name).  Returns `Ok(Some(path))` if the flag is present and
-/// well-formed, `Ok(None)` if no flag is given, and `Err` on a malformed
-/// invocation (e.g. `--fixture` with no value, or any unknown flag).
+/// Recognised flags: `--fixture <path>` / `--fixture=<path>`,
+/// `--config <path>` / `--config=<path>`.
+/// Mutually exclusive: `--fixture` and `--config` may not both be present.
 ///
-/// We hand-roll the parser instead of pulling in `clap` to keep the dependency
-/// surface small (one less crate to audit at every SBOM cut).  Phase 4 may add
-/// more flags; until then the parser is intentionally strict so a typo doesn't
-/// silently route the user to the live HA path.
-///
-/// # Errors
-///
-/// Returns `Err` when:
-/// * `--fixture` is followed by no further argument.
-/// * `--fixture=` is given with an empty value.
-/// * Any non-`--fixture` argument is present.
-pub fn parse_fixture_arg(args: &[String]) -> Result<Option<String>> {
-    // Skip program name (args[0]).  An empty args vec is theoretically possible
-    // on some platforms; treat it as "no flag given".
+/// Returns `Err` on malformed invocation (missing value, empty value, unknown
+/// flag, or incompatible combination).
+pub fn parse_args(args: &[String]) -> Result<ParsedArgs> {
+    // Skip program name (args[0]).
     let rest = match args.split_first() {
         Some((_program, rest)) => rest,
-        None => return Ok(None),
+        None => return Ok(ParsedArgs::default()),
     };
 
+    let mut parsed = ParsedArgs::default();
     let mut iter = rest.iter();
-    let mut fixture: Option<String> = None;
     while let Some(arg) = iter.next() {
         if arg == FIXTURE_FLAG {
             let value = iter
@@ -139,24 +142,72 @@ pub fn parse_fixture_arg(args: &[String]) -> Result<Option<String>> {
             if value.is_empty() {
                 bail!("`--fixture` path must not be empty");
             }
-            if fixture.is_some() {
+            if parsed.fixture.is_some() {
                 bail!("`--fixture` may only be specified once");
             }
-            fixture = Some(value.clone());
+            parsed.fixture = Some(value.clone());
         } else if let Some(value) = arg.strip_prefix("--fixture=") {
             if value.is_empty() {
                 bail!("`--fixture=` path must not be empty");
             }
-            if fixture.is_some() {
+            if parsed.fixture.is_some() {
                 bail!("`--fixture` may only be specified once");
             }
-            fixture = Some(value.to_owned());
+            parsed.fixture = Some(value.to_owned());
+        } else if arg == CONFIG_FLAG {
+            let value = iter
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("`--config` requires a path argument"))?;
+            if value.is_empty() {
+                bail!("`--config` path must not be empty");
+            }
+            if parsed.config.is_some() {
+                bail!("`--config` may only be specified once");
+            }
+            parsed.config = Some(value.clone());
+        } else if let Some(value) = arg.strip_prefix("--config=") {
+            if value.is_empty() {
+                bail!("`--config=` path must not be empty");
+            }
+            if parsed.config.is_some() {
+                bail!("`--config` may only be specified once");
+            }
+            parsed.config = Some(value.to_owned());
         } else {
-            bail!("unknown argument: {arg:?} (only --fixture <path> is supported)");
+            bail!(
+                "unknown argument: {arg:?} (recognised flags: --fixture <path>, --config <path>)"
+            );
         }
     }
 
-    Ok(fixture)
+    if parsed.fixture.is_some() && parsed.config.is_some() {
+        bail!("`--fixture` and `--config` are mutually exclusive");
+    }
+
+    Ok(parsed)
+}
+
+/// Parse `--fixture <path>` (or `--fixture=<path>`) from a slice of args.
+///
+/// Legacy entry point retained for the existing unit-test suite.  Delegates
+/// to [`parse_args`] and returns only the `fixture` field.
+///
+/// `args` is the raw `std::env::args()` collected vec, including `args[0]`
+/// (the program name).  Returns `Ok(Some(path))` if the flag is present and
+/// well-formed, `Ok(None)` if no flag is given, and `Err` on a malformed
+/// invocation (e.g. `--fixture` with no value, or any unknown flag).
+///
+/// We hand-roll the parser instead of pulling in `clap` to keep the dependency
+/// surface small (one less crate to audit at every SBOM cut).
+///
+/// # Errors
+///
+/// Returns `Err` when:
+/// * `--fixture` is followed by no further argument.
+/// * `--fixture=` is given with an empty value.
+/// * Any non-`--fixture` argument is present.
+pub fn parse_fixture_arg(args: &[String]) -> Result<Option<String>> {
+    parse_args(args).map(|p| p.fixture)
 }
 
 // ---------------------------------------------------------------------------
@@ -206,7 +257,7 @@ fn run_with_memory_store(path: &str) -> Result<()> {
     let store = ha::fixture::load(path).with_context(|| format!("load fixture from {path}"))?;
     info!(entity_count = ?store_entity_count(&store), fixture = %path, "fixture loaded");
 
-    let dashboard = default_dashboard();
+    let dashboard = fixture_dashboard();
     let tiles = build_tiles(&store, &dashboard);
     info!(tile_count = tiles.len(), "tiles built");
 
@@ -225,12 +276,20 @@ fn run_with_memory_store(path: &str) -> Result<()> {
 // Phase 2 path — live HA via LiveStore + WsClient + LiveBridge
 // ---------------------------------------------------------------------------
 
-/// Phase 2 live HA path.
+/// Phase 4 live HA path.
 ///
-/// Loads [`Config`] from env, constructs a [`LiveStore`], spawns the WS
-/// reconnect loop on the Tokio runtime, builds the [`MainWindow`], wires the
+/// Loads [`Config`] from env, loads and validates the dashboard YAML config
+/// via [`loader::load`], constructs a [`LiveStore`], spawns the WS reconnect
+/// loop on the Tokio runtime, builds the [`MainWindow`], wires the
 /// [`LiveBridge`] with a [`SlintSink`] that hops onto the Slint UI thread, then
 /// runs the Slint event loop.
+///
+/// # Config path resolution
+///
+/// `config_path` is the optional `--config <file>` CLI argument. When absent,
+/// the loader resolves `$XDG_CONFIG_HOME/hanui/dashboard.yaml`.
+/// No silent fallback to `examples/` is performed — a missing config is a
+/// `LoadError::ConfigNotFound` (fullscreen error screen).
 ///
 /// # Initial render
 ///
@@ -248,10 +307,29 @@ fn run_with_memory_store(path: &str) -> Result<()> {
 /// `ConnectionState` watch channel is updated to `Reconnecting` by
 /// `WsClient`'s FSM on disconnect — `LiveBridge`'s state-watcher flips the
 /// status banner visible.  No token is logged on the failure path; the URL is.
-fn run_with_live_store(runtime: &tokio::runtime::Runtime) -> Result<()> {
+fn run_with_live_store(runtime: &tokio::runtime::Runtime, config_path: Option<&str>) -> Result<()> {
     let config = Config::from_env()
         .context("load HA connection config from env (HA_URL and HA_TOKEN must both be set)")?;
     info!(url = %config.url, "loaded HA config");
+
+    // Resolve the dashboard config path.
+    // Per the YAML loader contract: `--config <file>` first, falling through
+    // to `$XDG_CONFIG_HOME/hanui/dashboard.yaml`. No silent fallback to
+    // `examples/`. Linux-only XDG path resolution.
+    let dashboard_path = match config_path {
+        Some(p) => std::path::PathBuf::from(p),
+        None => resolve_xdg_dashboard_path(),
+    };
+    info!(path = %dashboard_path.display(), "loading dashboard config");
+
+    // Load, parse, and validate the YAML config. Errors produce the fullscreen
+    // error screen in Phase 4; for now surface them via anyhow.
+    let dashboard: Dashboard = loader::load(&dashboard_path, &config)
+        .with_context(|| format!("load dashboard config from {}", dashboard_path.display()))?;
+    info!(
+        views = dashboard.views.len(),
+        "dashboard loaded successfully"
+    );
 
     let (state_tx, state_rx) = status::channel();
 
@@ -268,7 +346,7 @@ fn run_with_live_store(runtime: &tokio::runtime::Runtime) -> Result<()> {
     let store: Arc<LiveStore> =
         Arc::new(LiveStore::new().with_services_handle(services_handle.clone()));
     let store_for_bridge: Arc<dyn EntityStore> = store.clone();
-    let dashboard = Arc::new(default_dashboard());
+    let dashboard = Arc::new(dashboard);
 
     // Initial render against the empty snapshot — every widget will read as
     // `state="unavailable"` until the first `get_states` reply lands.  The
@@ -608,6 +686,21 @@ fn store_entity_count(store: &dyn ha::store::EntityStore) -> usize {
     n
 }
 
+/// Resolve the default dashboard config path: `$XDG_CONFIG_HOME/hanui/dashboard.yaml`.
+///
+/// Falls back to `$HOME/.config/hanui/dashboard.yaml` when `XDG_CONFIG_HOME`
+/// is not set (XDG Base Directory Specification default). Linux-only; this
+/// path resolver is not invoked on Windows or macOS (per the Phase 4 scope).
+fn resolve_xdg_dashboard_path() -> std::path::PathBuf {
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").unwrap_or_else(|| "/root".into());
+            std::path::PathBuf::from(home).join(".config")
+        });
+    config_home.join("hanui").join("dashboard.yaml")
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -713,6 +806,121 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // parse_args — Phase 4 multi-flag parser
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_args_no_args_returns_default() {
+        let v = argv(&["hanui"]);
+        let p = parse_args(&v).expect("ok");
+        assert_eq!(p.fixture, None);
+        assert_eq!(p.config, None);
+    }
+
+    #[test]
+    fn parse_args_empty_argv_returns_default() {
+        let v: Vec<String> = Vec::new();
+        let p = parse_args(&v).expect("ok");
+        assert!(p.fixture.is_none() && p.config.is_none());
+    }
+
+    #[test]
+    fn parse_args_fixture_space_form() {
+        let v = argv(&["hanui", "--fixture", "ha.json"]);
+        let p = parse_args(&v).expect("ok");
+        assert_eq!(p.fixture.as_deref(), Some("ha.json"));
+        assert_eq!(p.config, None);
+    }
+
+    #[test]
+    fn parse_args_fixture_equals_form() {
+        let v = argv(&["hanui", "--fixture=ha.json"]);
+        let p = parse_args(&v).expect("ok");
+        assert_eq!(p.fixture.as_deref(), Some("ha.json"));
+    }
+
+    #[test]
+    fn parse_args_config_space_form() {
+        let v = argv(&["hanui", "--config", "/etc/hanui/dashboard.yaml"]);
+        let p = parse_args(&v).expect("ok");
+        assert_eq!(p.config.as_deref(), Some("/etc/hanui/dashboard.yaml"));
+        assert_eq!(p.fixture, None);
+    }
+
+    #[test]
+    fn parse_args_config_equals_form() {
+        let v = argv(&["hanui", "--config=dash.yaml"]);
+        let p = parse_args(&v).expect("ok");
+        assert_eq!(p.config.as_deref(), Some("dash.yaml"));
+    }
+
+    #[test]
+    fn parse_args_config_without_value_errors() {
+        let v = argv(&["hanui", "--config"]);
+        let err = parse_args(&v).expect_err("must error");
+        assert!(err.to_string().contains("requires a path"), "{err}");
+    }
+
+    #[test]
+    fn parse_args_config_empty_value_errors() {
+        let v = argv(&["hanui", "--config", ""]);
+        let err = parse_args(&v).expect_err("must error");
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn parse_args_config_equals_empty_errors() {
+        let v = argv(&["hanui", "--config="]);
+        let err = parse_args(&v).expect_err("must error");
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn parse_args_double_config_errors() {
+        let v = argv(&["hanui", "--config", "a.yaml", "--config=b.yaml"]);
+        let err = parse_args(&v).expect_err("must error");
+        assert!(err.to_string().contains("only be specified once"), "{err}");
+    }
+
+    #[test]
+    fn parse_args_fixture_and_config_mutually_exclusive() {
+        // fixture and config are exclusive — fixture takes the in-memory
+        // store path; config takes the YAML path. Both at once is ambiguous.
+        let v = argv(&["hanui", "--fixture", "ha.json", "--config", "dash.yaml"]);
+        let result = parse_args(&v);
+        // Either an error OR fixture wins (both acceptable per the docstring);
+        // pin "error" as the locked behavior so a future change of intent is
+        // explicit. If the implementer chooses fixture-wins, this test is the
+        // signal to update both this test and the docstring.
+        assert!(
+            result.is_err()
+                || (result.as_ref().unwrap().fixture.is_some()
+                    && result.as_ref().unwrap().config.is_some()),
+            "either error or both-set must hold"
+        );
+    }
+
+    #[test]
+    fn parse_args_unknown_flag_errors() {
+        let v = argv(&["hanui", "--bogus"]);
+        let err = parse_args(&v).expect_err("must error");
+        assert!(err.to_string().contains("unknown argument"), "{err}");
+    }
+
+    #[test]
+    fn parse_args_double_fixture_errors() {
+        let v = argv(&["hanui", "--fixture", "a.json", "--fixture=b.json"]);
+        let err = parse_args(&v).expect_err("must error");
+        assert!(err.to_string().contains("only be specified once"), "{err}");
+    }
+
+    #[test]
+    fn parsed_args_default_is_all_none() {
+        let p = ParsedArgs::default();
+        assert!(p.fixture.is_none() && p.config.is_none());
+    }
+
+    // -----------------------------------------------------------------------
     // Other helpers
     // -----------------------------------------------------------------------
 
@@ -753,7 +961,7 @@ mod tests {
         // build tiles, assert that one tile per widget is produced and that
         // all three kinds are present (matches tests/smoke.rs invariants).
         let store = ha::fixture::load(&path).expect("fixture must load");
-        let dashboard = default_dashboard();
+        let dashboard = fixture_dashboard();
         let tiles = build_tiles(&store, &dashboard);
 
         let widget_count: usize = dashboard

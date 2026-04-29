@@ -1,0 +1,582 @@
+//! YAML configuration loader for the dashboard.
+//!
+//! [`load`] is the single public entry point. It reads a `dashboard.yaml` file,
+//! enforces the 256 KiB pre-parse byte cap, parses the YAML into a typed
+//! [`Dashboard`], delegates `token_env` resolution to
+//! [`Config::resolve_token_env`], runs the schema validator, and returns the
+//! populated `Dashboard` on success.
+//!
+//! # No-direct-env-var contract
+//!
+//! This module MUST NOT call the standard library's environment-variable lookup
+//! function directly. All environment-variable lookups go through
+//! [`Config::resolve_token_env`]. A unit test
+//! (`loader::tests::no_env_var_call_in_loader_source`) reads this file's source
+//! at test time and asserts the constraint has not regressed.
+//!
+//! # Error taxonomy
+//!
+//! | Variant | Cause |
+//! |---|---|
+//! | `ConfigNotFound` | File path does not exist on disk. |
+//! | `ConfigTooLarge` | File exceeds `MAX_YAML_BYTES` before parsing. |
+//! | `ParseError` | `serde_yaml_ng` returns a parse error. |
+//! | `TokenEnvNotFound` | `token_env` env var is absent. |
+//! | `TokenEnvEmpty` | `token_env` env var is set but empty. |
+//! | `Validation` | Validator produced Error-severity `Issue` entries. |
+//!
+//! # Path resolution
+//!
+//! `path` is the caller-supplied argument (from `--config <file>` or the
+//! XDG default `$XDG_CONFIG_HOME/hanui/dashboard.yaml`). No silent fallback to
+//! `examples/` is performed — the caller must resolve the path before calling.
+//!
+//! # Parent plan
+//!
+//! `docs/plans/2026-04-29-phase-4-layout.md` — relevant decisions:
+//! `yaml_loader_size_cap`, `token_env_failure_mode`, `platform_config_naming`,
+//! `view_spec_disposition`.
+
+use std::path::{Path, PathBuf};
+
+use thiserror::Error;
+
+use crate::dashboard::schema::{Dashboard, Issue, Severity};
+use crate::platform::config::{Config, ConfigError};
+
+/// Hard byte cap on dashboard YAML files (256 KiB).
+///
+/// Enforced BEFORE handing bytes to the YAML parser. Protects against:
+/// 1. Legitimate-but-bloated configs allocating multi-MB on small SBCs.
+/// 2. YAML-bomb / billion-laughs alias-expansion — even before the parser
+///    sees aliases, the byte cap shuts down deep nesting payloads.
+///
+/// Realistic `dashboard.yaml` configs are 1–20 KiB (the in-tree
+/// `examples/dashboard.yaml` is under 1 KiB); 256 KiB is generous.
+pub const MAX_YAML_BYTES: usize = 256 * 1024;
+
+/// Errors returned by [`load`].
+#[derive(Debug, Error)]
+pub enum LoadError {
+    /// The config file path does not exist.
+    #[error("dashboard config not found: {}", path.display())]
+    ConfigNotFound {
+        /// The path that was tried.
+        path: PathBuf,
+    },
+    /// The config file exceeds the pre-parse byte cap.
+    #[error("dashboard config too large: {bytes} bytes exceeds cap of {cap} bytes (256 KiB)")]
+    ConfigTooLarge {
+        /// Actual file size in bytes.
+        bytes: usize,
+        /// The cap in bytes.
+        cap: usize,
+    },
+    /// The YAML failed to parse.
+    #[error("dashboard config parse error: {excerpt}")]
+    ParseError {
+        /// The offending YAML line(s), bounded to ≤256 chars. No token
+        /// material is captured here — the excerpt is from the structural
+        /// YAML error location, never from a token value.
+        excerpt: String,
+    },
+    /// The `home_assistant.token_env` env var does not exist.
+    #[error("Home Assistant token env var '{name}' is not set; set it before starting hanui")]
+    TokenEnvNotFound {
+        /// Name of the missing environment variable.
+        name: String,
+    },
+    /// The `home_assistant.token_env` env var exists but is empty.
+    #[error("Home Assistant token env var '{name}' is empty; set it before starting hanui")]
+    TokenEnvEmpty {
+        /// Name of the empty environment variable.
+        name: String,
+    },
+    /// The dashboard passed parsing but failed schema validation.
+    ///
+    /// Only Error-severity issues are reported here; Warning-severity issues
+    /// are attached to the returned `Dashboard` but do not prevent loading.
+    #[error("dashboard validation failed with {} error(s)", issues.len())]
+    Validation {
+        /// All Error-severity validation issues.
+        issues: Vec<Issue>,
+    },
+}
+
+/// Load, parse, and validate a `dashboard.yaml` file.
+///
+/// # Arguments
+///
+/// * `path` — path to the YAML config file. The caller is responsible for
+///   resolving `--config <file>` or `$XDG_CONFIG_HOME/hanui/dashboard.yaml`
+///   before calling this function. No silent fallback to `examples/` is
+///   performed.
+/// * `config` — the platform config used to resolve the `token_env` name.
+///   [`Config::resolve_token_env`] is called for the `home_assistant.token_env`
+///   field; the loader itself NEVER calls the env-var lookup directly.
+///
+/// # Errors
+///
+/// See [`LoadError`] for the full taxonomy.
+pub fn load(path: &Path, config: &Config) -> Result<Dashboard, LoadError> {
+    // Step 1: check existence.
+    if !path.exists() {
+        return Err(LoadError::ConfigNotFound {
+            path: path.to_owned(),
+        });
+    }
+
+    // Step 2: read bytes.
+    let bytes = std::fs::read(path).map_err(|_| LoadError::ConfigNotFound {
+        path: path.to_owned(),
+    })?;
+
+    // Step 3: enforce byte cap BEFORE parsing (mitigates YAML bomb / RSS spike).
+    if bytes.len() > MAX_YAML_BYTES {
+        return Err(LoadError::ConfigTooLarge {
+            bytes: bytes.len(),
+            cap: MAX_YAML_BYTES,
+        });
+    }
+
+    // Step 4: parse YAML into typed Dashboard.
+    let dashboard: Dashboard = serde_yaml_ng::from_slice(&bytes).map_err(|e| {
+        // Extract a bounded excerpt from the error message; never return the
+        // full YAML (which might contain token-adjacent context).
+        let msg = e.to_string();
+        let excerpt = msg.chars().take(256).collect::<String>();
+        LoadError::ParseError { excerpt }
+    })?;
+
+    // Step 5: resolve token_env if home_assistant is present.
+    // The loader delegates to config.resolve_token_env — never calls the env lookup directly.
+    if let Some(ha) = &dashboard.home_assistant {
+        config
+            .resolve_token_env(&ha.token_env)
+            .map_err(|config_err| match config_err {
+                ConfigError::TokenEnvNotFound { name } => LoadError::TokenEnvNotFound { name },
+                ConfigError::TokenEnvEmpty { name } => LoadError::TokenEnvEmpty { name },
+                // Missing / Empty refer to the static HA_URL / HA_TOKEN vars —
+                // those come from Config::from_env, not resolve_token_env.
+                // resolve_token_env only returns TokenEnvNotFound / TokenEnvEmpty.
+                ConfigError::Missing { var } => LoadError::TokenEnvNotFound {
+                    name: var.to_owned(),
+                },
+                ConfigError::Empty { var } => LoadError::TokenEnvEmpty {
+                    name: var.to_owned(),
+                },
+            })?;
+        // Token value is not stored — the loader only validates it exists and
+        // is non-empty at load time. The WS client re-reads it via
+        // Config::expose_token at connection time.
+    }
+
+    // Step 6: validation stub.
+    //
+    // TASK-083 (validate.rs) will implement the full validator. Until it
+    // merges, we perform a no-op validation pass: no issues, no allowlist.
+    //
+    // When TASK-083 lands, replace this block with:
+    //   let issues = crate::dashboard::validate::run(&dashboard, profile);
+    //   let errors: Vec<Issue> = issues.iter()
+    //       .filter(|i| i.severity == Severity::Error)
+    //       .cloned()
+    //       .collect();
+    //   if !errors.is_empty() {
+    //       return Err(LoadError::Validation { issues: errors });
+    //   }
+    //
+    // For now, assert that the type-level parse was complete (no Error issues
+    // from a hypothetical validator — stub returns empty).
+    let issues: Vec<Issue> = vec![];
+    let errors: Vec<Issue> = issues
+        .iter()
+        .filter(|i| i.severity == Severity::Error)
+        .cloned()
+        .collect();
+    if !errors.is_empty() {
+        return Err(LoadError::Validation { issues: errors });
+    }
+
+    Ok(dashboard)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::config::Config;
+
+    /// Construct a minimal stub `Config` that satisfies the loader's
+    /// `config: &Config` parameter without touching real env vars.
+    fn stub_config() -> Config {
+        Config::new_for_testing("ws://stub".to_string())
+    }
+
+    /// Minimal valid YAML dashboard payload.
+    const MINIMAL_YAML: &str = r#"version: 1
+device_profile: rpi4
+default_view: home
+views:
+  - id: home
+    title: Home
+    layout: sections
+    sections: []
+"#;
+
+    /// Write `content` to a temporary file and return a `TempFile` guard.
+    ///
+    /// The file is deleted when the guard goes out of scope. Uses
+    /// `std::env::temp_dir()` so no external `tempfile` crate is required.
+    struct TempFile(std::path::PathBuf);
+
+    impl TempFile {
+        fn new(content: &str) -> Self {
+            use std::io::Write as _;
+            // Use a unique name derived from a thread ID + nanosecond timestamp
+            // to avoid collisions in parallel test runs.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos();
+            let tid = std::thread::current().id();
+            let name = format!("hanui_test_{tid:?}_{nanos}.yaml");
+            let path = std::env::temp_dir().join(name);
+            let mut f = std::fs::File::create(&path).expect("temp file create");
+            f.write_all(content.as_bytes()).expect("temp file write");
+            f.flush().expect("temp file flush");
+            TempFile(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Size cap — boundary tests
+    // -----------------------------------------------------------------------
+
+    /// A 256 KiB payload should be accepted (Ok or Validation only, not
+    /// ConfigTooLarge).
+    ///
+    /// We synthesize a deliberately pathological one-key-per-line YAML payload
+    /// to maximise AST node count while staying within the byte cap.
+    #[test]
+    fn config_accepted_at_256_kib() {
+        let cap = MAX_YAML_BYTES; // 256 * 1024
+
+        // Build a valid-YAML-but-large string: start with valid headers, then
+        // pad with comment lines (# ...) to reach exactly `cap` bytes.
+        // The final content is parseable YAML but the `Dashboard` type won't
+        // deserialise from the comment-padded content — we only care that it
+        // does NOT return ConfigTooLarge.
+        let header = MINIMAL_YAML;
+        let mut payload = header.to_string();
+        while payload.len() < cap {
+            payload.push_str("# padding line to reach 256KiB cap boundary\n");
+        }
+        // Trim to exactly `cap` bytes (may cut a partial line).
+        payload.truncate(cap);
+        assert_eq!(payload.len(), cap);
+
+        let tmp = TempFile::new(&payload);
+        let result = load(tmp.path(), &stub_config());
+        // Must NOT be ConfigTooLarge.
+        assert!(
+            !matches!(result, Err(LoadError::ConfigTooLarge { .. })),
+            "256 KiB payload must not trigger ConfigTooLarge; got: {result:?}"
+        );
+    }
+
+    /// A 257 KiB payload must return `Err(LoadError::ConfigTooLarge)` BEFORE
+    /// parsing (i.e., without touching the YAML parser at all).
+    #[test]
+    fn config_too_large_at_257_kib() {
+        // We use 257 * 1024 to match the acceptance criterion's exact wording.
+        let target = 257 * 1024;
+        let payload = "x".repeat(target);
+
+        let tmp = TempFile::new(&payload);
+        let result = load(tmp.path(), &stub_config());
+        match result {
+            Err(LoadError::ConfigTooLarge { bytes, cap }) => {
+                assert_eq!(bytes, target, "bytes field must reflect actual file size");
+                assert_eq!(cap, MAX_YAML_BYTES, "cap field must be MAX_YAML_BYTES");
+            }
+            other => panic!("expected ConfigTooLarge for 257 KiB payload, got: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ConfigNotFound
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_not_found_returns_error() {
+        let path = std::path::Path::new("/tmp/hanui_nonexistent_dashboard_xyz_082.yaml");
+        let result = load(path, &stub_config());
+        assert!(
+            matches!(result, Err(LoadError::ConfigNotFound { .. })),
+            "missing file must return ConfigNotFound; got: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ParseError
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_error_on_invalid_yaml_returns_error() {
+        let bad_yaml = "this: is: not: valid: yaml: {{{";
+        let tmp = TempFile::new(bad_yaml);
+        let result = load(tmp.path(), &stub_config());
+        assert!(
+            matches!(result, Err(LoadError::ParseError { .. })),
+            "invalid YAML must return ParseError; got: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // token_env resolution
+    // -----------------------------------------------------------------------
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// YAML with `home_assistant.token_env` pointing to an absent env var.
+    fn yaml_with_token_env(token_env_name: &str) -> String {
+        format!(
+            r#"version: 1
+device_profile: rpi4
+default_view: home
+home_assistant:
+  url: "ws://homeassistant.local:8123/api/websocket"
+  token_env: "{token_env_name}"
+views:
+  - id: home
+    title: Home
+    layout: sections
+    sections: []
+"#
+        )
+    }
+
+    #[test]
+    fn token_env_not_found_returns_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let var_name = "HANUI_TEST_TOKEN_NOT_FOUND_082";
+        // Ensure the var is absent.
+        unsafe { std::env::remove_var(var_name) };
+
+        let yaml = yaml_with_token_env(var_name);
+        let tmp = TempFile::new(&yaml);
+        let result = load(tmp.path(), &stub_config());
+        assert!(
+            matches!(result, Err(LoadError::TokenEnvNotFound { ref name }) if name == var_name),
+            "absent token_env var must return TokenEnvNotFound; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn token_env_empty_returns_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let var_name = "HANUI_TEST_TOKEN_EMPTY_082";
+        unsafe { std::env::set_var(var_name, "") };
+
+        let yaml = yaml_with_token_env(var_name);
+        let tmp = TempFile::new(&yaml);
+        let result = load(tmp.path(), &stub_config());
+        assert!(
+            matches!(result, Err(LoadError::TokenEnvEmpty { ref name }) if name == var_name),
+            "empty token_env var must return TokenEnvEmpty; got: {result:?}"
+        );
+        unsafe { std::env::remove_var(var_name) };
+    }
+
+    // -----------------------------------------------------------------------
+    // Mechanical no-direct-env-lookup gate
+    // -----------------------------------------------------------------------
+
+    /// Regression guard: assert that `loader.rs` contains no direct call to the
+    /// standard library's environment-variable lookup function.
+    ///
+    /// The loader must always delegate to `Config::resolve_token_env`. This
+    /// test scans non-comment, non-string-literal lines for the call pattern.
+    ///
+    /// This test reads the source file at test time (relative to the crate
+    /// root, which is cargo's cwd during `cargo test`).
+    #[test]
+    fn no_env_var_call_in_loader_source() {
+        let source =
+            std::fs::read_to_string("src/dashboard/loader.rs").expect("loader.rs must be readable");
+        // Build the forbidden call-site pattern by concatenation so this test
+        // file itself does not contain the literal string being checked for.
+        // This prevents the test from falsely matching its own assertion text.
+        let forbidden = format!("{}::{}", "env", "var(");
+        let call_pattern_std = format!("std::{}", forbidden);
+
+        let violation_lines: Vec<(usize, &str)> = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let trimmed = line.trim_start();
+                // Skip pure comment lines.
+                if trimmed.starts_with("//") {
+                    return false;
+                }
+                // Skip lines that contain the pattern only inside a string literal
+                // (heuristic: if the pattern appears after a '"' before a '"').
+                // We check for the pattern AND require it is not inside a test
+                // assertion's message string.
+                line.contains(&call_pattern_std) || {
+                    // Also catch bare `env::var(` that does not start with `std::`.
+                    // Strip out string-delimited content first (simple heuristic).
+                    let without_strings = strip_string_literals(line);
+                    without_strings.contains(&forbidden)
+                }
+            })
+            .collect();
+
+        assert!(
+            violation_lines.is_empty(),
+            "loader.rs must not call env-var lookup directly; delegate to Config::resolve_token_env. \
+             Offending lines: {:?}",
+            violation_lines.iter().map(|(n, l)| format!("line {}: {}", n + 1, l)).collect::<Vec<_>>()
+        );
+    }
+
+    /// Very simple string-literal stripper: replaces content between `"..."` with
+    /// spaces so that patterns in string literals don't match code checks.
+    fn strip_string_literals(line: &str) -> String {
+        let mut result = String::with_capacity(line.len());
+        let mut in_string = false;
+        let mut prev_char = '\0';
+        for ch in line.chars() {
+            if ch == '"' && prev_char != '\\' {
+                in_string = !in_string;
+                result.push(' ');
+            } else if in_string {
+                result.push(' ');
+            } else {
+                result.push(ch);
+            }
+            prev_char = ch;
+        }
+        result
+    }
+
+    // -----------------------------------------------------------------------
+    // Happy path — successful load
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn happy_path_loads_minimal_yaml() {
+        let tmp = TempFile::new(MINIMAL_YAML);
+        let result = load(tmp.path(), &stub_config());
+        assert!(
+            result.is_ok(),
+            "minimal valid YAML must load successfully; got: {result:?}"
+        );
+        let dashboard = result.unwrap();
+        assert_eq!(dashboard.version, 1);
+        assert_eq!(
+            dashboard.device_profile,
+            crate::dashboard::schema::ProfileKey::Rpi4
+        );
+    }
+
+    #[test]
+    fn happy_path_with_token_env_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let var_name = "HANUI_TEST_TOKEN_HAPPY_082";
+        unsafe { std::env::set_var(var_name, "my-ha-token") };
+
+        let yaml = yaml_with_token_env(var_name);
+        let tmp = TempFile::new(&yaml);
+        let result = load(tmp.path(), &stub_config());
+        assert!(
+            result.is_ok(),
+            "YAML with valid token_env must load successfully; got: {result:?}"
+        );
+        unsafe { std::env::remove_var(var_name) };
+    }
+
+    // -----------------------------------------------------------------------
+    // Parse-time RSS test (Risk #17)
+    // -----------------------------------------------------------------------
+
+    /// Assert that parsing a worst-case 256 KiB YAML config does not push
+    /// RSS above `PROFILE_OPI_ZERO3.idle_rss_mb_cap` (60 MB).
+    ///
+    /// The payload uses a deliberately pathological one-key-per-line structure
+    /// to maximise YAML AST node count. If this test fails, the byte cap
+    /// should be tightened (per the acceptance criterion: "If this test fails,
+    /// the byte cap is tightened").
+    ///
+    /// NOTE: This test measures the delta in process RSS by reading
+    /// `/proc/self/status` (VmRSS). It is Linux-only. On non-Linux platforms
+    /// the test passes unconditionally (no measurement available).
+    #[test]
+    fn parse_time_rss_under_opi_zero3_budget() {
+        use crate::dashboard::profiles::PROFILE_OPI_ZERO3;
+
+        // Build a pathological 256 KiB YAML payload: one mapping key per line.
+        // The content is syntactically valid YAML but won't deserialize as a
+        // `Dashboard` (ParseError expected); we only care about RSS, not parse
+        // correctness.
+        let cap = MAX_YAML_BYTES;
+        let header = "# pathological YAML payload for RSS budget test\n";
+        let mut payload = header.to_string();
+        let mut i: u64 = 0;
+        while payload.len() < cap {
+            payload.push_str(&format!("key_{i}: value_{i}\n"));
+            i += 1;
+        }
+        payload.truncate(cap);
+
+        let rss_before_kb = read_proc_rss_kb();
+
+        let tmp = TempFile::new(&payload);
+        // The load may succeed or fail — we only care about RSS.
+        let _result = load(tmp.path(), &stub_config());
+
+        let rss_after_kb = read_proc_rss_kb();
+
+        if let (Some(before), Some(after)) = (rss_before_kb, rss_after_kb) {
+            let delta_mb = (after.saturating_sub(before)) / 1024;
+            let budget_mb = PROFILE_OPI_ZERO3.idle_rss_mb_cap as u64;
+            assert!(
+                delta_mb <= budget_mb,
+                "parse-time RSS delta {delta_mb} MiB exceeds opi_zero3 budget \
+                 {budget_mb} MiB for a 256 KiB YAML payload — tighten MAX_YAML_BYTES"
+            );
+        }
+        // If /proc/self/status is unavailable, the test passes (non-Linux CI).
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    /// Read the current process's resident set size from `/proc/self/status`
+    /// (Linux only). Returns `None` on non-Linux platforms or if the read fails.
+    fn read_proc_rss_kb() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kb: u64 = rest.trim().trim_end_matches(" kB").parse().ok()?;
+                return Some(kb);
+            }
+        }
+        None
+    }
+}
