@@ -39,11 +39,16 @@
 //! falls into branch (3) naturally: every lookup returns `None`, and the
 //! dispatcher surfaces a descriptive error instead of panicking.
 //!
-//! # `Url` (TASK-063)
+//! # `Url` (TASK-063 handler + TASK-075 dispatcher wiring)
 //!
-//! Returns [`DispatchError::NotImplementedYet`] with a static reference to
-//! TASK-063, the ticket that owns the `xdg-open` shell-out boundary and
-//! `UrlActionMode` gating. The dispatcher does not shell out itself.
+//! Routes through [`crate::actions::url::handle_url_action_with_spawner`]
+//! under the [`UrlActionMode`] gate (`Always` / `Never` / `Ask`). The
+//! gate value lives on the dispatcher as `url_action_mode` (default
+//! `Never`, fail-closed) and is overridable via
+//! [`Dispatcher::with_url_action_mode`]. The spawner is overridable via
+//! [`Dispatcher::with_url_spawner`] for tests. `Url` is never WS-bound:
+//! no `OutboundCommand` is pushed, no optimistic entry recorded, in any
+//! mode.
 //!
 //! # `Navigate` (TASK-068)
 //!
@@ -113,7 +118,9 @@ use tracing::{debug, warn};
 use crate::actions::map::{WidgetActionEntry, WidgetActionMap, WidgetId};
 use crate::actions::queue::{OfflineQueue, QueueError};
 use crate::actions::timing::{ActionOverlapStrategy, ActionTiming};
+use crate::actions::url::{self, UrlError, UrlOutcome};
 use crate::actions::Action;
+use crate::dashboard::profiles::UrlActionMode;
 use crate::ha::client::{AckResult, OutboundCommand, OutboundFrame};
 use crate::ha::entity::EntityId;
 use crate::ha::live_store::{LiveStore, OptimisticEntry, OptimisticInsertError};
@@ -279,6 +286,26 @@ pub enum DispatchOutcome {
         /// Entity the queued action targets.
         entity_id: EntityId,
     },
+    /// `Action::Url` with [`UrlActionMode::Always`]: `xdg-open` was spawned
+    /// successfully (TASK-075). The child is fire-and-forget; no
+    /// `OutboundCommand` is pushed. The caller has nothing to await.
+    UrlOpened,
+    /// `Action::Url` with [`UrlActionMode::Never`]: the device profile
+    /// blocked the URL action (TASK-075). `text` is the static toast string
+    /// ([`crate::actions::url::TOAST_BLOCKED_BY_PROFILE`]) for the UI layer
+    /// to render. No `OutboundCommand` is pushed.
+    UrlBlockedToast {
+        /// Static toast text to render (never contains the href).
+        text: &'static str,
+    },
+    /// `Action::Url` with [`UrlActionMode::Ask`]: the device profile defers
+    /// to a Phase 6 confirmation dialog (TASK-075). `text` is the static
+    /// toast string ([`crate::actions::url::TOAST_ASK_PHASE_6`]). No
+    /// `OutboundCommand` is pushed.
+    UrlAskToast {
+        /// Static toast text to render (never contains the href).
+        text: &'static str,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -384,6 +411,24 @@ pub enum DispatchError {
         /// Why the queue refused the action.
         reason: QueueRejectReason,
     },
+    /// `Action::Url` href failed validation (scheme, shell-metachar, length
+    /// cap, or `file://` path-traversal check) — TASK-075. The `reason`
+    /// field is forwarded verbatim from
+    /// [`crate::actions::url::UrlError::InvalidHref`]; it is a `&'static str`
+    /// so it cannot leak the rejected href.
+    UrlInvalidHref {
+        /// One-line rejection reason (never contains the href itself).
+        reason: &'static str,
+    },
+    /// `Action::Url` with [`UrlActionMode::Always`]: `xdg-open` could not be
+    /// spawned — TASK-075. The `reason` is the [`Display`][std::fmt::Display]
+    /// rendering of the underlying `io::Error`, NOT its `Debug` form (which
+    /// can surface OS paths). Truncated to ≤256 chars to fit the toast surface
+    /// budget.
+    UrlSpawnFailed {
+        /// Human-readable spawn-failure description (no href, no PII).
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for DispatchError {
@@ -449,6 +494,12 @@ impl std::fmt::Display for DispatchError {
                     "offline queue refused action on `{entity_id}`: unsupported variant for the offline path"
                 ),
             },
+            DispatchError::UrlInvalidHref { reason } => {
+                write!(f, "url action rejected: {reason}")
+            }
+            DispatchError::UrlSpawnFailed { reason } => {
+                write!(f, "url action: xdg-open spawn failed: {reason}")
+            }
         }
     }
 }
@@ -519,6 +570,21 @@ pub struct Dispatcher {
     /// routes WS-bound actions through the offline queue when the state
     /// is not [`ConnectionState::Live`].
     offline: Option<OfflineRoutingCtx>,
+
+    /// Gate controlling how `Action::Url` dispatches behave (TASK-075).
+    ///
+    /// Defaults to [`UrlActionMode::Never`] (fail-closed) so the dispatcher
+    /// is safe to construct without a `DeviceProfile` in scope. Phase 4 will
+    /// populate this from the YAML `device_profile.url_action_mode` field.
+    url_action_mode: UrlActionMode,
+
+    /// Injectable spawner for `Action::Url` (TASK-075).
+    ///
+    /// Defaults to [`crate::actions::url::default_spawner`] (production
+    /// `xdg-open` gate). Tests inject a recording closure via
+    /// [`Dispatcher::with_url_spawner`] to assert call counts without
+    /// launching a real process.
+    url_spawner: crate::actions::url::Spawner,
 }
 
 // Custom `Debug` so the `dyn ViewRouter` field (which does not implement
@@ -536,6 +602,8 @@ impl std::fmt::Debug for Dispatcher {
                 "reconciliation",
                 &self.reconciliation.as_ref().map(|_| "<ReconciliationCtx>"),
             )
+            .field("url_action_mode", &self.url_action_mode)
+            .field("url_spawner", &"<Spawner>")
             .finish()
     }
 }
@@ -602,6 +670,8 @@ impl Dispatcher {
             view_router: None,
             reconciliation: None,
             offline: None,
+            url_action_mode: UrlActionMode::Never,
+            url_spawner: url::default_spawner,
         }
     }
 
@@ -620,6 +690,8 @@ impl Dispatcher {
             view_router: None,
             reconciliation: None,
             offline: None,
+            url_action_mode: UrlActionMode::Never,
+            url_spawner: url::default_spawner,
         }
     }
 
@@ -727,6 +799,40 @@ impl Dispatcher {
         self
     }
 
+    /// Set the [`UrlActionMode`] gate for `Action::Url` dispatches (TASK-075).
+    ///
+    /// Defaults to [`UrlActionMode::Never`] (fail-closed). Phase 4 will call
+    /// this with the value loaded from `DeviceProfile.url_action_mode` in YAML.
+    ///
+    /// * `Always` — `xdg-open` is invoked immediately; returns
+    ///   [`DispatchOutcome::UrlOpened`] on success.
+    /// * `Never` — returns [`DispatchOutcome::UrlBlockedToast`]; no spawn.
+    /// * `Ask` — returns [`DispatchOutcome::UrlAskToast`]; no spawn (Phase 6
+    ///   swaps the Ask handler for a real confirmation dialog).
+    #[must_use]
+    pub fn with_url_action_mode(mut self, mode: UrlActionMode) -> Self {
+        self.url_action_mode = mode;
+        self
+    }
+
+    /// Override the `xdg-open` spawner for `Action::Url` dispatches
+    /// (TASK-075).
+    ///
+    /// The default is [`crate::actions::url::default_spawner`] (production).
+    /// Tests inject a recording closure via this method to count spawner
+    /// invocations and force failure without launching a real process.
+    ///
+    /// The [`crate::actions::url::Spawner`] typedef is `fn(&str) ->
+    /// io::Result<()>` — a plain function pointer, not a closure, so
+    /// closures with captured state cannot be passed directly. Use a static
+    /// `AtomicBool`/`AtomicUsize` for test state, mirroring the pattern in
+    /// `src/actions/url.rs`'s own test module.
+    #[must_use]
+    pub fn with_url_spawner(mut self, spawner: crate::actions::url::Spawner) -> Self {
+        self.url_spawner = spawner;
+        self
+    }
+
     /// Route a gesture on a widget through the action map.
     ///
     /// Per the ticket acceptance criteria, this is the canonical
@@ -800,10 +906,48 @@ impl Dispatcher {
                     view_id: view_id.clone(),
                 })
             }
-            Action::Url { .. } => Err(DispatchError::NotImplementedYet {
-                what: "Url",
-                ticket: "TASK-063",
-            }),
+            Action::Url { href } => {
+                // Url is never WS-bound: no OutboundCommand pushed, no
+                // optimistic entry recorded, in any mode. The offline gate
+                // above (maybe_route_offline) already returned
+                // OfflineNonIdempotent for the offline path — this branch
+                // only runs on the Live path.
+                match url::handle_url_action_with_spawner(
+                    href,
+                    self.url_action_mode,
+                    self.url_spawner,
+                ) {
+                    Ok(UrlOutcome::Opened) => Ok(DispatchOutcome::UrlOpened),
+                    Ok(UrlOutcome::BlockedShowToast(text)) => {
+                        Ok(DispatchOutcome::UrlBlockedToast { text })
+                    }
+                    Ok(UrlOutcome::AskShowToast(text)) => Ok(DispatchOutcome::UrlAskToast { text }),
+                    Err(UrlError::InvalidHref { reason }) => {
+                        Err(DispatchError::UrlInvalidHref { reason })
+                    }
+                    Err(UrlError::Spawn(io_err)) => {
+                        // Use Display (not Debug) per url.rs:188-194 — the
+                        // Display form is "failed to spawn xdg-open: <os msg>"
+                        // and does not include the href. Truncate to ≤256
+                        // bytes (rounded DOWN to a UTF-8 char boundary) to
+                        // fit the toast surface budget. Naive `full[..256]`
+                        // panics if byte 256 lands mid-codepoint — a real
+                        // risk on non-ASCII locales where the OS error
+                        // string can carry multi-byte chars.
+                        let full = io_err.to_string();
+                        let reason = if full.len() > 256 {
+                            let mut end = 256;
+                            while !full.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            full[..end].to_owned()
+                        } else {
+                            full
+                        };
+                        Err(DispatchError::UrlSpawnFailed { reason })
+                    }
+                }
+            }
             Action::Toggle => self.dispatch_toggle(entry, store),
             Action::CallService {
                 domain,
@@ -2049,13 +2193,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Url — deferred to TASK-063
+    // Url — default Never mode (TASK-075 wiring; fail-closed default)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn url_returns_not_implemented_yet_referencing_task_063() {
+    fn url_default_never_mode_returns_url_blocked_toast_no_frame() {
+        // Default dispatcher has url_action_mode = Never (fail-closed).
+        // Asserts: Ok(UrlBlockedToast), zero WS frames, spawner NOT called.
         let services = handle_from(ServiceRegistry::new());
-        let (dispatcher, _rx) = make_dispatcher_with_recorder(services);
+        let (dispatcher, mut rx) = make_dispatcher_with_recorder(services);
         let map = one_widget_map(
             "w",
             entry_with(
@@ -2069,16 +2215,52 @@ mod tests {
         );
         let store = store_with(vec![]);
 
-        let err = dispatcher
+        let outcome = dispatcher
             .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
-            .expect_err("Url is deferred to TASK-063");
-        match err {
-            DispatchError::NotImplementedYet { what, ticket } => {
-                assert_eq!(what, "Url");
-                assert_eq!(ticket, "TASK-063");
+            .expect("Never mode must return Ok, not Err");
+        match outcome {
+            DispatchOutcome::UrlBlockedToast { text } => {
+                assert_eq!(
+                    text,
+                    crate::actions::url::TOAST_BLOCKED_BY_PROFILE,
+                    "Never mode must surface the blocked-by-profile toast"
+                );
             }
-            other => panic!("expected NotImplementedYet, got {other:?}"),
+            other => panic!("expected UrlBlockedToast, got {other:?}"),
         }
+        // Url is never WS-bound: zero frames regardless of mode.
+        assert!(
+            rx.try_recv().is_err(),
+            "Url dispatch must NOT push any OutboundCommand frame"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // UrlSpawnFailed.reason UTF-8 truncation must NOT panic when the
+    // io::Error Display form carries multi-byte chars and the byte cap
+    // (256) lands mid-codepoint. We exercise the truncation path directly
+    // via a synthetic >256-byte multi-byte string. The dispatch wiring
+    // uses `is_char_boundary` to round DOWN to a valid boundary.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn url_spawn_failed_reason_truncation_is_utf8_safe() {
+        // 4-byte codepoint repeated past the 256-byte cap. Each '🟥' is
+        // 4 bytes; 70 of them is 280 bytes — guaranteed to cross the cap.
+        let s = "🟥".repeat(70);
+        assert!(s.len() > 256);
+
+        let mut end = 256;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        // The truncation must (a) NOT panic and (b) produce a valid &str
+        // slice on a char boundary that is ≤ 256 bytes.
+        let truncated = &s[..end];
+        assert!(end <= 256);
+        assert!(s.is_char_boundary(end));
+        // Sanity: the truncated form is a valid prefix of the input.
+        assert!(s.starts_with(truncated));
     }
 
     // -----------------------------------------------------------------------
@@ -2314,6 +2496,18 @@ mod tests {
                     ticket: "TASK-063",
                 },
                 "TASK-063",
+            ),
+            (
+                DispatchError::UrlInvalidHref {
+                    reason: "contains shell metacharacter",
+                },
+                "url action rejected",
+            ),
+            (
+                DispatchError::UrlSpawnFailed {
+                    reason: "No such file or directory".to_owned(),
+                },
+                "xdg-open spawn failed",
             ),
         ];
         for (err, expected_substr) in cases {

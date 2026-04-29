@@ -1,15 +1,15 @@
 //! `Url` action handler — `xdg-open` shell-out gate.
 //!
-//! # Dispatcher wiring (deferred)
+//! # Dispatcher wiring (TASK-075)
 //!
-//! Per the TASK-063 ticket allowlist (`must_not_touch: src/actions/dispatcher.rs`),
-//! this PR ships the handler module without re-routing the dispatcher's
-//! `Action::Url` arm. The dispatcher continues to return
-//! `DispatchError::NotImplementedYet { ticket: "TASK-063" }` for `Url`
-//! variants. A follow-up ticket — gated behind `security-engineer` review of
-//! this PR — will swap that branch to call [`handle_url_action`]. Keeping the
-//! handler isolated lets `security-engineer` audit the shell-out boundary in
-//! a small, focused diff.
+//! TASK-063 shipped this handler with `must_not_touch: src/actions/dispatcher.rs`
+//! so `security-engineer` could audit the `xdg-open` boundary in a small,
+//! focused diff. TASK-075 then routed the handler through the dispatcher
+//! under the [`UrlActionMode`] gate; the dispatcher's `Action::Url` arm
+//! now calls [`handle_url_action_with_spawner`] with `self.url_action_mode`
+//! and `self.url_spawner`. The validation, scheme allowlist, `..` traversal
+//! defence, length cap, and "href is never logged" invariants in this file
+//! are unchanged — TASK-075 only adds the routing.
 //!
 //! Phase 3 implements the `Url` action's runtime path per
 //! `docs/plans/2026-04-28-phase-3-actions.md` `locked_decisions.url_action_gating`.
@@ -227,6 +227,21 @@ pub type Spawner = fn(&str) -> io::Result<()>;
 /// dispatcher's gesture-callback thread.
 fn spawn_xdg_open(href: &str) -> io::Result<()> {
     Command::new("xdg-open").arg(href).spawn().map(|_child| ())
+}
+
+/// The production [`Spawner`] used by the dispatcher.
+///
+/// Exposed as `pub(crate)` so the [`crate::actions::dispatcher::Dispatcher`]
+/// can wire this as its default `url_spawner` field without needing to name
+/// the private `spawn_xdg_open` function. Tests inject a recording closure via
+/// [`handle_url_action_with_spawner`] rather than calling this directly.
+///
+/// The security boundary is unchanged — this is simply a re-export of the
+/// existing private spawner under a crate-visible name. `security-engineer`
+/// review of TASK-063 covers the `spawn_xdg_open` implementation; this
+/// wrapper adds no new behaviour.
+pub(crate) fn default_spawner(href: &str) -> io::Result<()> {
+    spawn_xdg_open(href)
 }
 
 // ---------------------------------------------------------------------------
