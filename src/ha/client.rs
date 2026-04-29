@@ -22,7 +22,7 @@
 //!
 //! State-changed events that arrive while `get_states` is in flight are
 //! buffered in a bounded ring of capacity
-//! `DEFAULT_PROFILE.snapshot_buffer_events` (10 000).  After the snapshot
+//! `PROFILE_DESKTOP.snapshot_buffer_events` (10 000).  After the snapshot
 //! reply arrives the buffered events are replayed before the FSM transitions
 //! to `Live`.  On ring overflow the connection is dropped; 3 overflows within
 //! 60 s trip the circuit-breaker and transition to `Failed`.
@@ -58,7 +58,7 @@
 //! # Payload cap
 //!
 //! `tokio-tungstenite` is configured with `max_message_size` and
-//! `max_frame_size` from `DEFAULT_PROFILE.ws_payload_cap`.  A message exceeding
+//! `max_frame_size` from `PROFILE_DESKTOP.ws_payload_cap`.  A message exceeding
 //! the cap causes the transport to return an error; the FSM treats this as a
 //! transport error and drops the connection for a full resync.
 //!
@@ -82,7 +82,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::dashboard::profiles::DEFAULT_PROFILE;
+use crate::dashboard::profiles::PROFILE_DESKTOP;
 use crate::ha::entity::{Entity, EntityId};
 use crate::ha::live_store::LiveStore;
 use crate::ha::protocol::{
@@ -399,7 +399,7 @@ pub(crate) enum Phase {
     Snapshotting {
         get_states_id: u32,
         /// Ring buffer of state-changed events arriving during snapshot fetch.
-        /// Capacity: `DEFAULT_PROFILE.snapshot_buffer_events`.
+        /// Capacity: `PROFILE_DESKTOP.snapshot_buffer_events`.
         event_buffer: Vec<InboundMsg>,
     },
     /// Snapshot applied; `get_services` in flight.
@@ -1045,8 +1045,8 @@ impl WsClient {
         tracing::info!(url = %self.config.url, "connecting to HA");
 
         let ws_config = WebSocketConfig {
-            max_message_size: Some(DEFAULT_PROFILE.ws_payload_cap),
-            max_frame_size: Some(DEFAULT_PROFILE.ws_payload_cap),
+            max_message_size: Some(PROFILE_DESKTOP.ws_payload_cap),
+            max_frame_size: Some(PROFILE_DESKTOP.ws_payload_cap),
             ..Default::default()
         };
 
@@ -1292,9 +1292,9 @@ impl WsClient {
                 },
                 InboundMsg::Event(event_payload),
             ) => {
-                if event_buffer.len() >= DEFAULT_PROFILE.snapshot_buffer_events {
+                if event_buffer.len() >= PROFILE_DESKTOP.snapshot_buffer_events {
                     tracing::warn!(
-                        cap = DEFAULT_PROFILE.snapshot_buffer_events,
+                        cap = PROFILE_DESKTOP.snapshot_buffer_events,
                         "snapshot event buffer overflow; dropping connection"
                     );
                     let tripped = self.overflow_breaker.record_overflow();
@@ -2024,7 +2024,7 @@ mod tests {
         let (mut sink, _sent) = MockSink::new();
 
         // Pre-fill buffer to exactly the capacity limit.
-        let event_buffer: Vec<InboundMsg> = (0..DEFAULT_PROFILE.snapshot_buffer_events)
+        let event_buffer: Vec<InboundMsg> = (0..PROFILE_DESKTOP.snapshot_buffer_events)
             .map(|_| {
                 inbound(r#"{"type":"event","id":1,"event":{"event_type":"state_changed","data":{"entity_id":"light.x","new_state":null,"old_state":null},"origin":"LOCAL","time_fired":"2024-01-01T00:00:00+00:00"}}"#)
             })
@@ -2074,7 +2074,7 @@ mod tests {
         client.overflow_breaker.record_overflow();
 
         // Trigger a 3rd overflow via handle_message.
-        let event_buffer: Vec<InboundMsg> = (0..DEFAULT_PROFILE.snapshot_buffer_events)
+        let event_buffer: Vec<InboundMsg> = (0..PROFILE_DESKTOP.snapshot_buffer_events)
             .map(|_| {
                 inbound(r#"{"type":"event","id":1,"event":{"event_type":"state_changed","data":{"entity_id":"light.x","new_state":null,"old_state":null},"origin":"LOCAL","time_fired":"2024-01-01T00:00:00+00:00"}}"#)
             })

@@ -46,7 +46,7 @@
 //!     [`crate::assets::icons::resolve`]), wraps each per-variant `Vec` in a
 //!     `slint::ModelRc<...>`, and writes the three array properties on
 //!     `MainWindow`. Also writes the two `AnimationBudget` globals from
-//!     [`crate::dashboard::profiles::DEFAULT_PROFILE`].
+//!     [`crate::dashboard::profiles::PROFILE_DESKTOP`].
 //!
 //! [`wire_window`] runs once per refresh cycle, not per frame. Per-frame
 //! property reads inside the Slint runtime see only `SharedString`
@@ -375,7 +375,7 @@ pub use slint_ui::{AnimationBudget, GestureConfigGlobal, MainWindow, ViewRouterG
 
 use crate::actions::timing::GestureConfig;
 use crate::assets::icons;
-use crate::dashboard::profiles::DEFAULT_PROFILE;
+use crate::dashboard::profiles::PROFILE_DESKTOP;
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 /// Errors that can occur while wiring VM data into Slint properties.
@@ -384,10 +384,10 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 /// the failure path either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireError {
-    /// `DEFAULT_PROFILE.animation_framerate_cap` does not fit in `i32` (the
+    /// `PROFILE_DESKTOP.animation_framerate_cap` does not fit in `i32` (the
     /// Slint property type for `framerate-cap`).
     FramerateCapOutOfRange,
-    /// `DEFAULT_PROFILE.max_simultaneous_animations` does not fit in `i32`
+    /// `PROFILE_DESKTOP.max_simultaneous_animations` does not fit in `i32`
     /// (the Slint property type for `max-simultaneous`).
     MaxSimultaneousOutOfRange,
     /// One of the [`GestureConfig`] `*_ms` fields does not fit in `i32` (the
@@ -401,10 +401,10 @@ impl std::fmt::Display for WireError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WireError::FramerateCapOutOfRange => {
-                f.write_str("DEFAULT_PROFILE.animation_framerate_cap does not fit in i32")
+                f.write_str("PROFILE_DESKTOP.animation_framerate_cap does not fit in i32")
             }
             WireError::MaxSimultaneousOutOfRange => {
-                f.write_str("DEFAULT_PROFILE.max_simultaneous_animations does not fit in i32")
+                f.write_str("PROFILE_DESKTOP.max_simultaneous_animations does not fit in i32")
             }
             WireError::GestureTimingOutOfRange => {
                 f.write_str("GestureConfig timing field does not fit in i32")
@@ -511,7 +511,7 @@ pub fn split_tile_vms(
 
 /// Wire a typed `&[TileVM]` slice into the three array properties on
 /// [`MainWindow`], and write the two `AnimationBudget` globals from
-/// [`DEFAULT_PROFILE`].
+/// [`PROFILE_DESKTOP`].
 ///
 /// This is the single public entry point used by `main.rs` (TASK-016) and by
 /// any future Phase 2 push-update path. The function runs once per refresh
@@ -529,9 +529,9 @@ pub fn split_tile_vms(
 /// # Errors
 ///
 /// Returns [`WireError::FramerateCapOutOfRange`] if
-/// `DEFAULT_PROFILE.animation_framerate_cap` does not fit in `i32`, and
+/// `PROFILE_DESKTOP.animation_framerate_cap` does not fit in `i32`, and
 /// [`WireError::MaxSimultaneousOutOfRange`] if
-/// `DEFAULT_PROFILE.max_simultaneous_animations` does not fit. Both are
+/// `PROFILE_DESKTOP.max_simultaneous_animations` does not fit. Both are
 /// defensive: the desktop preset values (60 and 8 respectively) are well
 /// within `i32` range, but a future profile could exceed it and we want a
 /// typed failure rather than a silent truncation.
@@ -548,12 +548,12 @@ pub fn wire_window(window: &MainWindow, tiles: &[TileVM]) -> Result<(), WireErro
     window.set_sensor_tiles(sensor_model);
     window.set_entity_tiles(entity_model);
 
-    // AnimationBudget globals — wired once at startup from DEFAULT_PROFILE.
+    // AnimationBudget globals — wired once at startup from PROFILE_DESKTOP.
     let budget = window.global::<AnimationBudget>();
 
-    let cap_i32 = i32::try_from(DEFAULT_PROFILE.animation_framerate_cap)
+    let cap_i32 = i32::try_from(PROFILE_DESKTOP.animation_framerate_cap)
         .map_err(|_| WireError::FramerateCapOutOfRange)?;
-    let max_i32 = i32::try_from(DEFAULT_PROFILE.max_simultaneous_animations)
+    let max_i32 = i32::try_from(PROFILE_DESKTOP.max_simultaneous_animations)
         .map_err(|_| WireError::MaxSimultaneousOutOfRange)?;
 
     budget.set_framerate_cap(cap_i32);
@@ -2071,7 +2071,7 @@ mod tests {
     #[test]
     fn wire_window_writes_animation_budget_and_default_gesture_config() {
         // Behavior contract: `wire_window` populates AnimationBudget from
-        // `DEFAULT_PROFILE` AND wires the default GestureConfig in a single
+        // `PROFILE_DESKTOP` AND wires the default GestureConfig in a single
         // call. We verify both globals end up with the documented values
         // after one wire_window invocation.
         install_test_platform_once_per_thread();
@@ -2087,15 +2087,15 @@ mod tests {
         let budget = window.global::<AnimationBudget>();
         assert_eq!(
             budget.get_framerate_cap(),
-            i32::try_from(DEFAULT_PROFILE.animation_framerate_cap)
-                .expect("DEFAULT_PROFILE framerate_cap fits in i32"),
-            "wire_window must propagate DEFAULT_PROFILE.animation_framerate_cap",
+            i32::try_from(PROFILE_DESKTOP.animation_framerate_cap)
+                .expect("PROFILE_DESKTOP framerate_cap fits in i32"),
+            "wire_window must propagate PROFILE_DESKTOP.animation_framerate_cap",
         );
         assert_eq!(
             budget.get_max_simultaneous(),
-            i32::try_from(DEFAULT_PROFILE.max_simultaneous_animations)
-                .expect("DEFAULT_PROFILE max_simultaneous fits in i32"),
-            "wire_window must propagate DEFAULT_PROFILE.max_simultaneous_animations",
+            i32::try_from(PROFILE_DESKTOP.max_simultaneous_animations)
+                .expect("PROFILE_DESKTOP max_simultaneous fits in i32"),
+            "wire_window must propagate PROFILE_DESKTOP.max_simultaneous_animations",
         );
 
         // Gesture global must also be populated with the GestureConfig

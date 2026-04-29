@@ -37,7 +37,7 @@ use std::sync::{Arc, RwLock};
 use thiserror::Error;
 use tokio::sync::broadcast;
 
-use crate::dashboard::profiles::DEFAULT_PROFILE;
+use crate::dashboard::profiles::PROFILE_DESKTOP;
 
 use super::entity::{Entity, EntityId};
 
@@ -102,8 +102,8 @@ pub trait EntityStore: Send + Sync {
 /// Error returned by [`MemoryStore::load`].
 #[derive(Debug, Error)]
 pub enum MemoryStoreError {
-    /// The number of entities exceeds [`DEFAULT_PROFILE`]``.max_entities`.
-    #[error("entity count {count} exceeds profile cap {cap} (DEFAULT_PROFILE.max_entities)")]
+    /// The number of entities exceeds [`PROFILE_DESKTOP`]``.max_entities`.
+    #[error("entity count {count} exceeds profile cap {cap} (PROFILE_DESKTOP.max_entities)")]
     CapExceeded { count: usize, cap: usize },
 }
 
@@ -130,7 +130,7 @@ impl MemoryStore {
     /// Construct a [`MemoryStore`] from a slice of entities.
     ///
     /// Returns [`MemoryStoreError::CapExceeded`] if `entities.len()` exceeds
-    /// `DEFAULT_PROFILE.max_entities`.
+    /// `PROFILE_DESKTOP.max_entities`.
     ///
     /// # TASK-008 handoff
     ///
@@ -144,7 +144,7 @@ impl MemoryStore {
     /// The returned `Arc<MemoryStore>` is then threaded into the bridge layer
     /// as `Arc<dyn EntityStore>`.
     pub fn load(entities: Vec<Entity>) -> Result<Self, MemoryStoreError> {
-        let cap = DEFAULT_PROFILE.max_entities;
+        let cap = PROFILE_DESKTOP.max_entities;
         if entities.len() > cap {
             return Err(MemoryStoreError::CapExceeded {
                 count: entities.len(),
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn load_rejects_fixture_exceeding_max_entities() {
-        let cap = DEFAULT_PROFILE.max_entities;
+        let cap = PROFILE_DESKTOP.max_entities;
         // Build cap + 1 entities.
         let entities: Vec<Entity> = (0..=cap)
             .map(|i| make_entity(&format!("light.e{i}"), "on"))
@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn load_accepts_fixture_at_exactly_max_entities() {
-        let cap = DEFAULT_PROFILE.max_entities;
+        let cap = PROFILE_DESKTOP.max_entities;
         let entities: Vec<Entity> = (0..cap)
             .map(|i| make_entity(&format!("light.e{i}"), "on"))
             .collect();

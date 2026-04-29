@@ -659,7 +659,7 @@ async fn scenario_reconnect_resync_only_broadcasts_changed_entities() {
 // Scenario: oversized payload — connection drops (run() exits with transport err)
 //
 // The acceptance criterion requires that a frame above
-// `DEFAULT_PROFILE.ws_payload_cap` (16 MiB) terminates the WS connection so
+// `PROFILE_DESKTOP.ws_payload_cap` (16 MiB) terminates the WS connection so
 // the outer reconnect loop (TASK-032) can full-resync.  The inner `run()`
 // signals this via an `Err(ClientError::Transport(_))` return — it does NOT
 // re-publish `ConnectionState` because the outer reconnect loop owns that
@@ -669,7 +669,7 @@ async fn scenario_reconnect_resync_only_broadcasts_changed_entities() {
 
 #[tokio::test]
 async fn scenario_oversized_payload_drops_connection() {
-    use hanui::dashboard::profiles::DEFAULT_PROFILE;
+    use hanui::dashboard::profiles::PROFILE_DESKTOP;
 
     let server = MockWsServer::start().await;
     server.script_auth_ok().await;
@@ -684,7 +684,7 @@ async fn scenario_oversized_payload_drops_connection() {
 
     // Inject a frame just above the cap; the WS layer (mock or client) rejects
     // it, terminating the connection.
-    let cap = DEFAULT_PROFILE.ws_payload_cap;
+    let cap = PROFILE_DESKTOP.ws_payload_cap;
     let oversized = format!(
         r#"{{"type":"event","id":1,"_pad":"{}"}}"#,
         "x".repeat(cap + 1)
@@ -716,7 +716,7 @@ async fn scenario_oversized_payload_drops_connection() {
 // already covers the FSM-level transition for the third (tripping) overflow,
 // but uses pre-recorded `record_overflow` calls for the first two.  This
 // test closes the gap end-to-end: ALL THREE overflows are driven by the
-// mock injecting > `DEFAULT_PROFILE.snapshot_buffer_events` state_changed
+// mock injecting > `PROFILE_DESKTOP.snapshot_buffer_events` state_changed
 // events while the FSM is in `Phase::Snapshotting`, and the third overflow
 // must surface as `ClientError::OverflowCircuitBreaker` with the FSM in
 // `ConnectionState::Failed`.
@@ -741,7 +741,7 @@ async fn scenario_oversized_payload_drops_connection() {
 ///    incoming event hits the overflow branch in `handle_message`.
 /// 3. Returns the error from `run()`.
 async fn drive_one_fsm_overflow(server: &MockWsServer, client: &mut WsClient) -> ClientError {
-    use hanui::dashboard::profiles::DEFAULT_PROFILE;
+    use hanui::dashboard::profiles::PROFILE_DESKTOP;
 
     server.script_auth_ok().await;
     server.script_subscribe_ack().await;
@@ -770,7 +770,7 @@ async fn drive_one_fsm_overflow(server: &MockWsServer, client: &mut WsClient) ->
         // overflow branch in handle_message.  Use a unique entity_id per
         // index so the test exercises the full event_buffer.push path (the
         // cap check is `len() >= cap`, not "id repeats").
-        let cap = DEFAULT_PROFILE.snapshot_buffer_events;
+        let cap = PROFILE_DESKTOP.snapshot_buffer_events;
         let frames: Vec<String> = (0..=cap)
             .map(|i| {
                 state_changed_event_json(

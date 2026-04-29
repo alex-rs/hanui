@@ -32,7 +32,7 @@
 //!     RSS in the second minute does not exceed 5 MB.  This guards against slow
 //!     memory leaks that accumulate over the 10-minute run.
 //!
-//! (b) **Absolute peak RSS ≤ `DEFAULT_PROFILE.idle_rss_mb_cap` (120 MB)**:
+//! (b) **Absolute peak RSS ≤ `PROFILE_DESKTOP.idle_rss_mb_cap` (120 MB)**:
 //!     the highest observed RSS at any point during the run must not exceed the
 //!     profile cap.
 //!
@@ -72,7 +72,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
-use hanui::dashboard::profiles::DEFAULT_PROFILE;
+use hanui::dashboard::profiles::PROFILE_DESKTOP;
 use hanui::ha::client::{ClientError, WsClient};
 use hanui::ha::live_store::LiveStore;
 use hanui::platform::config::Config;
@@ -103,7 +103,7 @@ const BURST_DURATION: Duration = Duration::from_secs(30);
 const BURST_DISCONNECTS: usize = 5;
 
 /// Absolute peak RSS cap from the profile (in bytes).
-const RSS_CAP_BYTES: u64 = DEFAULT_PROFILE.idle_rss_mb_cap as u64 * 1024 * 1024;
+const RSS_CAP_BYTES: u64 = PROFILE_DESKTOP.idle_rss_mb_cap as u64 * 1024 * 1024;
 
 /// Steady-state growth budget (in bytes).
 const STEADY_STATE_GROWTH_BUDGET_BYTES: u64 = 5 * 1024 * 1024;
@@ -558,7 +558,7 @@ async fn memory_soak_10min_1000_entities_50_evs() {
         );
     }
 
-    // (b) Absolute peak RSS ≤ DEFAULT_PROFILE.idle_rss_mb_cap.
+    // (b) Absolute peak RSS ≤ PROFILE_DESKTOP.idle_rss_mb_cap.
     let absolute_peak = samples.iter().map(|s| s.rss_bytes).max().unwrap_or(0);
     eprintln!(
         "[soak] assertion (b): absolute peak RSS = {:.1} MB (cap = {:.1} MB)",

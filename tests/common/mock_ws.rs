@@ -273,7 +273,7 @@ impl MockWsServer {
     /// Equivalent to calling [`MockWsServer::inject_event`] in a loop, but
     /// holds the inject queue's mutex once for the whole batch.  Used by the
     /// snapshot-buffer overflow integration test (TASK-046 finding 7) which
-    /// must shovel >`DEFAULT_PROFILE.snapshot_buffer_events` (10 000) frames
+    /// must shovel >`PROFILE_DESKTOP.snapshot_buffer_events` (10 000) frames
     /// at the FSM during `Phase::Snapshotting`; per-event locking would
     /// add ~10 000 mutex acquisitions for no benefit.
     pub async fn inject_events_batch<I: IntoIterator<Item = String>>(&self, raws: I) {

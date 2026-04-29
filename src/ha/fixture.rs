@@ -60,7 +60,7 @@ pub enum FixtureError {
         source: jiff::Error,
     },
 
-    /// The fixture contains more entities than `DEFAULT_PROFILE.max_entities`.
+    /// The fixture contains more entities than `PROFILE_DESKTOP.max_entities`.
     #[error("{0}")]
     Capacity(#[from] MemoryStoreError),
 }
@@ -132,7 +132,7 @@ impl RawFixtureEntry {
 /// - [`FixtureError::Timestamp`] if any `last_changed`/`last_updated` value
 ///   is not a valid ISO 8601 timestamp.
 /// - [`FixtureError::Capacity`] if the fixture exceeds
-///   `DEFAULT_PROFILE.max_entities` (currently {DEFAULT_PROFILE.max_entities}).
+///   `PROFILE_DESKTOP.max_entities` (currently {PROFILE_DESKTOP.max_entities}).
 pub fn load(path: impl AsRef<Path>) -> Result<MemoryStore, FixtureError> {
     let bytes = std::fs::read(path)?;
     let raw: Vec<RawFixtureEntry> = serde_json::from_slice(&bytes)?;
@@ -158,7 +158,7 @@ mod tests {
     use serde_json::Map;
 
     use super::*;
-    use crate::dashboard::profiles::DEFAULT_PROFILE;
+    use crate::dashboard::profiles::PROFILE_DESKTOP;
     use crate::ha::store::EntityStore;
 
     /// Path to the canonical Phase 1 fixture relative to the crate root.
@@ -247,12 +247,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Capacity enforcement: exceeding DEFAULT_PROFILE.max_entities → Err
+    // Capacity enforcement: exceeding PROFILE_DESKTOP.max_entities → Err
     // -----------------------------------------------------------------------
 
     #[test]
     fn load_fails_when_fixture_exceeds_max_entities() {
-        let cap = DEFAULT_PROFILE.max_entities;
+        let cap = PROFILE_DESKTOP.max_entities;
         // Build cap + 1 raw entries as a JSON array and write to a temp file.
         let entries: Vec<serde_json::Value> = (0..=cap)
             .map(|i| {
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn load_accepts_exactly_max_entities() {
-        let cap = DEFAULT_PROFILE.max_entities;
+        let cap = PROFILE_DESKTOP.max_entities;
         let entries: Vec<serde_json::Value> = (0..cap)
             .map(|i| {
                 serde_json::json!({

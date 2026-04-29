@@ -21,7 +21,7 @@
 //! The WS transport layer (`src/ha/client.rs`, implemented in TASK-029)
 //! enforces the maximum message size via `tokio-tungstenite`
 //! `max_message_size` / `max_frame_size`, both set to
-//! `DEFAULT_PROFILE.ws_payload_cap` (16 MiB for the desktop profile).  Any
+//! `PROFILE_DESKTOP.ws_payload_cap` (16 MiB for the desktop profile).  Any
 //! message exceeding that cap is dropped at the transport level; the client
 //! then performs a full resync.  This module documents that constraint via the
 //! [`ParseError::OversizedFrame`] variant, which the transport layer emits
@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::dashboard::profiles::DEFAULT_PROFILE;
+use crate::dashboard::profiles::PROFILE_DESKTOP;
 
 // ---------------------------------------------------------------------------
 // ParseError
@@ -51,14 +51,14 @@ pub enum ParseError {
     /// The frame size exceeded the configured cap before deserialization was
     /// attempted.
     ///
-    /// Cap is sourced from `DEFAULT_PROFILE.ws_payload_cap` (currently
+    /// Cap is sourced from `PROFILE_DESKTOP.ws_payload_cap` (currently
     /// 16 MiB for the desktop profile).  Enforcement happens in the transport
     /// layer (`src/ha/client.rs`); this variant is emitted so callers have a
     /// single typed error hierarchy to match against.
     ///
     /// On receiving this error, the caller must drop the connection and
     /// initiate a full resync — no partial buffer may be retained.
-    #[error("frame size {actual_bytes} exceeds cap {cap_bytes} (DEFAULT_PROFILE.ws_payload_cap)")]
+    #[error("frame size {actual_bytes} exceeds cap {cap_bytes} (PROFILE_DESKTOP.ws_payload_cap)")]
     OversizedFrame {
         actual_bytes: usize,
         cap_bytes: usize,
@@ -67,11 +67,11 @@ pub enum ParseError {
 
 impl ParseError {
     /// Construct an [`OversizedFrame`][ParseError::OversizedFrame] using the
-    /// cap from [`DEFAULT_PROFILE`].
+    /// cap from [`PROFILE_DESKTOP`].
     pub fn oversized(actual_bytes: usize) -> Self {
         ParseError::OversizedFrame {
             actual_bytes,
-            cap_bytes: DEFAULT_PROFILE.ws_payload_cap,
+            cap_bytes: PROFILE_DESKTOP.ws_payload_cap,
         }
     }
 }
@@ -279,12 +279,12 @@ impl<'de> Deserialize<'de> for InboundMsg {
 /// Parse a raw JSON byte slice into an [`InboundMsg`].
 ///
 /// Returns [`ParseError::OversizedFrame`] before attempting deserialization if
-/// the slice exceeds `DEFAULT_PROFILE.ws_payload_cap`.  The caller should
+/// the slice exceeds `PROFILE_DESKTOP.ws_payload_cap`.  The caller should
 /// check this case first to avoid allocating for oversized frames.
 ///
 /// Returns [`ParseError::Json`] for malformed JSON or unknown schema.
 pub fn parse_inbound(bytes: &[u8]) -> Result<InboundMsg, ParseError> {
-    if bytes.len() > DEFAULT_PROFILE.ws_payload_cap {
+    if bytes.len() > PROFILE_DESKTOP.ws_payload_cap {
         return Err(ParseError::oversized(bytes.len()));
     }
     let msg = serde_json::from_slice(bytes)?;
@@ -940,11 +940,11 @@ mod tests {
 
     #[test]
     fn oversized_frame_returns_typed_error() {
-        // Build a synthetic JSON string that exceeds DEFAULT_PROFILE.ws_payload_cap.
+        // Build a synthetic JSON string that exceeds PROFILE_DESKTOP.ws_payload_cap.
         // We construct a payload slightly larger than the cap; the bytes are valid
         // UTF-8 but we never attempt to deserialize them — ParseError::OversizedFrame
         // is returned first.
-        let cap = DEFAULT_PROFILE.ws_payload_cap;
+        let cap = PROFILE_DESKTOP.ws_payload_cap;
         // 17 MiB > 16 MiB cap.
         let oversized = vec![b'x'; cap + 1];
         let result = parse_inbound(&oversized);
@@ -966,7 +966,7 @@ mod tests {
         // A frame of exactly ws_payload_cap bytes is not oversized — the guard
         // is strictly greater-than.  This byte slice is not valid JSON, so it
         // falls through to ParseError::Json, but crucially not OversizedFrame.
-        let cap = DEFAULT_PROFILE.ws_payload_cap;
+        let cap = PROFILE_DESKTOP.ws_payload_cap;
         let exactly_cap = vec![b'x'; cap];
         let result = parse_inbound(&exactly_cap);
         assert!(result.is_err());
@@ -1005,7 +1005,7 @@ mod tests {
                 cap_bytes,
             } => {
                 assert_eq!(actual_bytes, 999_999_999);
-                assert_eq!(cap_bytes, DEFAULT_PROFILE.ws_payload_cap);
+                assert_eq!(cap_bytes, PROFILE_DESKTOP.ws_payload_cap);
             }
             other => panic!("unexpected: {other:?}"),
         }
