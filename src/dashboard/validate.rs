@@ -61,9 +61,17 @@
 use crate::actions::Action;
 use crate::dashboard::profiles::DeviceProfile;
 use crate::dashboard::schema::{
-    CallServiceAllowlist, Dashboard, Issue, Section, Severity, ValidationRule, Widget,
-    WidgetOptions,
+    Dashboard, Issue, Section, Severity, ValidationRule, Widget, WidgetOptions,
 };
+
+// Re-export `CallServiceAllowlist` from this module so consumers (notably
+// `crate::actions::queue` per TASK-090) can refer to it through the
+// validator's API surface — the validator is the producer of the set, so
+// the type appears canonically alongside `validate()`. The type is defined
+// in `schema.rs` (per `locked_decisions.call_service_allowlist_runtime_access`)
+// to avoid a `schema` ↔ `validate` import cycle; this re-export does not
+// duplicate the definition. Additive change only — semantics unchanged.
+pub use crate::dashboard::schema::CallServiceAllowlist;
 
 // ---------------------------------------------------------------------------
 // Visibility predicate namespace
