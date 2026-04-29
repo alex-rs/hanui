@@ -343,7 +343,7 @@ pub mod slint_ui {
     slint::include_modules!();
 }
 
-pub use slint_ui::{AnimationBudget, GestureConfigGlobal, MainWindow};
+pub use slint_ui::{AnimationBudget, GestureConfigGlobal, MainWindow, ViewRouterGlobal};
 
 use crate::actions::timing::GestureConfig;
 use crate::assets::icons;
