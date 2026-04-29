@@ -288,21 +288,8 @@ fn parse_error_returns_bounded_excerpt() {
 /// schema). This test asserts that the file parses and loads without
 /// `Severity::Error` validation issues.
 ///
-/// **Known limitation (pre-existing)**: `examples/dashboard.yaml` uses
-/// `entity_tile` widgets with domain-keyed options (e.g.
-/// `options: { camera: { interval_seconds: 5 } }`) rather than the Phase 4
-/// tagged format (`options: { kind: camera, interval_seconds: 5 }`). When
-/// the loader encounters this format mismatch, it returns
-/// `LoadError::ParseError { excerpt: "missing field `kind`" }`.
-///
-/// Until `examples/dashboard.yaml` is updated to use the Phase 4 options
-/// format (MUST NOT be done in this ticket per `must_not_touch`), this test
-/// documents the known parse error and passes when the error matches the
-/// expected known-limitation pattern. When the examples file is fixed, the
-/// test will proceed to full validation assertions automatically.
-///
-/// Security: if the file does load, the sentinel value `"smoke-test-token"`
-/// must NOT appear in any `Issue.message`.
+/// Security: the sentinel value `"smoke-test-token"` must NOT appear in any
+/// `Issue.message`.
 #[test]
 fn examples_dashboard_yaml_loads_without_issues() {
     let guard = acquire_env_lock();
@@ -324,73 +311,41 @@ fn examples_dashboard_yaml_loads_without_issues() {
     let result = loader::load(examples_path, &config);
     unsafe { std::env::remove_var("HA_TOKEN") };
 
-    match result {
-        Ok(dashboard) => {
-            // Full assertions: the file loaded successfully.
-            assert!(
-                !dashboard.views.is_empty(),
-                "examples/dashboard.yaml must have at least one view"
-            );
-            let total_widgets: usize = dashboard
-                .views
-                .iter()
-                .flat_map(|v| v.sections.iter())
-                .map(|s| s.widgets.len())
-                .sum();
-            assert!(
-                total_widgets >= 1,
-                "examples/dashboard.yaml must have at least one widget; found {total_widgets}"
-            );
+    let dashboard = result.expect("examples/dashboard.yaml must load successfully");
+    assert!(
+        !dashboard.views.is_empty(),
+        "examples/dashboard.yaml must have at least one view"
+    );
+    let total_widgets: usize = dashboard
+        .views
+        .iter()
+        .flat_map(|v| v.sections.iter())
+        .map(|s| s.widgets.len())
+        .sum();
+    assert!(
+        total_widgets >= 1,
+        "examples/dashboard.yaml must have at least one widget; found {total_widgets}"
+    );
 
-            // Run validator under desktop profile; assert zero Error issues.
-            let (issues, _allowlist) = validate::validate(&dashboard, &PROFILE_DESKTOP);
-            let error_issues: Vec<_> = issues
-                .iter()
-                .filter(|i| i.severity == hanui::dashboard::schema::Severity::Error)
-                .collect();
-            assert!(
-                error_issues.is_empty(),
-                "examples/dashboard.yaml must produce zero Error issues; \
-                 found {} error(s): {error_issues:#?}",
-                error_issues.len()
-            );
+    let (issues, _allowlist) = validate::validate(&dashboard, &PROFILE_DESKTOP);
+    let error_issues: Vec<_> = issues
+        .iter()
+        .filter(|i| i.severity == hanui::dashboard::schema::Severity::Error)
+        .collect();
+    assert!(
+        error_issues.is_empty(),
+        "examples/dashboard.yaml must produce zero Error issues; \
+         found {} error(s): {error_issues:#?}",
+        error_issues.len()
+    );
 
-            // Token-leak guard.
-            for issue in &issues {
-                assert!(
-                    !issue.message.contains(sentinel),
-                    "token sentinel must not appear in issue messages; got: {:?}",
-                    issue.message
-                );
-            }
-        }
-        Err(LoadError::ParseError { ref excerpt }) => {
-            // Known pre-existing limitation: examples/dashboard.yaml uses
-            // domain-keyed options format (entity_tile with options.camera etc.)
-            // which does not match the Phase 4 tagged WidgetOptions schema.
-            // The expected error contains "missing field `kind`".
-            assert!(
-                excerpt.contains("missing field") || excerpt.contains("kind"),
-                "ParseError on examples/dashboard.yaml must be the known 'missing field `kind`' \
-                 options-format mismatch, not a new unexpected error. \
-                 Got excerpt: {excerpt:?}\n\
-                 If examples/dashboard.yaml was recently modified, verify the options format \
-                 matches `WidgetOptions` tagged schema (kind: camera, kind: fan, etc.)."
-            );
-            // Known limitation acknowledged; test passes.
-            eprintln!(
-                "NOTE: examples/dashboard.yaml fails to parse due to known pre-existing \
-                 domain-keyed options format (entity_tile with options.camera/fan/etc.). \
-                 Excerpt: {excerpt:?}. \
-                 Update examples/dashboard.yaml to use 'kind: camera' tagged format to fix."
-            );
-        }
-        Err(other) => {
-            panic!(
-                "examples/dashboard.yaml returned an unexpected LoadError variant \
-                 (not the known ParseError options-format mismatch): {other:?}"
-            );
-        }
+    // Token-leak guard.
+    for issue in &issues {
+        assert!(
+            !issue.message.contains(sentinel),
+            "token sentinel must not appear in issue messages; got: {:?}",
+            issue.message
+        );
     }
 }
 

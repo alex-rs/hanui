@@ -252,7 +252,7 @@ pub struct PinPolicy {
 /// Per `locked_decisions.no_hashmap_in_deserialized_types`: no `HashMap` is
 /// used here; map-shaped data is expressed as named fields or `BTreeMap`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum WidgetOptions {
     /// Options for `type: camera` widgets.
     Camera {
@@ -343,7 +343,18 @@ pub struct Widget {
     pub layout: WidgetLayout,
     /// `options` — tile-kind-specific typed options. `None` for tile kinds
     /// that carry no extra options (`LightTile`, `SensorTile`, `EntityTile`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Uses `serde_yaml_ng::with::singleton_map` so the YAML wire form is
+    /// the externally-tagged map shape documented in `docs/DASHBOARD_SCHEMA.md`
+    /// (e.g. `options:\n  camera:\n    interval_seconds: 5`), NOT the YAML-tag
+    /// form (`!camera\ninterval_seconds: 5`) that `serde_yaml_ng` would emit
+    /// for a bare `#[serde(rename_all)]` enum.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serde_yaml_ng::with::singleton_map::serialize",
+        deserialize_with = "serde_yaml_ng::with::singleton_map::deserialize"
+    )]
     pub options: Option<WidgetOptions>,
     /// Computed grid slot assigned by the packer. Skipped during
     /// serialization/deserialization (internal only).
@@ -715,31 +726,43 @@ views:
         assert!(!issue.message.is_empty());
     }
 
+    /// Helper wrapper so unit tests can exercise `WidgetOptions` through the
+    /// `singleton_map` path without constructing a full `Widget`.
+    ///
+    /// The `options` field here mirrors the attribute on `Widget::options`.
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct OptionsWrapper {
+        #[serde(with = "serde_yaml_ng::with::singleton_map")]
+        options: WidgetOptions,
+    }
+
     #[test]
     fn widget_options_camera_roundtrip() {
-        let yaml = r#"kind: camera
-interval_seconds: 10
+        let yaml = r#"options:
+  camera:
+    interval_seconds: 10
 "#;
-        let opts: WidgetOptions = serde_yaml_ng::from_str(yaml).unwrap();
+        let w: OptionsWrapper = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(matches!(
-            opts,
+            w.options,
             WidgetOptions::Camera {
                 interval_seconds: 10
             }
         ));
-        let back = serde_yaml_ng::to_string(&opts).unwrap();
-        let opts2: WidgetOptions = serde_yaml_ng::from_str(&back).unwrap();
-        assert_eq!(opts, opts2);
+        let back = serde_yaml_ng::to_string(&w).unwrap();
+        let w2: OptionsWrapper = serde_yaml_ng::from_str(&back).unwrap();
+        assert_eq!(w, w2);
     }
 
     #[test]
     fn widget_options_history_roundtrip() {
-        let yaml = r#"kind: history
-window_seconds: 3600
+        let yaml = r#"options:
+  history:
+    window_seconds: 3600
 "#;
-        let opts: WidgetOptions = serde_yaml_ng::from_str(yaml).unwrap();
+        let w: OptionsWrapper = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(matches!(
-            opts,
+            w.options,
             WidgetOptions::History {
                 window_seconds: 3600
             }
@@ -748,15 +771,16 @@ window_seconds: 3600
 
     #[test]
     fn widget_options_fan_roundtrip() {
-        let yaml = r#"kind: fan
-speed_count: 3
-preset_modes:
-  - Low
-  - Medium
-  - High
+        let yaml = r#"options:
+  fan:
+    speed_count: 3
+    preset_modes:
+      - Low
+      - Medium
+      - High
 "#;
-        let opts: WidgetOptions = serde_yaml_ng::from_str(yaml).unwrap();
-        match opts {
+        let w: OptionsWrapper = serde_yaml_ng::from_str(yaml).unwrap();
+        match w.options {
             WidgetOptions::Fan {
                 speed_count,
                 ref preset_modes,
@@ -766,6 +790,30 @@ preset_modes:
             }
             _ => panic!("expected Fan variant"),
         }
+    }
+
+    #[test]
+    fn widget_options_camera_serializes_externally_tagged() {
+        let w = OptionsWrapper {
+            options: WidgetOptions::Camera {
+                interval_seconds: 5,
+            },
+        };
+        let yaml = serde_yaml_ng::to_string(&w).expect("serialize");
+        // External tag form: variant name is the key, fields nested under it.
+        assert!(
+            yaml.contains("camera:"),
+            "must use externally-tagged form: {yaml}"
+        );
+        assert!(
+            yaml.contains("interval_seconds: 5"),
+            "field must serialize: {yaml}"
+        );
+        // Internal tag form would contain "kind: camera" — pin against regression.
+        assert!(
+            !yaml.contains("kind: camera"),
+            "must NOT use internally-tagged form: {yaml}"
+        );
     }
 
     #[test]
