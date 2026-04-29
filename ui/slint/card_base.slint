@@ -1,7 +1,10 @@
-// card_base.slint — shared visual chrome for every Phase 1 tile.
+// card_base.slint — shared visual chrome AND gesture-detection layer for
+// every Phase 1+ tile.
 //
-// Provides the rounded surface, border, focus ring, and press animation
-// that wrap the content of light_tile / sensor_tile / entity_tile (TASK-013).
+// Provides the rounded surface, border, focus ring, press animation, and
+// (TASK-060) the tap / hold / double-tap gesture-detection state machine
+// that wrap the content of light_tile / sensor_tile / entity_tile.
+//
 // All colors are pulled from theme.slint; no inline hex literals are
 // permitted in this file (CI hex-color gate, .github/workflows/ci.yml § Gate 1).
 //
@@ -19,12 +22,35 @@
 //     the press animation duration collapses to 0 ms so the card snaps to
 //     the end-state without animating; the global ripple budget is preserved.
 //
-// Out of scope (do not add here — see TASK-013 / Phase 3):
-//   * tap_action / hold_action / double_tap_action wiring.
+// Gesture layer (TASK-060):
+//   * `tap`, `hold`, `double-tap` callbacks fire from a single TouchArea +
+//     two Timers (hold timer, tap-promotion timer). The state machine is
+//     documented in detail above the `gesture-touch` block below.
+//   * All timing thresholds are READ from `GestureConfigGlobal` (TASK-059)
+//     — never hardcoded. The Rust bridge (`src/ui/bridge.rs::write_gesture_config`)
+//     populates the global from `crate::actions::timing::GestureConfig` at
+//     startup.
+//   * Per `docs/plans/2026-04-28-phase-3-actions.md` `locked_decisions.gesture_config`,
+//     Slint MUST read the explicit `arm-double-tap-timer` boolean to decide
+//     whether to arm the double-tap promotion timer. Slint MUST NOT infer
+//     "double-tap is on" from `double-tap-max-gap-ms == 0` — the Rust side
+//     pre-computes the boolean once.
+//   * Risk #4 (plan): the previous tile-level `TouchArea` was a press-feedback
+//     hook only. To prevent the same touch from being captured by two
+//     overlapping TouchAreas (which would double-fire `tap` or fire a
+//     spurious `tap` on hold-release), CardBase now owns the single
+//     gesture-capture TouchArea. The tile components consume `pressed`
+//     from CardBase (`out` property) instead of declaring their own
+//     TouchArea.
+//
+// Out of scope (do not add here — see TASK-062 / Phase 3):
+//   * Routing the fired callbacks through the Rust dispatcher
+//     (TASK-062 owns `WidgetActionMap` + dispatcher core).
 //   * Tile-specific content (icon, name, state value).
-//   * Hover effects beyond the press visual feedback.
+//   * More-info modal (TASK-066).
 
 import { Theme } from "theme.slint";
+import { GestureConfigGlobal } from "gesture_config.slint";
 
 // AnimationBudget — global gate for the per-frame and total-concurrent
 // animation budget. The Rust bridge (TASK-015) is responsible for:
@@ -60,21 +86,86 @@ export global AnimationBudget {
     out property <bool> at-capacity: active-count >= max-simultaneous;
 }
 
-// CardBase — the chrome wrapper used by every tile. Consumers place tile
-// content inside via `@children`; CardBase handles the surface, border,
-// padding, focus ring, and press visual feedback.
+// CardBase — chrome wrapper + gesture-detection state machine used by every
+// tile. Consumers place tile content inside via `@children`; CardBase handles
+// the surface, border, padding, focus ring, press visual feedback, AND the
+// tap/hold/double-tap gesture detection.
 //
-// Properties:
-//   * pressed — driven by the parent tile's TouchArea (TASK-013). Drives
-//     the press visual feedback (background brighten + accent focus ring).
-//   * focused — keyboard focus indicator. Same accent ring as pressed.
+// Public surface:
+//   * `pressed`  — out: true while the gesture-detection TouchArea has the
+//                  press captured. Tiles read this for visual feedback.
+//   * `focused`  — in: keyboard focus indicator (no callback drives it yet).
+//   * `tap`      — callback: fires once per single-tap.
+//   * `hold`     — callback: fires once per long-press (≥ hold-min-ms).
+//   * `double-tap` — callback: fires once per pair of taps within
+//                    double-tap-max-gap-ms (only when arm-double-tap-timer
+//                    is true).
 //
-// No callbacks are exposed here — tile-level interaction wiring is owned
-// by the tile components and ultimately the Phase 3 action dispatcher.
+// Gesture state machine (TASK-060):
+//
+//   On pointer-event.down:
+//     1. Record `press-started-at = animation-tick()`.
+//     2. Reset `hold-fired = false`.
+//     3. If `pending-tap == true` AND
+//          `(animation-tick() - last-tap-at) <= double-tap-max-gap-ms * 1ms`:
+//        — promote the still-pending single tap to a double-tap.
+//          Stop tap-promotion-timer, clear `pending-tap`, fire `double-tap()`.
+//     4. Start hold-timer (interval = hold-min-ms * 1ms).
+//
+//   On pointer-event.up:
+//     1. Stop hold-timer.
+//     2. If `hold-fired == true` — consume the up; the hold callback already
+//        fired and there must be no spurious `tap` on hold-release (Risk #4).
+//     3. Else if press duration `<= tap-max-ms * 1ms`:
+//          - If `arm-double-tap-timer == false`: fire `tap()` synchronously.
+//          - Else: record `last-tap-at`, set `pending-tap = true`,
+//            start tap-promotion-timer (interval = double-tap-max-gap-ms * 1ms).
+//     4. Else: press exceeded tap window but did not reach hold — drop.
+//
+//   On pointer-event.cancel:
+//     1. Stop both timers, clear `pending-tap`, clear `hold-fired`.
+//
+//   On hold-timer.triggered:
+//     1. self.running = false  (one-shot).
+//     2. If TouchArea is still pressed: set `hold-fired = true`, fire `hold()`.
+//
+//   On tap-promotion-timer.triggered:
+//     1. self.running = false  (one-shot).
+//     2. If `pending-tap == true`: clear it and fire `tap()`.
+//
+// This delivers the three explicit-acceptance invariants:
+//   * Single tap → exactly one `tap` (either synchronous or post-promotion).
+//   * Long-press → exactly one `hold` and zero `tap` on hold-release.
+//   * Two rapid downs (with arm-double-tap-timer) → exactly one `double-tap`,
+//     and the still-pending first-tap is cancelled rather than emitted.
 export component CardBase inherits Rectangle {
     // ── Public properties ───────────────────────────────────────────────────
-    in property <bool> pressed: false;
+    out property <bool> pressed: gesture-touch.pressed;
     in property <bool> focused: false;
+
+    // ── Gesture callbacks (TASK-060) ────────────────────────────────────────
+    // Wired by the Rust bridge / dispatcher in TASK-062. CardBase fires them;
+    // it does NOT route them anywhere — that is dispatcher territory.
+    callback tap();
+    callback hold();
+    callback double-tap();
+
+    // ── Internal gesture state ──────────────────────────────────────────────
+    // `press-started-at` is the animation-tick value at the most recent
+    // pointer-down. Used to classify the corresponding pointer-up as tap or
+    // (timed-out) drop.
+    property <duration> press-started-at: 0ms;
+    // `last-tap-at` is the animation-tick value at the most recent
+    // tap-up. Reset only by a tap firing or a cancel.
+    property <duration> last-tap-at: 0ms;
+    // `pending-tap` is true between a tap-up and the tap-promotion-timer
+    // firing (or being cancelled by a follow-up down). Drives the
+    // single-tap-vs-double-tap branch on the next down.
+    property <bool> pending-tap: false;
+    // `hold-fired` is true once the hold-timer has fired for the in-flight
+    // press. Suppresses the tap branch on the corresponding up so a hold
+    // never produces a spurious tap (Risk #4 explicit acceptance).
+    property <bool> hold-fired: false;
 
     // ── Chrome (surface, border, radius) ────────────────────────────────────
     // Background brightens to `elevated` while pressed for the press feedback.
@@ -108,5 +199,102 @@ export component CardBase inherits Rectangle {
     VerticalLayout {
         padding: Theme.space-3;
         @children
+    }
+
+    // ── Gesture-capture TouchArea (TASK-060) ────────────────────────────────
+    // Single pointer-capture region for the entire card. Sits AFTER the
+    // content layout in the item tree so it overlays it (Slint paints later
+    // children on top, and the TouchArea is intentionally transparent — its
+    // job is event capture, not rendering). This is the ONLY TouchArea on
+    // the card; tile files consume `pressed` from CardBase rather than
+    // declaring their own TouchArea (Risk #4 mitigation).
+    gesture-touch := TouchArea {
+        // Fill the card via Slint's TouchArea default sizing.
+        mouse-cursor: pointer;
+
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                root.press-started-at = animation-tick();
+                root.hold-fired = false;
+                // Detect the second-down side of a double-tap. We branch on
+                // `pending-tap` (set only when arm-double-tap-timer is true)
+                // — there is no zero-gap inference path. The gap check uses
+                // duration arithmetic so the int * 1ms multiplier promotes
+                // `double-tap-max-gap-ms` to a comparable duration.
+                if (root.pending-tap
+                    && (animation-tick() - root.last-tap-at)
+                       <= GestureConfigGlobal.double-tap-max-gap-ms * 1ms) {
+                    tap-promotion-timer.running = false;
+                    root.pending-tap = false;
+                    root.double-tap();
+                }
+                hold-timer.running = true;
+            } else if (event.kind == PointerEventKind.up) {
+                hold-timer.running = false;
+                if (root.hold-fired) {
+                    // Hold already fired — DO NOT also emit `tap` on the
+                    // corresponding release. This is the spurious-tap
+                    // suppression Risk #4 names explicitly.
+                    root.hold-fired = false;
+                } else if ((animation-tick() - root.press-started-at)
+                           <= GestureConfigGlobal.tap-max-ms * 1ms) {
+                    if (GestureConfigGlobal.arm-double-tap-timer) {
+                        // Arm the promotion timer: tap fires after the gap
+                        // unless a second down arrives within the window.
+                        root.last-tap-at = animation-tick();
+                        root.pending-tap = true;
+                        tap-promotion-timer.running = true;
+                    } else {
+                        // No double-tap path — fire synchronously. Slint
+                        // never infers double-tap from a zero gap; this
+                        // branch is reached only when the explicit boolean
+                        // is false (locked_decisions.gesture_config).
+                        root.tap();
+                    }
+                }
+                // Press exceeded tap-max-ms but never reached hold-min-ms:
+                // intentional drop. The user lifted in the dead zone.
+            } else if (event.kind == PointerEventKind.cancel) {
+                hold-timer.running = false;
+                tap-promotion-timer.running = false;
+                root.pending-tap = false;
+                root.hold-fired = false;
+            }
+        }
+    }
+
+    // ── Hold timer (TASK-060) ───────────────────────────────────────────────
+    // One-shot. Armed on pointer-down, disarmed on pointer-up or cancel.
+    // Fires `hold()` only if the TouchArea is still pressed at trigger time
+    // (defensive: if the user lifted *exactly* between pointer-event.up
+    // running `running = false` and the timer firing one tick later, we do
+    // not want a hold against an already-released press).
+    hold-timer := Timer {
+        interval: GestureConfigGlobal.hold-min-ms * 1ms;
+        running: false;
+        triggered => {
+            self.running = false;
+            if (gesture-touch.pressed) {
+                root.hold-fired = true;
+                root.hold();
+            }
+        }
+    }
+
+    // ── Tap-promotion timer (TASK-060) ──────────────────────────────────────
+    // One-shot. Armed on a tap-classified pointer-up when
+    // `arm-double-tap-timer == true`. If a second down arrives within
+    // `double-tap-max-gap-ms`, the down-handler cancels this timer and
+    // fires `double-tap` instead. Otherwise this timer fires `tap`.
+    tap-promotion-timer := Timer {
+        interval: GestureConfigGlobal.double-tap-max-gap-ms * 1ms;
+        running: false;
+        triggered => {
+            self.running = false;
+            if (root.pending-tap) {
+                root.pending-tap = false;
+                root.tap();
+            }
+        }
     }
 }

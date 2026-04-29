@@ -66,17 +66,13 @@ export struct SensorTileVM {
 // Layout mirrors LightTile (header row + value line) but the value uses
 // text-primary in font-xxl to make sensor readings the focal element of
 // the tile (per docs/PHASES.md "hero numbers" font-size guidance).
+//
+// Press feedback + gesture detection live on CardBase (TASK-060). Tile-
+// level TouchArea removed to avoid double-capture (Risk #4).
 export component SensorTile inherits Rectangle {
     in property <SensorTileVM> view-model;
 
-    property <bool> pressed: touch.pressed;
-
-    touch := TouchArea {
-        // No callbacks wired in Phase 1 — see Out of scope above.
-    }
-
     base := CardBase {
-        pressed: pressed;
 
         VerticalLayout {
             spacing: Theme.space-2;

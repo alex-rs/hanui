@@ -22,5 +22,16 @@
 #[expect(dead_code)]
 pub mod mock_ws;
 
+// Re-expose the headless Slint harness (TASK-074) so the gesture-layer tests
+// (TASK-060) can construct a `HeadlessRenderer` without spinning up a window
+// system. The harness's own smoke test runs as a separate `[[test]]` target
+// (`slint_harness_smoke`); here we only consume its API. Smoke-test items
+// inside the file are gated on `#[cfg(test)]`, which is true for this
+// integration binary as well.
+#[path = "../common/slint_harness.rs"]
+#[expect(dead_code)]
+pub mod slint_harness;
+
+pub mod gesture_layer;
 pub mod lagged_resync;
 pub mod ws_client;
