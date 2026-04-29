@@ -1,0 +1,476 @@
+//! `WidgetActionMap` — the dispatcher's lookup table from `WidgetId` to
+//! `(entity_id, tap, hold, double_tap)`.
+//!
+//! Phase 3 ships this module with an in-code builder driven from
+//! [`crate::dashboard::view_spec::Dashboard`]; Phase 4 will replace the
+//! builder with a YAML deserializer without changing the lookup API or the
+//! dispatcher (locked_decisions.phase4_forward_compat).
+//!
+//! # Why each entry carries `entity_id`
+//!
+//! Per `docs/plans/2026-04-28-phase-3-actions.md`
+//! `locked_decisions.more_info_modal`, the WidgetActionMap entry is the
+//! single source of truth for the entity associated with a widget at
+//! dispatch time. The dispatcher reads `entity_id` from the entry for both
+//! WS dispatch (Toggle / CallService default-target) and more-info modal
+//! routing — it never performs a second lookup against the dashboard view
+//! spec while resolving an action (Risk #12).
+//!
+//! Widgets that have no associated HA entity are skipped by
+//! [`WidgetActionMap::from_view_spec`]: there is nothing for the dispatcher
+//! to route on. The Phase 4 YAML loader is expected to enforce the same
+//! invariant at parse time.
+
+use std::collections::HashMap;
+use std::fmt;
+
+use smol_str::SmolStr;
+
+use crate::actions::Action;
+use crate::dashboard::view_spec::Dashboard;
+use crate::ha::entity::EntityId;
+
+// ---------------------------------------------------------------------------
+// WidgetId
+// ---------------------------------------------------------------------------
+
+/// Newtype wrapper around the user-authored widget id (`Widget.id`).
+///
+/// Kept structurally identical to [`EntityId`]: a [`SmolStr`] inside, so
+/// short ids (the common case) avoid heap allocation. The dispatcher hashes
+/// `WidgetId` directly without going through the `String` representation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WidgetId(SmolStr);
+
+impl WidgetId {
+    /// Returns the string slice of this widget id.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Display for WidgetId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+
+impl From<&str> for WidgetId {
+    fn from(s: &str) -> Self {
+        WidgetId(SmolStr::new(s))
+    }
+}
+
+impl From<String> for WidgetId {
+    fn from(s: String) -> Self {
+        WidgetId(SmolStr::new(s))
+    }
+}
+
+impl AsRef<str> for WidgetId {
+    fn as_ref(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WidgetActionEntry
+// ---------------------------------------------------------------------------
+
+/// One row of the [`WidgetActionMap`].
+///
+/// Carries the widget's associated entity id alongside the three gesture
+/// actions. Per `locked_decisions.more_info_modal`, `entity_id` is present
+/// even when none of the action variants references it — the dispatcher
+/// reads it directly for `MoreInfo` modal routing and for Toggle's domain
+/// resolution, so a single source of truth lives here.
+///
+/// Action fields use `Action::None` as the absent sentinel, matching the
+/// canonical schema. A widget with no `tap_action` configured therefore has
+/// `tap: Action::None` rather than a separate `Option` indirection — the
+/// dispatcher's match handles `Action::None` as a no-op.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WidgetActionEntry {
+    /// The HA entity id this widget is bound to. Required for both
+    /// dispatch (Toggle / CallService default-target) and `MoreInfo`
+    /// routing.
+    pub entity_id: EntityId,
+    /// Action fired on a single tap.
+    pub tap: Action,
+    /// Action fired on a long press.
+    pub hold: Action,
+    /// Action fired on a double tap.
+    pub double_tap: Action,
+}
+
+// ---------------------------------------------------------------------------
+// WidgetActionMap
+// ---------------------------------------------------------------------------
+
+/// Lookup table from [`WidgetId`] to [`WidgetActionEntry`].
+///
+/// Built from the dashboard view spec in Phase 3 via
+/// [`WidgetActionMap::from_view_spec`]; Phase 4 will swap the constructor
+/// for a YAML loader without changing the read API.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WidgetActionMap {
+    inner: HashMap<WidgetId, WidgetActionEntry>,
+}
+
+impl WidgetActionMap {
+    /// Construct an empty map.
+    #[must_use]
+    pub fn new() -> Self {
+        WidgetActionMap {
+            inner: HashMap::new(),
+        }
+    }
+
+    /// Build a [`WidgetActionMap`] from a [`Dashboard`].
+    ///
+    /// Walks every view → section → widget. For each widget that has an
+    /// `entity` set, inserts an entry keyed by `widget.id` carrying:
+    ///
+    /// * `entity_id`         — `widget.entity` (parsed via [`EntityId::from`]).
+    /// * `tap` / `hold` / `double_tap` — the corresponding `Option<Action>`
+    ///   field, defaulting to [`Action::None`] when the field is `None`.
+    ///
+    /// Widgets without an `entity` are skipped: they have nothing for the
+    /// dispatcher to route on. Phase 4's YAML loader is expected to refuse
+    /// configs that pair a non-`None` action with a missing entity.
+    ///
+    /// If the dashboard contains duplicate widget ids across views or
+    /// sections the **last** occurrence wins; this matches `HashMap`'s
+    /// natural behaviour and is a documented gotcha for the Phase 4 schema
+    /// validator. Phase 3's hand-built `default_dashboard` does not produce
+    /// duplicates, so the policy is observable but not exercised in the
+    /// fixture.
+    #[must_use]
+    pub fn from_view_spec(spec: &Dashboard) -> Self {
+        let mut map = HashMap::new();
+        for view in &spec.views {
+            for section in &view.sections {
+                for widget in &section.widgets {
+                    let Some(entity_str) = widget.entity.as_deref() else {
+                        continue;
+                    };
+                    let entry = WidgetActionEntry {
+                        entity_id: EntityId::from(entity_str),
+                        tap: widget.tap_action.clone().unwrap_or(Action::None),
+                        hold: widget.hold_action.clone().unwrap_or(Action::None),
+                        double_tap: widget.double_tap_action.clone().unwrap_or(Action::None),
+                    };
+                    map.insert(WidgetId::from(widget.id.as_str()), entry);
+                }
+            }
+        }
+        WidgetActionMap { inner: map }
+    }
+
+    /// Look up the action entry for a widget.
+    ///
+    /// Returns `None` when the widget has no entry — typically because it
+    /// has no associated HA entity, or because the widget id was never
+    /// registered. The dispatcher treats `None` as
+    /// [`crate::actions::dispatcher::DispatchError::UnknownWidget`].
+    #[must_use]
+    pub fn lookup(&self, widget_id: &WidgetId) -> Option<&WidgetActionEntry> {
+        self.inner.get(widget_id)
+    }
+
+    /// Return the number of registered widgets. Test/debug helper.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Whether the map has zero entries. Test/debug helper.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Insert (or replace) an entry directly.
+    ///
+    /// Used by tests that build minimal fixtures without going through a
+    /// full `Dashboard`. Production callers go via
+    /// [`WidgetActionMap::from_view_spec`].
+    pub fn insert(&mut self, widget_id: WidgetId, entry: WidgetActionEntry) {
+        self.inner.insert(widget_id, entry);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dashboard::view_spec::default_dashboard;
+
+    // -----------------------------------------------------------------------
+    // WidgetId
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn widget_id_round_trips_str_form() {
+        let id = WidgetId::from("kitchen_light");
+        assert_eq!(id.as_str(), "kitchen_light");
+        assert_eq!(id.to_string(), "kitchen_light");
+        let s: &str = id.as_ref();
+        assert_eq!(s, "kitchen_light");
+    }
+
+    #[test]
+    fn widget_id_from_owned_string_works() {
+        let owned = String::from("entity_tile_living");
+        let id = WidgetId::from(owned);
+        assert_eq!(id.as_str(), "entity_tile_living");
+    }
+
+    #[test]
+    fn widget_ids_compare_by_value() {
+        let a = WidgetId::from("kitchen_light");
+        let b = WidgetId::from("kitchen_light");
+        let c = WidgetId::from("hallway_temperature");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    // -----------------------------------------------------------------------
+    // WidgetActionMap basics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn new_map_is_empty() {
+        let map = WidgetActionMap::new();
+        assert!(map.is_empty());
+        assert_eq!(map.len(), 0);
+        assert!(map.lookup(&WidgetId::from("anything")).is_none());
+    }
+
+    #[test]
+    fn insert_then_lookup_returns_inserted_entry() {
+        let mut map = WidgetActionMap::new();
+        let entry = WidgetActionEntry {
+            entity_id: EntityId::from("light.kitchen"),
+            tap: Action::Toggle,
+            hold: Action::MoreInfo,
+            double_tap: Action::None,
+        };
+        map.insert(WidgetId::from("kitchen_light"), entry.clone());
+        let looked = map
+            .lookup(&WidgetId::from("kitchen_light"))
+            .expect("inserted entry must be visible");
+        assert_eq!(looked, &entry);
+        assert_eq!(map.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // entity_id presence on every entry — locked_decisions.more_info_modal
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn every_entry_built_from_view_spec_carries_entity_id() {
+        // This is the Phase 3 invariant from
+        // `locked_decisions.more_info_modal` and acceptance criterion.
+        // No entry is allowed to omit `entity_id`.
+        let dashboard = default_dashboard();
+        let map = WidgetActionMap::from_view_spec(&dashboard);
+        assert!(
+            !map.is_empty(),
+            "default_dashboard fixture must produce at least one entry"
+        );
+        for (widget_id, entry) in &map.inner {
+            // entity_id must be a non-empty string — entry construction
+            // skips widgets where `entity` is None, so reaching this loop
+            // already proves entity_id was populated. Defence-in-depth:
+            // assert it's non-empty too.
+            assert!(
+                !entry.entity_id.as_str().is_empty(),
+                "entity_id must be non-empty for widget {widget_id}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // from_view_spec round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_view_spec_populates_kitchen_light_with_toggle_and_more_info() {
+        let dashboard = default_dashboard();
+        let map = WidgetActionMap::from_view_spec(&dashboard);
+        let entry = map
+            .lookup(&WidgetId::from("kitchen_light"))
+            .expect("kitchen_light fixture entry must be present");
+        assert_eq!(entry.entity_id, EntityId::from("light.kitchen"));
+        assert_eq!(entry.tap, Action::Toggle);
+        assert_eq!(entry.hold, Action::MoreInfo);
+        assert_eq!(entry.double_tap, Action::None);
+    }
+
+    #[test]
+    fn from_view_spec_defaults_missing_actions_to_action_none() {
+        // hallway_temperature in the fixture has all three actions set to
+        // None; the map entry must reflect Action::None for each.
+        let dashboard = default_dashboard();
+        let map = WidgetActionMap::from_view_spec(&dashboard);
+        let entry = map
+            .lookup(&WidgetId::from("hallway_temperature"))
+            .expect("hallway_temperature fixture entry must be present");
+        assert_eq!(
+            entry.entity_id,
+            EntityId::from("sensor.hallway_temperature")
+        );
+        assert_eq!(entry.tap, Action::None);
+        assert_eq!(entry.hold, Action::None);
+        assert_eq!(entry.double_tap, Action::None);
+    }
+
+    #[test]
+    fn from_view_spec_preserves_navigate_action_on_double_tap() {
+        // living_room_entity in the fixture has a double_tap_action of
+        // Navigate { view_id: "home" }. The map must round-trip the
+        // payload without re-encoding the variant.
+        let dashboard = default_dashboard();
+        let map = WidgetActionMap::from_view_spec(&dashboard);
+        let entry = map
+            .lookup(&WidgetId::from("living_room_entity"))
+            .expect("living_room_entity fixture entry must be present");
+        assert_eq!(entry.entity_id, EntityId::from("switch.outlet_1"));
+        assert_eq!(entry.tap, Action::Toggle);
+        assert_eq!(entry.hold, Action::MoreInfo);
+        assert_eq!(
+            entry.double_tap,
+            Action::Navigate {
+                view_id: "home".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn from_view_spec_skips_widgets_without_entity() {
+        // Build a widget with `entity: None` and assert it is omitted.
+        use crate::dashboard::view_spec::{
+            Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
+        };
+        let dashboard = Dashboard {
+            version: 1,
+            device_profile: "rpi4".to_owned(),
+            home_assistant: None,
+            theme: None,
+            default_view: "home".to_owned(),
+            views: vec![View {
+                id: "home".to_owned(),
+                title: "Home".to_owned(),
+                layout: Layout::Sections,
+                sections: vec![Section {
+                    id: "overview".to_owned(),
+                    title: "Overview".to_owned(),
+                    widgets: vec![Widget {
+                        id: "no_entity_widget".to_owned(),
+                        widget_type: WidgetKind::EntityTile,
+                        entity: None,
+                        entities: vec![],
+                        name: None,
+                        icon: None,
+                        tap_action: Some(Action::Toggle),
+                        hold_action: None,
+                        double_tap_action: None,
+                        layout: WidgetLayout {
+                            preferred_columns: 1,
+                            preferred_rows: 1,
+                        },
+                        options: vec![],
+                        placement: None,
+                    }],
+                }],
+            }],
+        };
+        let map = WidgetActionMap::from_view_spec(&dashboard);
+        assert!(
+            map.lookup(&WidgetId::from("no_entity_widget")).is_none(),
+            "widget without `entity` must be omitted from the map"
+        );
+        assert!(
+            map.is_empty(),
+            "no entries should be produced when only entity-less widgets exist"
+        );
+    }
+
+    #[test]
+    fn from_view_spec_traverses_multiple_sections_and_views() {
+        use crate::dashboard::view_spec::{
+            Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
+        };
+        // Two views, each with one widget, both bound to entities.
+        fn make_widget(id: &str, entity: &str) -> Widget {
+            Widget {
+                id: id.to_owned(),
+                widget_type: WidgetKind::EntityTile,
+                entity: Some(entity.to_owned()),
+                entities: vec![],
+                name: None,
+                icon: None,
+                tap_action: Some(Action::Toggle),
+                hold_action: None,
+                double_tap_action: None,
+                layout: WidgetLayout {
+                    preferred_columns: 1,
+                    preferred_rows: 1,
+                },
+                options: vec![],
+                placement: None,
+            }
+        }
+        let dashboard = Dashboard {
+            version: 1,
+            device_profile: "rpi4".to_owned(),
+            home_assistant: None,
+            theme: None,
+            default_view: "home".to_owned(),
+            views: vec![
+                View {
+                    id: "home".to_owned(),
+                    title: "Home".to_owned(),
+                    layout: Layout::Sections,
+                    sections: vec![Section {
+                        id: "main".to_owned(),
+                        title: "Main".to_owned(),
+                        widgets: vec![make_widget("alpha", "switch.alpha")],
+                    }],
+                },
+                View {
+                    id: "office".to_owned(),
+                    title: "Office".to_owned(),
+                    layout: Layout::Sections,
+                    sections: vec![Section {
+                        id: "desk".to_owned(),
+                        title: "Desk".to_owned(),
+                        widgets: vec![make_widget("beta", "light.beta")],
+                    }],
+                },
+            ],
+        };
+        let map = WidgetActionMap::from_view_spec(&dashboard);
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.lookup(&WidgetId::from("alpha")).unwrap().entity_id,
+            EntityId::from("switch.alpha")
+        );
+        assert_eq!(
+            map.lookup(&WidgetId::from("beta")).unwrap().entity_id,
+            EntityId::from("light.beta")
+        );
+    }
+
+    #[test]
+    fn lookup_unknown_widget_returns_none() {
+        let dashboard = default_dashboard();
+        let map = WidgetActionMap::from_view_spec(&dashboard);
+        assert!(map.lookup(&WidgetId::from("does_not_exist")).is_none());
+    }
+}

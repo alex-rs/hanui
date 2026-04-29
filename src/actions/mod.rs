@@ -6,15 +6,14 @@
 //! | Submodule | Ticket | Contents |
 //! |---|---|---|
 //! | [`schema`] | TASK-058 | `Action`, `ActionSpec`, `Idempotency` |
-//! | [`timing`] | TASK-059 (this) | `GestureConfig`, `ActionTiming`, `ActionOverlapStrategy` |
-//! | `map`      | TASK-062 | `WidgetActionMap` |
-//! | `dispatcher` | TASK-062 | `dispatch()` |
+//! | [`timing`] | TASK-059 | `GestureConfig`, `ActionTiming`, `ActionOverlapStrategy` |
+//! | [`map`]    | TASK-062 | `WidgetActionMap`, `WidgetActionEntry`, `WidgetId` |
+//! | [`dispatcher`] | TASK-062 | `Dispatcher`, `DispatchOutcome`, `DispatchError`, `Gesture` |
 //! | `url`      | TASK-063 | `Url` action handler |
 //! | `queue`    | TASK-065 | offline FIFO queue |
-//!
-//! `schema` and `timing` exist today; the rest are added by their respective
-//! tickets.
 
+pub mod dispatcher;
+pub mod map;
 pub mod schema;
 pub mod timing;
 
