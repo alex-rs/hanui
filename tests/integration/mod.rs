@@ -32,6 +32,7 @@ pub mod mock_ws;
 #[expect(dead_code)]
 pub mod slint_harness;
 
+pub mod actions_protocol;
 pub mod command_tx;
 pub mod gesture_layer;
 pub mod lagged_resync;
