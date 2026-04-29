@@ -18,9 +18,18 @@
 //! while resolving an action (Risk #12).
 //!
 //! Widgets that have no associated HA entity are skipped by
-//! [`WidgetActionMap::from_view_spec`]: there is nothing for the dispatcher
+//! [`WidgetActionMap::from_dashboard`]: there is nothing for the dispatcher
 //! to route on. The Phase 4 YAML loader enforces the same invariant at
 //! parse time.
+//!
+//! # Widget-id collision policy
+//!
+//! If two widgets share the same `id` (intentional or accidental), the
+//! **last** occurrence in document order wins. `HashMap`'s natural `insert`
+//! behaviour provides this: the earlier entry is silently overwritten.
+//! A `tracing::warn!` is emitted at population time so operators can detect
+//! collisions from logs. Phase 5 may harden this to a load-time error if
+//! required.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -111,9 +120,11 @@ pub struct WidgetActionEntry {
 
 /// Lookup table from [`WidgetId`] to [`WidgetActionEntry`].
 ///
-/// Built from the dashboard view spec in Phase 3 via
-/// [`WidgetActionMap::from_view_spec`]; Phase 4 will swap the constructor
-/// for a YAML loader without changing the read API.
+/// Built from a [`Dashboard`] via [`WidgetActionMap::from_dashboard`].
+/// The constructor walks every `view → section → widget` triple in the
+/// dashboard; Phase 3 used `fixture_dashboard()` as the source, Phase 4
+/// uses the YAML-loaded `Dashboard` returned by `loader::load`. The read
+/// API (lookup, len, is_empty) is unchanged — only the data source changed.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WidgetActionMap {
     inner: HashMap<WidgetId, WidgetActionEntry>,
@@ -142,12 +153,15 @@ impl WidgetActionMap {
     /// non-`None` action with a missing entity.
     ///
     /// If the dashboard contains duplicate widget ids across views or
-    /// sections the **last** occurrence wins; this matches `HashMap`'s
-    /// natural behaviour and is a documented gotcha for the Phase 4 schema
-    /// validator. The fixture dashboard (`fixture_dashboard`) does not produce
-    /// duplicates, so the policy is observable but not exercised there.
+    /// sections the **last** occurrence wins (documented gotcha; see
+    /// module-level comment on the collision policy). A `tracing::warn!` is
+    /// emitted so operators can detect collisions from logs.
+    ///
+    /// All callers — including the `--fixture` path in `src/lib.rs` and the
+    /// Phase 4 live-HA path — call this function; only the `Dashboard` they
+    /// pass in differs (fixture vs. YAML-loaded).
     #[must_use]
-    pub fn from_view_spec(spec: &Dashboard) -> Self {
+    pub fn from_dashboard(spec: &Dashboard) -> Self {
         let mut map = HashMap::new();
         for view in &spec.views {
             for section in &view.sections {
@@ -155,13 +169,20 @@ impl WidgetActionMap {
                     let Some(entity_str) = widget.entity.as_deref() else {
                         continue;
                     };
+                    let widget_id = WidgetId::from(widget.id.as_str());
+                    if map.contains_key(&widget_id) {
+                        tracing::warn!(
+                            widget_id = %widget_id,
+                            "duplicate widget id in dashboard — last occurrence wins"
+                        );
+                    }
                     let entry = WidgetActionEntry {
                         entity_id: EntityId::from(entity_str),
                         tap: widget.tap_action.clone().unwrap_or(Action::None),
                         hold: widget.hold_action.clone().unwrap_or(Action::None),
                         double_tap: widget.double_tap_action.clone().unwrap_or(Action::None),
                     };
-                    map.insert(WidgetId::from(widget.id.as_str()), entry);
+                    map.insert(widget_id, entry);
                 }
             }
         }
@@ -195,7 +216,7 @@ impl WidgetActionMap {
     ///
     /// Used by tests that build minimal fixtures without going through a
     /// full `Dashboard`. Production callers go via
-    /// [`WidgetActionMap::from_view_spec`].
+    /// [`WidgetActionMap::from_dashboard`].
     pub fn insert(&mut self, widget_id: WidgetId, entry: WidgetActionEntry) {
         self.inner.insert(widget_id, entry);
     }
@@ -273,12 +294,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn every_entry_built_from_view_spec_carries_entity_id() {
+    fn every_entry_built_from_dashboard_carries_entity_id() {
         // This is the Phase 3 invariant from
         // `locked_decisions.more_info_modal` and acceptance criterion.
         // No entry is allowed to omit `entity_id`.
         let dashboard = fixture_dashboard();
-        let map = WidgetActionMap::from_view_spec(&dashboard);
+        let map = WidgetActionMap::from_dashboard(&dashboard);
         assert!(
             !map.is_empty(),
             "fixture_dashboard must produce at least one entry"
@@ -296,13 +317,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // from_view_spec round-trip
+    // from_dashboard round-trip
     // -----------------------------------------------------------------------
 
     #[test]
-    fn from_view_spec_populates_kitchen_light_with_toggle_and_more_info() {
+    fn from_dashboard_populates_kitchen_light_with_toggle_and_more_info() {
         let dashboard = fixture_dashboard();
-        let map = WidgetActionMap::from_view_spec(&dashboard);
+        let map = WidgetActionMap::from_dashboard(&dashboard);
         let entry = map
             .lookup(&WidgetId::from("kitchen_light"))
             .expect("kitchen_light fixture entry must be present");
@@ -313,11 +334,11 @@ mod tests {
     }
 
     #[test]
-    fn from_view_spec_defaults_missing_actions_to_action_none() {
+    fn from_dashboard_defaults_missing_actions_to_action_none() {
         // hallway_temperature in the fixture has all three actions set to
         // None; the map entry must reflect Action::None for each.
         let dashboard = fixture_dashboard();
-        let map = WidgetActionMap::from_view_spec(&dashboard);
+        let map = WidgetActionMap::from_dashboard(&dashboard);
         let entry = map
             .lookup(&WidgetId::from("hallway_temperature"))
             .expect("hallway_temperature fixture entry must be present");
@@ -331,12 +352,12 @@ mod tests {
     }
 
     #[test]
-    fn from_view_spec_preserves_navigate_action_on_double_tap() {
+    fn from_dashboard_preserves_navigate_action_on_double_tap() {
         // living_room_entity in the fixture has a double_tap_action of
         // Navigate { view_id: "home" }. The map must round-trip the
         // payload without re-encoding the variant.
         let dashboard = fixture_dashboard();
-        let map = WidgetActionMap::from_view_spec(&dashboard);
+        let map = WidgetActionMap::from_dashboard(&dashboard);
         let entry = map
             .lookup(&WidgetId::from("living_room_entity"))
             .expect("living_room_entity fixture entry must be present");
@@ -352,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn from_view_spec_skips_widgets_without_entity() {
+    fn from_dashboard_skips_widgets_without_entity() {
         // Build a widget with `entity: None` and assert it is omitted.
         use crate::dashboard::schema::{
             Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
@@ -393,7 +414,7 @@ mod tests {
                 }],
             }],
         };
-        let map = WidgetActionMap::from_view_spec(&dashboard);
+        let map = WidgetActionMap::from_dashboard(&dashboard);
         assert!(
             map.lookup(&WidgetId::from("no_entity_widget")).is_none(),
             "widget without `entity` must be omitted from the map"
@@ -405,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn from_view_spec_traverses_multiple_sections_and_views() {
+    fn from_dashboard_traverses_multiple_sections_and_views() {
         use crate::dashboard::schema::{
             Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
         };
@@ -462,7 +483,7 @@ mod tests {
                 },
             ],
         };
-        let map = WidgetActionMap::from_view_spec(&dashboard);
+        let map = WidgetActionMap::from_dashboard(&dashboard);
         assert_eq!(map.len(), 2);
         assert_eq!(
             map.lookup(&WidgetId::from("alpha")).unwrap().entity_id,
@@ -475,9 +496,303 @@ mod tests {
     }
 
     #[test]
+    fn from_dashboard_duplicate_widget_id_last_occurrence_wins() {
+        // Exercises the `tracing::warn!` collision branch: two widgets with the
+        // same id; the second one's `tap_action` must overwrite the first.
+        // This pins the documented "last occurrence wins" policy and covers
+        // the warn-emit code path that would otherwise be uncovered.
+        use crate::dashboard::schema::{
+            Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
+        };
+        fn make_widget_with_action(id: &str, entity: &str, action: Action) -> Widget {
+            Widget {
+                id: id.to_owned(),
+                widget_type: WidgetKind::EntityTile,
+                entity: Some(entity.to_owned()),
+                entities: vec![],
+                name: None,
+                icon: None,
+                tap_action: Some(action),
+                hold_action: None,
+                double_tap_action: None,
+                layout: WidgetLayout {
+                    preferred_columns: 1,
+                    preferred_rows: 1,
+                },
+                options: None,
+                placement: None,
+                visibility: "always".to_string(),
+            }
+        }
+        let dashboard = Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            version: 1,
+            device_profile: ProfileKey::Rpi4,
+            home_assistant: None,
+            theme: None,
+            default_view: "home".to_owned(),
+            views: vec![View {
+                id: "home".to_owned(),
+                title: "Home".to_owned(),
+                layout: Layout::Sections,
+                sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
+                    id: "main".to_owned(),
+                    title: "Main".to_owned(),
+                    widgets: vec![
+                        // First occurrence: tap → Toggle.
+                        make_widget_with_action("dup_id", "switch.alpha", Action::Toggle),
+                        // Second occurrence (collision): tap → MoreInfo. Overwrites the first.
+                        make_widget_with_action("dup_id", "switch.beta", Action::MoreInfo),
+                    ],
+                }],
+            }],
+        };
+        let map = WidgetActionMap::from_dashboard(&dashboard);
+        // Only one entry — second occurrence won.
+        assert_eq!(map.len(), 1);
+        let entry = map
+            .lookup(&WidgetId::from("dup_id"))
+            .expect("dup_id present");
+        assert_eq!(entry.entity_id, EntityId::from("switch.beta"));
+        assert_eq!(entry.tap, Action::MoreInfo);
+    }
+
+    #[test]
     fn lookup_unknown_widget_returns_none() {
         let dashboard = fixture_dashboard();
-        let map = WidgetActionMap::from_view_spec(&dashboard);
+        let map = WidgetActionMap::from_dashboard(&dashboard);
         assert!(map.lookup(&WidgetId::from("does_not_exist")).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-088 acceptance tests
+    // -----------------------------------------------------------------------
+
+    /// Acceptance: a Dashboard with zero widgets produces an empty
+    /// WidgetActionMap (no panic, no error).
+    #[test]
+    fn populate_from_empty_dashboard_yields_empty_map() {
+        use crate::dashboard::schema::{Dashboard, Layout, ProfileKey, Section, View};
+        let dashboard = Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            version: 1,
+            device_profile: ProfileKey::Rpi4,
+            home_assistant: None,
+            theme: None,
+            default_view: "home".to_owned(),
+            views: vec![View {
+                id: "home".to_owned(),
+                title: "Home".to_owned(),
+                layout: Layout::Sections,
+                sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
+                    id: "s1".to_owned(),
+                    title: "Empty".to_owned(),
+                    widgets: vec![],
+                }],
+            }],
+        };
+        let map = WidgetActionMap::from_dashboard(&dashboard);
+        assert!(
+            map.is_empty(),
+            "Dashboard with zero widgets must produce an empty WidgetActionMap"
+        );
+        assert_eq!(map.len(), 0);
+    }
+
+    /// Acceptance: a Dashboard with one widget carrying all three action kinds
+    /// round-trips every action variant correctly.
+    ///
+    /// Simulates what the YAML loader would produce for:
+    /// ```yaml
+    /// tap_action:
+    ///   action: call-service
+    ///   domain: light
+    ///   service: turn_on
+    /// hold_action:
+    ///   action: more-info
+    /// double_tap_action:
+    ///   action: navigate
+    ///   view-id: settings
+    /// ```
+    #[test]
+    fn tap_hold_double_tap_propagate_from_yaml() {
+        use crate::dashboard::schema::{
+            Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
+        };
+
+        let tap = Action::CallService {
+            domain: "light".to_owned(),
+            service: "turn_on".to_owned(),
+            target: Some("light.kitchen".to_owned()),
+            data: None,
+        };
+        let hold = Action::MoreInfo;
+        let double_tap = Action::Navigate {
+            view_id: "settings".to_owned(),
+        };
+
+        let dashboard = Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            version: 1,
+            device_profile: ProfileKey::Rpi4,
+            home_assistant: None,
+            theme: None,
+            default_view: "home".to_owned(),
+            views: vec![View {
+                id: "home".to_owned(),
+                title: "Home".to_owned(),
+                layout: Layout::Sections,
+                sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
+                    id: "lights".to_owned(),
+                    title: "Lights".to_owned(),
+                    widgets: vec![Widget {
+                        id: "kitchen_light".to_owned(),
+                        widget_type: WidgetKind::LightTile,
+                        entity: Some("light.kitchen".to_owned()),
+                        entities: vec![],
+                        name: None,
+                        icon: None,
+                        tap_action: Some(tap.clone()),
+                        hold_action: Some(hold.clone()),
+                        double_tap_action: Some(double_tap.clone()),
+                        layout: WidgetLayout {
+                            preferred_columns: 2,
+                            preferred_rows: 2,
+                        },
+                        options: None,
+                        placement: None,
+                        visibility: "always".to_string(),
+                    }],
+                }],
+            }],
+        };
+
+        let map = WidgetActionMap::from_dashboard(&dashboard);
+        assert_eq!(map.len(), 1, "must produce exactly one entry");
+
+        let entry = map
+            .lookup(&WidgetId::from("kitchen_light"))
+            .expect("kitchen_light entry must be present");
+
+        assert_eq!(
+            entry.entity_id,
+            EntityId::from("light.kitchen"),
+            "entity_id must match the widget's entity field"
+        );
+        assert_eq!(
+            entry.tap, tap,
+            "tap action must round-trip: CallService(light.turn_on)"
+        );
+        assert_eq!(entry.hold, hold, "hold action must round-trip: MoreInfo");
+        assert_eq!(
+            entry.double_tap, double_tap,
+            "double_tap action must round-trip: Navigate(settings)"
+        );
+    }
+
+    /// Acceptance: a widget with NO explicit tap_action produces
+    /// `tap == Action::None`.
+    #[test]
+    fn populate_from_loaded_dashboard() {
+        use crate::dashboard::schema::{
+            Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
+        };
+
+        // Widget with entity but no actions set — models the YAML-loaded
+        // case where all three action fields are absent from the YAML.
+        let dashboard = Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            version: 1,
+            device_profile: ProfileKey::Rpi4,
+            home_assistant: None,
+            theme: None,
+            default_view: "home".to_owned(),
+            views: vec![View {
+                id: "home".to_owned(),
+                title: "Home".to_owned(),
+                layout: Layout::Sections,
+                sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
+                    id: "sensors".to_owned(),
+                    title: "Sensors".to_owned(),
+                    widgets: vec![Widget {
+                        id: "temp_sensor".to_owned(),
+                        widget_type: WidgetKind::SensorTile,
+                        entity: Some("sensor.temp".to_owned()),
+                        entities: vec![],
+                        name: None,
+                        icon: None,
+                        // No actions set — simulates a YAML config that omits
+                        // tap_action / hold_action / double_tap_action entirely.
+                        tap_action: None,
+                        hold_action: None,
+                        double_tap_action: None,
+                        layout: WidgetLayout {
+                            preferred_columns: 2,
+                            preferred_rows: 1,
+                        },
+                        options: None,
+                        placement: None,
+                        visibility: "always".to_string(),
+                    }],
+                }],
+            }],
+        };
+
+        let map = WidgetActionMap::from_dashboard(&dashboard);
+        assert_eq!(map.len(), 1, "one widget with entity must yield one entry");
+
+        let entry = map
+            .lookup(&WidgetId::from("temp_sensor"))
+            .expect("temp_sensor entry must be present");
+
+        assert_eq!(
+            entry.entity_id,
+            EntityId::from("sensor.temp"),
+            "entity_id must match YAML entity field"
+        );
+        // All three actions absent from YAML → Action::None in the map.
+        assert_eq!(
+            entry.tap,
+            Action::None,
+            "missing tap_action must produce Action::None"
+        );
+        assert_eq!(
+            entry.hold,
+            Action::None,
+            "missing hold_action must produce Action::None"
+        );
+        assert_eq!(
+            entry.double_tap,
+            Action::None,
+            "missing double_tap_action must produce Action::None"
+        );
+    }
+
+    /// Mechanical gate (Risk #8): assert that the production function
+    /// `from_dashboard` in this file does NOT call `default_dashboard()`.
+    ///
+    /// This test reads the source of `src/actions/map.rs` at test time and
+    /// asserts the forbidden string is absent outside the `mod tests` block.
+    /// Any future regression where in-code fixture construction sneaks into
+    /// the production path is caught here before reaching CI.
+    #[test]
+    fn default_dashboard_not_called_in_production_paths() {
+        let source = std::fs::read_to_string("src/actions/map.rs")
+            .expect("src/actions/map.rs must be readable from cargo's cwd");
+
+        // Split the file at the `mod tests` boundary. Everything before
+        // that marker is production code; everything after is test-only.
+        let mod_tests_marker = "#[cfg(test)]\nmod tests {";
+        let production_section = source.split(mod_tests_marker).next().unwrap_or(&source);
+
+        assert!(
+            !production_section.contains("default_dashboard"),
+            "`default_dashboard` must not appear in the production code path of \
+             src/actions/map.rs (Risk #8). It was found before `mod tests {{`."
+        );
     }
 }

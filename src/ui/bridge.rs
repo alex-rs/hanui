@@ -79,7 +79,7 @@ pub struct TilePlacement {
 }
 
 impl TilePlacement {
-    fn from_view_spec(p: &Placement) -> Self {
+    fn from_placement(p: &Placement) -> Self {
         TilePlacement {
             col: i32::from(p.col),
             row: i32::from(p.row),
@@ -271,7 +271,7 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                         let placement = widget
                             .placement
                             .as_ref()
-                            .map(TilePlacement::from_view_spec)
+                            .map(TilePlacement::from_placement)
                             .unwrap_or_else(|| {
                                 TilePlacement::default_for(preferred_columns, preferred_rows)
                             });
@@ -330,7 +330,7 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                         let placement = widget
                             .placement
                             .as_ref()
-                            .map(TilePlacement::from_view_spec)
+                            .map(TilePlacement::from_placement)
                             .unwrap_or_else(|| {
                                 TilePlacement::default_for(preferred_columns, preferred_rows)
                             });
