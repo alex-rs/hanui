@@ -9,13 +9,15 @@
 //! | [`timing`] | TASK-059 | `GestureConfig`, `ActionTiming`, `ActionOverlapStrategy` |
 //! | [`map`]    | TASK-062 | `WidgetActionMap`, `WidgetActionEntry`, `WidgetId` |
 //! | [`dispatcher`] | TASK-062 | `Dispatcher`, `DispatchOutcome`, `DispatchError`, `Gesture` |
-//! | `url`      | TASK-063 | `Url` action handler |
+//! | [`url`]    | TASK-063 | `Url` action handler with `UrlActionMode` gate |
 //! | `queue`    | TASK-065 | offline FIFO queue |
 
 pub mod dispatcher;
 pub mod map;
 pub mod schema;
 pub mod timing;
+pub mod url;
 
 pub use schema::{Action, ActionSpec, Idempotency};
 pub use timing::{ActionOverlapStrategy, ActionTiming, GestureConfig};
+pub use url::{handle_url_action, UrlError, UrlOutcome};
