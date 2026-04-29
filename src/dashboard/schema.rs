@@ -23,9 +23,28 @@
 //! `view_spec_disposition`, `no_hashmap_in_deserialized_types`,
 //! `validation_rule_identifiers`.
 
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::actions::Action;
+
+// ---------------------------------------------------------------------------
+// CallServiceAllowlist
+// ---------------------------------------------------------------------------
+
+/// The set of `(domain, service)` pairs that this dashboard config calls.
+///
+/// Built by the validator (`src/dashboard/validate.rs`) during the validation
+/// pass; stored on [`Dashboard::call_service_allowlist`] so the actions queue
+/// (TASK-090) can gate runtime `CallService` dispatches against the static
+/// set declared in the YAML.
+///
+/// Per `locked_decisions.call_service_allowlist_runtime_access`: defined here
+/// (not in `validate.rs`) so `Dashboard` can carry the field without creating
+/// a circular import between `schema` and `validate`.
+pub type CallServiceAllowlist = BTreeSet<(String, String)>;
 
 // ---------------------------------------------------------------------------
 // ProfileKey
@@ -123,6 +142,52 @@ pub struct WidgetLayout {
     pub preferred_columns: u8,
     /// `preferred_rows` — the widget's preferred row span hint.
     pub preferred_rows: u8,
+}
+
+// ---------------------------------------------------------------------------
+// SectionGrid  (user-visible sub-object)
+// ---------------------------------------------------------------------------
+
+/// Grid parameters for a section, corresponding to the YAML `grid:` field
+/// inside a section definition.
+///
+/// `columns` drives the `SpanOverflow` validator check: a widget whose
+/// `preferred_columns` exceeds `columns` is a validator Error.
+///
+/// `gap` is the gap between grid cells in logical pixels; it is stored for
+/// the layout packer (TASK-084) and ignored by the validator.
+///
+/// `Default` implementation provides `columns: 4, gap: 8` — the conventional
+/// Phase 4 defaults from `docs/DASHBOARD_SCHEMA.md`. These defaults are used
+/// when the YAML section omits the `grid:` sub-object entirely (i.e., when
+/// existing fixtures predate this field being required).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SectionGrid {
+    /// Number of columns in the section grid.
+    /// A widget with `preferred_columns > columns` triggers a `SpanOverflow` Error.
+    pub columns: u8,
+    /// Gap between grid cells in logical pixels.
+    #[serde(default = "SectionGrid::default_gap")]
+    pub gap: u8,
+}
+
+impl SectionGrid {
+    /// Default gap value (8 logical pixels) per `docs/DASHBOARD_SCHEMA.md`.
+    #[must_use]
+    pub const fn default_gap() -> u8 {
+        8
+    }
+}
+
+impl Default for SectionGrid {
+    /// Provides `columns: 4, gap: 8` — the conventional Phase 4 section defaults.
+    ///
+    /// Phase 4 fixtures that predate the required `grid:` field on sections use
+    /// this default so that the existing serde round-trip tests continue to pass
+    /// when the field is absent from the YAML.
+    fn default() -> Self {
+        Self { columns: 4, gap: 8 }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +316,20 @@ pub struct Widget {
     /// `icon` — optional icon override (MDI icon slug or asset path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// `visibility` — predicate string controlling when the widget is shown.
+    ///
+    /// Defaults to `"always"` when absent (the widget is always visible).
+    /// Phase 4 locks the predicate namespace; unknown values fail validation
+    /// with [`ValidationRule::UnknownVisibilityPredicate`]. Phase 6 evaluates
+    /// the predicate at runtime; Phase 4 only validates the namespace.
+    ///
+    /// Known predicates: `always`, `never`, `entity_available:<entity_id>`,
+    /// `state_equals:<entity_id>:<value>`, `profile:<profile_key>`.
+    #[serde(
+        default = "Widget::default_visibility",
+        skip_serializing_if = "Widget::is_default_visibility"
+    )]
+    pub visibility: String,
     /// `tap_action` — action fired on a single tap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tap_action: Option<Action>,
@@ -272,6 +351,27 @@ pub struct Widget {
     pub placement: Option<Placement>,
 }
 
+impl Widget {
+    /// Returns the default visibility predicate (`"always"`).
+    ///
+    /// Used by `#[serde(default = "Widget::default_visibility")]` to populate
+    /// the field when the YAML section omits `visibility:`.
+    #[must_use]
+    pub fn default_visibility() -> String {
+        "always".to_string()
+    }
+
+    /// Returns `true` when the visibility string equals the default (`"always"`).
+    ///
+    /// Used by `#[serde(skip_serializing_if = "Widget::is_default_visibility")]`
+    /// to omit the field during serialization so that existing round-trip
+    /// fixtures are not polluted with an explicit `visibility: always`.
+    #[must_use]
+    pub fn is_default_visibility(v: &str) -> bool {
+        v == "always"
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Section
 // ---------------------------------------------------------------------------
@@ -283,6 +383,14 @@ pub struct Section {
     pub id: String,
     /// `title` — display title shown above the section.
     pub title: String,
+    /// `grid` — grid parameters (column count + gap) for this section.
+    ///
+    /// Defaults to `SectionGrid { columns: 4, gap: 8 }` when the YAML omits
+    /// the sub-object (e.g. fixtures authored before Phase 4 required this
+    /// field). The validator uses `grid.columns` for the `SpanOverflow` check;
+    /// the layout packer uses both fields at pack time.
+    #[serde(default)]
+    pub grid: SectionGrid,
     /// `widgets` — ordered list of widgets in this section.
     #[serde(default)]
     pub widgets: Vec<Widget>,
@@ -332,6 +440,19 @@ pub struct Dashboard {
     pub default_view: String,
     /// `views` — ordered list of all views in the dashboard.
     pub views: Vec<View>,
+    /// Per-config `(domain, service)` allowlist built by the validator at load time.
+    ///
+    /// **Not serialized to / deserialized from YAML** (`#[serde(default, skip)]`).
+    /// A freshly-deserialized `Dashboard` carries an empty allowlist; the loader
+    /// (TASK-082) replaces it with the validator's output after a clean
+    /// `validate()` call returns zero `Severity::Error` issues.
+    ///
+    /// Per `locked_decisions.call_service_allowlist_runtime_access`: the runtime
+    /// actions queue (TASK-090) reads this field to gate `CallService` dispatches
+    /// against the static set declared in the YAML, preventing injection of
+    /// services that the config never declared.
+    #[serde(default, skip)]
+    pub call_service_allowlist: Arc<CallServiceAllowlist>,
 }
 
 // ---------------------------------------------------------------------------
