@@ -1,0 +1,12 @@
+{
+  "sections": [
+    {
+      "section_id": "main",
+      "positions": [
+        {"widget_id": "w1", "col": 0, "row": 0, "span_cols": 3, "span_rows": 1},
+        {"widget_id": "w2", "col": 0, "row": 1, "span_cols": 3, "span_rows": 1},
+        {"widget_id": "w3", "col": 0, "row": 2, "span_cols": 3, "span_rows": 1}
+      ]
+    }
+  ]
+}

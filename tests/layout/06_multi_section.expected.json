@@ -1,0 +1,20 @@
+{
+  "sections": [
+    {
+      "section_id": "lights",
+      "positions": [
+        {"widget_id": "light_a", "col": 0, "row": 0, "span_cols": 2, "span_rows": 1},
+        {"widget_id": "light_b", "col": 2, "row": 0, "span_cols": 1, "span_rows": 1},
+        {"widget_id": "light_c", "col": 0, "row": 1, "span_cols": 3, "span_rows": 1}
+      ]
+    },
+    {
+      "section_id": "sensors",
+      "positions": [
+        {"widget_id": "sensor_a", "col": 0, "row": 0, "span_cols": 1, "span_rows": 1},
+        {"widget_id": "sensor_b", "col": 1, "row": 0, "span_cols": 1, "span_rows": 1},
+        {"widget_id": "sensor_c", "col": 0, "row": 1, "span_cols": 2, "span_rows": 1}
+      ]
+    }
+  ]
+}

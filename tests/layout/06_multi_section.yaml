@@ -1,0 +1,56 @@
+version: 1
+device_profile: desktop
+default_view: home
+views:
+  - id: home
+    title: Home
+    layout: sections
+    sections:
+      - id: lights
+        title: Lights
+        grid:
+          columns: 3
+          gap: 8
+        widgets:
+          - id: light_a
+            type: light_tile
+            entity: light.kitchen
+            layout:
+              preferred_columns: 2
+              preferred_rows: 1
+          - id: light_b
+            type: light_tile
+            entity: light.living_room
+            layout:
+              preferred_columns: 1
+              preferred_rows: 1
+          - id: light_c
+            type: light_tile
+            entity: light.bedroom
+            layout:
+              preferred_columns: 3
+              preferred_rows: 1
+      - id: sensors
+        title: Sensors
+        grid:
+          columns: 2
+          gap: 8
+        widgets:
+          - id: sensor_a
+            type: sensor_tile
+            entity: sensor.temperature
+            layout:
+              preferred_columns: 1
+              preferred_rows: 1
+          - id: sensor_b
+            type: sensor_tile
+            entity: sensor.humidity
+            layout:
+              preferred_columns: 1
+              preferred_rows: 1
+          - id: sensor_c
+            type: sensor_tile
+            entity: sensor.pressure
+            layout:
+              preferred_columns: 2
+              preferred_rows: 1

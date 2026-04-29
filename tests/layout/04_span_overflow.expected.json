@@ -1,0 +1,8 @@
+{
+  "issues": [
+    {
+      "rule": "SpanOverflow",
+      "severity": "Error"
+    }
+  ]
+}
