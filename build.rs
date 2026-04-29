@@ -1,6 +1,6 @@
 // build.rs — Slint compilation entry points.
 //
-// Compiles two Slint entry points:
+// Compiles three Slint entry points:
 //
 //   1. `ui/slint/main_window.slint` — production `MainWindow` and the
 //      `AnimationBudget` / `GestureConfigGlobal` re-exports the bridge wires.
@@ -12,6 +12,14 @@
 //      file and pulled in via an explicit `include!` from
 //      `src/ui/bridge.rs::gesture_test_slint` so its generated types do
 //      NOT collide with the production `MainWindow` bindings.
+//
+//   3. `ui/slint/view.slint` — Phase 4 `View` component that renders a flat
+//      `Vec<PositionedTile>` in a proportional grid (TASK-085). Compiled to a
+//      distinct output file via `HANUI_VIEW_INCLUDE` so the golden-frame tests
+//      (TASK-089) can include `ViewWindow` types without pulling in the full
+//      production `MainWindow` symbol set. The TASK-086 bridge wires the View
+//      via the production `MainWindow` import chain; this separate compile is
+//      for the harness path only.
 //
 // Why two compiles instead of co-locating `GestureTestWindow` inside
 // `main_window.slint`: the test wrapper carries no production code path
@@ -93,5 +101,39 @@ fn main() {
     println!(
         "cargo:rustc-env=HANUI_SPAN_CHECK_INCLUDE={}",
         span_check_output.display()
+    );
+
+    // View component (TASK-085) — Phase 4 proportional-grid View.
+    //
+    // Compiles `ui/slint/view.slint` to a separate output file so the
+    // golden-frame harness (TASK-089) can include the generated `PositionedTile`
+    // struct and `View` component bindings via `HANUI_VIEW_INCLUDE` without
+    // pulling in the full production `MainWindow` symbol set.
+    //
+    // This compile also ensures that `view.slint` is in the build graph:
+    // `cargo build` will fail if the component has a syntax or type error,
+    // satisfying the acceptance criterion
+    // "verified by `cargo build` succeeding after the new component is
+    //  referenced from the build graph."
+    //
+    // The TASK-086 bridge will wire the View through the production
+    // `main_window.slint` import chain (adding `import { View } from "view.slint"`
+    // to main_window.slint); this separate compile is used ONLY by the harness.
+    let view_input = manifest_dir.join("ui/slint/view.slint");
+    let view_output = out_dir.join("view.rs");
+
+    let view_deps = slint_build::compile_with_output_path(
+        &view_input,
+        &view_output,
+        slint_build::CompilerConfiguration::default(),
+    )
+    .expect("compile ui/slint/view.slint with slint-build");
+
+    for dep in view_deps {
+        println!("cargo:rerun-if-changed={}", dep.display());
+    }
+    println!(
+        "cargo:rustc-env=HANUI_VIEW_INCLUDE={}",
+        view_output.display()
     );
 }
