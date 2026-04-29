@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 use slint::{ModelRc, SharedString, VecModel};
 use tokio::sync::mpsc;
 
-use crate::actions::dispatcher::{BackpressureScope, ToastEvent};
+use crate::actions::dispatcher::{BackpressureScope, QueueRejectReason, ToastEvent};
 use crate::actions::map::WidgetId;
 use crate::ha::live_store::LiveStore;
 use crate::ui::bridge::{slint_ui, MainWindow};
@@ -223,6 +223,24 @@ pub fn format_toast_message(event: &ToastEvent) -> String {
             }
             BackpressureScope::Global => {
                 format!("Action queue full (system-wide), dropping `{entity_id}`")
+            }
+        },
+        // TASK-065 cross-task contract: the dispatcher's offline path emits
+        // these three variants when a tap fires while the connection is not
+        // `Live`. Wording mirrors `locked_decisions.idempotency_marker` —
+        // the user must see the rejection rather than silently lose the tap.
+        ToastEvent::OfflineNonIdempotent { entity_id } => {
+            format!("Offline: `{entity_id}` requires connection (not queued)")
+        }
+        ToastEvent::OfflineQueued { entity_id } => {
+            format!("Queued for reconnect: `{entity_id}`")
+        }
+        ToastEvent::OfflineQueueRejected { entity_id, reason } => match reason {
+            QueueRejectReason::ServiceNotAllowlisted => {
+                format!("Offline queue refused `{entity_id}`: service not allowlisted")
+            }
+            QueueRejectReason::UnsupportedVariant => {
+                format!("Offline queue refused `{entity_id}`: unsupported action variant")
             }
         },
     }
@@ -565,6 +583,73 @@ mod tests {
         assert_eq!(
             format_toast_message(&event),
             "Action queue full for `light.kitchen`"
+        );
+    }
+
+    #[test]
+    fn format_offline_non_idempotent_names_entity_and_indicates_not_queued() {
+        // TASK-065 cross-task: the loud-error toast must name the entity AND
+        // make it explicit that the action was *not* queued (so the founder
+        // does not believe a tap was deferred when it was actually rejected).
+        let event = ToastEvent::OfflineNonIdempotent {
+            entity_id: EntityId::from("light.kitchen"),
+        };
+        let msg = format_toast_message(&event);
+        assert!(
+            msg.contains("light.kitchen"),
+            "entity id must be present: {msg}"
+        );
+        assert!(
+            msg.contains("not queued"),
+            "must indicate the action was not queued: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_offline_queued_names_entity() {
+        // The queued toast tells the user their tap was deferred for replay.
+        let event = ToastEvent::OfflineQueued {
+            entity_id: EntityId::from("switch.outlet_1"),
+        };
+        let msg = format_toast_message(&event);
+        assert!(
+            msg.contains("switch.outlet_1"),
+            "entity id must be present: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("queued") || msg.to_lowercase().contains("reconnect"),
+            "must indicate queueing/reconnect: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_offline_queue_rejected_names_entity_and_reason() {
+        let allowlist = ToastEvent::OfflineQueueRejected {
+            entity_id: EntityId::from("light.bedroom"),
+            reason: QueueRejectReason::ServiceNotAllowlisted,
+        };
+        let msg_a = format_toast_message(&allowlist);
+        assert!(
+            msg_a.contains("light.bedroom"),
+            "entity id missing: {msg_a}"
+        );
+        assert!(
+            msg_a.to_lowercase().contains("allowlist"),
+            "must mention allowlist for ServiceNotAllowlisted: {msg_a}"
+        );
+
+        let unsupported = ToastEvent::OfflineQueueRejected {
+            entity_id: EntityId::from("light.bedroom"),
+            reason: QueueRejectReason::UnsupportedVariant,
+        };
+        let msg_b = format_toast_message(&unsupported);
+        assert!(
+            msg_b.contains("light.bedroom"),
+            "entity id missing: {msg_b}"
+        );
+        assert!(
+            msg_b.to_lowercase().contains("unsupported"),
+            "must mention unsupported variant: {msg_b}"
         );
     }
 
