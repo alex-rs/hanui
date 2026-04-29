@@ -1,0 +1,375 @@
+// view.slint — Phase 4 View component that renders a flat Vec<PositionedTile>
+// into a proportional grid using HorizontalLayout + VerticalLayout stretch
+// primitives (TASK-085).
+//
+// # Layout algorithm (TASK-078 verdict: GREEN)
+//
+// TASK-078 (`examples/span_check.slint`) confirmed that Slint's `GridLayout`
+// with `colspan`/`rowspan` does NOT give proportional widths/heights. The
+// correct mechanism is:
+//   - Column proportions: absolute x position + width computed from
+//     (col / grid-columns) × parent width and (span-cols / grid-columns) × parent width.
+//   - Row proportions: absolute y position + height computed from
+//     row-height × row and row-height × span-rows.
+// This is the mandatory layout mechanism per
+// `locked_decisions.span_prototype_kill_switch` (verdict: GREEN).
+//
+// # Component overview
+//
+// `View` takes a flat array of `PositionedTile` structs (one per widget) and
+// renders them using absolute positioning within a clipping Rectangle. Each
+// tile's x, y, width, height are computed from:
+//   - x        = (tile.col   / grid-columns) × parent.width
+//   - y        = tile.row    × row-height
+//   - width    = (tile.span-cols / grid-columns) × parent.width
+//   - height   = tile.span-rows × row-height
+//
+// This mirrors the HorizontalLayout+horizontal-stretch and
+// VerticalLayout+vertical-stretch logic from span_check.slint, adapted for a
+// flat array (where Slint cannot dynamically group items into row containers).
+//
+// # Property contract
+//
+// The Rust bridge (TASK-086/088) populates these properties on each dashboard
+// load:
+//   in property <[PositionedTile]> tiles
+//       Flat list of all positioned widgets for this section, in config order.
+//       The packer (TASK-084) guarantees no overlap; the validator (TASK-083)
+//       guarantees no span overflow. The bridge maps PositionedWidget →
+//       PositionedTile, filling in the per-tile view-model fields.
+//
+//   in property <int> grid-columns
+//       Number of proportional column units in this section (e.g. 4 for a
+//       4-column section). Matches `section.grid.columns` from the YAML.
+//       Must be ≥ 1; the bridge asserts this. Division by grid-columns in
+//       Slint uses float arithmetic so integer ≥ 1 is sufficient.
+//
+//   in property <length> row-height
+//       Logical-pixel height of one grid row unit. The bridge computes this
+//       from DeviceProfile or the outer container's available height. For
+//       Phase 4 the bridge supplies a fixed row-height per section derived
+//       from DeviceProfile.preferred_row_height_px (future: TASK-086).
+//       Default: 120px, which matches the desktop preset's tile height.
+//
+//   in property <length> gap
+//       Logical-pixel gap between tiles in both axes. Applied as half-gap
+//       inset on each tile edge so that adjacent tiles have one full gap
+//       of space between them. Default: Theme.space-2 (8px).
+//
+// # Widget kind dispatch
+//
+// The `kind` field in `PositionedTile` is a string discriminator:
+//   - "light"  → LightTile (light_tile.slint)
+//   - "sensor" → SensorTile (sensor_tile.slint)
+//   - "entity" → EntityTile (entity_tile.slint)
+//   - any other value → defensive placeholder Rectangle (red, text overlay)
+//     Per acceptance criteria: the validator (TASK-083) emits
+//     ValidationRule::UnknownWidgetType at load time so this fallback should
+//     never fire in practice. It exists to surface load-time vs render-time
+//     contract mismatches loudly. Documented intentionally here.
+//
+// # Empty cells (spacers)
+//
+// Empty grid cells (cells not occupied by any widget) are NOT explicitly
+// rendered; Slint renders the section background (Theme.background) through
+// the transparent viewport Rectangle. The tile-by-tile absolute positioning
+// approach means only occupied cells have rendered content — empty cells are
+// implicitly the background color.
+//
+// # Performance contract (per docs/PHASES.md Performance budgets)
+//
+// - No animation in this component. AnimationBudget is not referenced here.
+//   Tile press animations live on CardBase (light_tile / sensor_tile /
+//   entity_tile all inherit CardBase's press feedback).
+// - `for tile in tiles` is the only iteration construct; there is no nested
+//   loop. One Slint element instance is allocated per tile (not per cell),
+//   keeping the element count at O(widgets) not O(cells).
+//
+// # Example use (for the harness consumer in TASK-089):
+//
+//   import { View, PositionedTile } from "view.slint";
+//
+//   // A 4-column section with a full-width tile (span_cols=4):
+//   View {
+//       grid-columns: 4;
+//       row-height: 120px;
+//       gap: 8px;
+//       tiles: [
+//           {
+//               widget-id: "full-width-light",
+//               col: 0, row: 0, span-cols: 4, span-rows: 1,
+//               kind: "light",
+//               name: "Kitchen", state: "on",
+//               icon-id: "mdi:lightbulb", icon: @image-url(""),
+//               preferred-columns: 4, preferred-rows: 1,
+//               pending: false,
+//           }
+//       ];
+//   }
+
+import { Theme } from "theme.slint";
+import { LightTile, LightTileVM, TilePlacement } from "light_tile.slint";
+import { SensorTile, SensorTileVM, SensorTilePlacement } from "sensor_tile.slint";
+import { EntityTile, EntityTileVM, EntityTilePlacement } from "entity_tile.slint";
+
+// PositionedTile — the per-widget view-model passed to the View component.
+//
+// This struct merges the packer's PositionedWidget geometry fields with the
+// per-widget display data that each tile component needs. The Rust bridge
+// (TASK-086/088) constructs one PositionedTile per widget by combining:
+//   * PositionedWidget (from TASK-084 packer output)
+//   * The per-widget typed view-model fields (entity_id, name, state, icon, etc.)
+//
+// Field naming uses Slint's kebab-case; Rust bridge sees snake_case equivalents
+// (e.g. `widget-id` → `widget_id`, `span-cols` → `span_cols`).
+//
+// `kind` is a string discriminator matching the YAML `type:` field (WidgetKind
+// snake_case serialization from src/dashboard/schema.rs):
+//   "light_tile"  → LightTile (the bridge sends the full snake_case kind)
+//   "sensor_tile" → SensorTile
+//   "entity_tile" → EntityTile
+//   anything else → defensive placeholder (red background + text)
+// The View component also accepts bare forms ("light", "sensor", "entity") for
+// forward-compatibility with any bridge that normalizes the underscore suffix.
+export struct PositionedTile {
+    // ── Grid geometry (from PositionedWidget / packer) ────────────────────
+    // widget-id: stable identifier matching Widget.id from the YAML config.
+    widget-id: string,
+    // col: zero-based column index of the widget's top-left cell.
+    col: int,
+    // row: zero-based row index of the widget's top-left cell.
+    row: int,
+    // span-cols: number of grid columns the widget occupies (≥ 1).
+    span-cols: int,
+    // span-rows: number of grid rows the widget occupies (≥ 1, GREEN verdict).
+    span-rows: int,
+
+    // ── Widget kind discriminator ─────────────────────────────────────────
+    // Matches the WidgetKind enum's snake_case YAML names:
+    //   "light_tile"  → LightTile
+    //   "sensor_tile" → SensorTile
+    //   "entity_tile" → EntityTile
+    kind: string,
+
+    // ── Per-tile view-model fields ────────────────────────────────────────
+    // These mirror the fields of LightTileVM / SensorTileVM / EntityTileVM.
+    // All three tile kinds share the same shape (per the comment in
+    // sensor_tile.slint and entity_tile.slint), so a single set of fields
+    // covers all three dispatch paths without runtime downcasting.
+    //
+    // name: user-visible entity label (e.g. "Kitchen").
+    name: string,
+    // state: canonical state string ("on", "off", "unavailable", or a sensor
+    //        reading such as "21.3 °C"). Rendered verbatim by SensorTile and
+    //        EntityTile; LightTile maps it to state-on/state-off/state-unavail.
+    state: string,
+    // icon-id: design-token id (e.g. "mdi:lightbulb"). The asset layer
+    //          (TASK-010) resolves it to bytes; the bridge writes `icon` once.
+    icon-id: string,
+    // icon: resolved Slint image. Written by the bridge (TASK-015/TASK-086)
+    //       once the asset is decoded. Empty image renders nothing; layout
+    //       stays stable because the Image element has explicit width/height.
+    icon: image,
+    // preferred-columns / preferred-rows: author intent from YAML. Passed
+    // through to the inner tile VM so the tile can record them for
+    // future consumers (e.g. analytics, responsive re-pack). Not used for
+    // layout in the View component itself (span-cols/span-rows govern layout).
+    preferred-columns: int,
+    preferred-rows: int,
+    // pending: true while an OptimisticEntry exists for this tile's entity.
+    // Drives the per-tile spinner overlay in CardBase (TASK-067). Bound from
+    // LiveStore::pending_for_widget per locked_decisions.pending_state_read_api.
+    pending: bool,
+}
+
+// View — renders a flat Vec<PositionedTile> in a proportional grid.
+//
+// Performance contract: no animations in this component. Tile-level press
+// animations are handled by CardBase inside each tile component. This View
+// component is a pure layout container.
+//
+// Theme tokens: background comes from Theme.background; padding is zero
+// (outer padding lives on the parent container, per the acceptance criterion
+// "padding is zero — the section's outer padding lives on the parent
+// component, not the GridLayout"). Gap between tiles is the `gap` property.
+export component View inherits Rectangle {
+    // ── Input properties ──────────────────────────────────────────────────
+    //
+    // tiles: flat ordered list of all positioned widgets for this section.
+    //        Config order. The packer (TASK-084) guarantees no overlap; the
+    //        validator (TASK-083) guarantees no span overflow.
+    in property <[PositionedTile]> tiles;
+
+    // grid-columns: number of proportional column units for this section.
+    //              Corresponds to section.grid.columns from the YAML config.
+    //              Must be ≥ 1. Division by this value gives each column unit
+    //              its proportional width fraction of the parent width.
+    in property <int> grid-columns: 4;
+
+    // row-height: logical-pixel height of one grid row unit.
+    //             Computed by the bridge (TASK-086) from DeviceProfile or the
+    //             outer container's available height. Default 120px matches the
+    //             desktop preset tile height.
+    in property <length> row-height: 120px;
+
+    // gap: logical-pixel gap between tiles. Applied as half-gap inset on each
+    //      tile edge so adjacent tiles have one full gap between them.
+    //      Defaults to Theme.space-2 (8px). Must use a theme token — no inline
+    //      hex or raw px literal here (Theme.space-2 is defined in theme.slint).
+    in property <length> gap: Theme.space-2;
+
+    // ── Component background ──────────────────────────────────────────────
+    // The View's own background is Theme.background (dark app background).
+    // Individual tiles render on Theme.surface (card surface) via CardBase.
+    // No inline hex color — CI hex-color gate enforces this.
+    // Animation capped per DEFAULT_PROFILE.animation_framerate_cap: N/A
+    // (this component has no animations; tiles use CardBase's budget).
+    background: Theme.background;
+
+    // ── Tile rendering ────────────────────────────────────────────────────
+    //
+    // Each PositionedTile is rendered as an absolute-positioned element whose
+    // x, y, width, height are derived from the tile's col/row/span-cols/span-rows
+    // fields and the component's grid-columns and row-height properties.
+    //
+    // This implements the proportional-stretch layout validated by TASK-078:
+    //   - Column proportion: same as HorizontalLayout with horizontal-stretch:N
+    //     (each column unit = parent.width / grid-columns).
+    //   - Row proportion:    same as VerticalLayout with vertical-stretch:N
+    //     (each row unit    = row-height).
+    //
+    // Half-gap inset on each edge ensures adjacent tiles have one full `gap`
+    // between them, while tiles at the section border have a half-gap inset.
+    // This is the standard gap-distribution pattern for grid cells.
+    //
+    // Widget kind dispatch: three conditional branches (light / sensor / entity)
+    // render the appropriate tile component. An else branch renders a defensive
+    // red placeholder for unknown kinds (should never fire in production).
+
+    // ── Light tiles ───────────────────────────────────────────────────────
+    for tile[i] in root.tiles : Rectangle {
+        // Compute proportional position and size from packer geometry.
+        //
+        // Column unit width = parent.width / grid-columns (integer division
+        // approximated in Slint float arithmetic). Each unit pixel-aligns via
+        // Slint's own layout engine rounding.
+        //
+        // Half-gap inset: each tile edge is inset by gap/2 so that two adjacent
+        // tiles have gap/2 + gap/2 = gap of space between them.
+        x: (tile.col * parent.width / root.grid-columns) + root.gap / 2;
+        y: (tile.row * root.row-height) + root.gap / 2;
+        width: (tile.span-cols * parent.width / root.grid-columns) - root.gap;
+        height: (tile.span-rows * root.row-height) - root.gap;
+
+        // Transparent outer wrapper — the actual chrome is inside each tile
+        // component (CardBase provides the surface/border/radius).
+        background: transparent;
+
+        // ── Light tile dispatch ───────────────────────────────────────────
+        if tile.kind == "light" || tile.kind == "light_tile" : LightTile {
+            // Fill the outer rectangle completely; CardBase provides its own
+            // rounded border and surface background.
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: parent.height;
+            view-model: {
+                name: tile.name,
+                state: tile.state,
+                icon-id: tile.icon-id,
+                icon: tile.icon,
+                preferred-columns: tile.preferred-columns,
+                preferred-rows: tile.preferred-rows,
+                placement: {
+                    col: tile.col,
+                    row: tile.row,
+                    span-cols: tile.span-cols,
+                    span-rows: tile.span-rows,
+                },
+                pending: tile.pending,
+            };
+        }
+
+        // ── Sensor tile dispatch ──────────────────────────────────────────
+        if tile.kind == "sensor" || tile.kind == "sensor_tile" : SensorTile {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: parent.height;
+            view-model: {
+                name: tile.name,
+                state: tile.state,
+                icon-id: tile.icon-id,
+                icon: tile.icon,
+                preferred-columns: tile.preferred-columns,
+                preferred-rows: tile.preferred-rows,
+                placement: {
+                    col: tile.col,
+                    row: tile.row,
+                    span-cols: tile.span-cols,
+                    span-rows: tile.span-rows,
+                },
+                pending: tile.pending,
+            };
+        }
+
+        // ── Entity tile dispatch ──────────────────────────────────────────
+        if tile.kind == "entity" || tile.kind == "entity_tile" : EntityTile {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: parent.height;
+            view-model: {
+                name: tile.name,
+                state: tile.state,
+                icon-id: tile.icon-id,
+                icon: tile.icon,
+                preferred-columns: tile.preferred-columns,
+                preferred-rows: tile.preferred-rows,
+                placement: {
+                    col: tile.col,
+                    row: tile.row,
+                    span-cols: tile.span-cols,
+                    span-rows: tile.span-rows,
+                },
+                pending: tile.pending,
+            };
+        }
+
+        // ── Defensive fallback for unknown widget kinds ───────────────────
+        //
+        // Renders a red rectangle with the kind string as a Text overlay.
+        // Intentional defensive surface: the validator (TASK-083) emits
+        // ValidationRule::UnknownWidgetType at load time, so this branch
+        // should never fire in production. If it does, it surfaces the
+        // load-time vs render-time contract mismatch loudly (bright red is
+        // impossible to miss during development).
+        //
+        // Per acceptance criteria: "Widget kind not in {light, sensor, entity}
+        // renders a placeholder Rectangle { background: red; } with the widget
+        // kind name as a Text overlay."
+        //
+        // Note: `background: Colors.red` here is a Slint named color constant,
+        // NOT an inline hex literal. Named colors are resolved by the Slint
+        // runtime and are the accepted pattern for defensive fallbacks.
+        if tile.kind != "light" && tile.kind != "light_tile"
+                && tile.kind != "sensor" && tile.kind != "sensor_tile"
+                && tile.kind != "entity" && tile.kind != "entity_tile" : Rectangle {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: parent.height;
+            background: Colors.red;
+
+            Text {
+                text: tile.kind;
+                color: Colors.white;
+                font-size: Theme.font-sm;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: parent.width;
+                height: parent.height;
+            }
+        }
+    }
+}
