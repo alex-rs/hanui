@@ -38,7 +38,7 @@
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 
-/// Errors returned by [`Config::from_env`].
+/// Errors returned by [`Config::from_env`] and [`Config::resolve_token_env`].
 #[derive(Debug, Error)]
 pub enum ConfigError {
     /// Environment variable is not set.
@@ -52,6 +52,25 @@ pub enum ConfigError {
     Empty {
         /// The name of the empty environment variable.
         var: &'static str,
+    },
+    /// The named env var (from `token_env` YAML field) does not exist.
+    ///
+    /// Per `locked_decisions.token_env_failure_mode`: a missing token env var
+    /// is a load-time error — no dashboard renders when the token cannot be
+    /// resolved.
+    #[error("Home Assistant token env var '{name}' is not set; set it before starting hanui")]
+    TokenEnvNotFound {
+        /// Name of the environment variable that was looked up.
+        name: String,
+    },
+    /// The named env var exists but is empty.
+    ///
+    /// An empty token string would cause HA auth failure silently; better to
+    /// fail loudly at load time.
+    #[error("Home Assistant token env var '{name}' is empty; set it before starting hanui")]
+    TokenEnvEmpty {
+        /// Name of the environment variable that was looked up.
+        name: String,
     },
 }
 
@@ -144,6 +163,52 @@ impl Config {
     pub fn expose_token(&self) -> &str {
         tracing::trace!(token_accessed = true, "token-accessed");
         self.token.expose_secret()
+    }
+
+    /// Construct a `Config` for unit tests without touching environment variables.
+    ///
+    /// Only available in `#[cfg(test)]` contexts. The token is an empty-ish
+    /// placeholder; only the `url` field matters for most test paths (loader
+    /// tests pass this config but never call `expose_token`, only
+    /// `resolve_token_env` which reads a different env var by name).
+    #[cfg(test)]
+    pub fn new_for_testing(url: String) -> Self {
+        Config {
+            url,
+            token: secrecy::SecretString::from("test-placeholder".to_string()),
+        }
+    }
+
+    /// Look up a Home Assistant token by reading the named environment variable.
+    ///
+    /// This method is the **sole** env-var lookup path for YAML-configured HA
+    /// tokens. The YAML loader reads `home_assistant.token_env` as a plain
+    /// `String` (the variable name) and delegates the actual `env::var` call
+    /// here. The loader itself never calls `env::var` directly —
+    /// `locked_decisions.platform_config_naming` requires this split so that
+    /// env-var access is auditable in one place.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::TokenEnvNotFound`] when the environment variable
+    /// is absent and [`ConfigError::TokenEnvEmpty`] when it is set but empty.
+    ///
+    /// # Security note
+    ///
+    /// The returned `String` contains the plaintext HA token. The caller
+    /// (loader.rs) must consume it immediately (wrap in `SecretString` or use
+    /// it to validate non-emptiness). It must not be stored in a log or
+    /// debug output.
+    pub fn resolve_token_env(&self, name: &str) -> Result<String, ConfigError> {
+        match std::env::var(name) {
+            Ok(value) if value.is_empty() => Err(ConfigError::TokenEnvEmpty {
+                name: name.to_owned(),
+            }),
+            Ok(value) => Ok(value),
+            Err(_) => Err(ConfigError::TokenEnvNotFound {
+                name: name.to_owned(),
+            }),
+        }
     }
 }
 
@@ -329,5 +394,75 @@ mod tests {
             !logs_contain("fixture-token-not-plaintext"),
             "plaintext token must never appear in any captured log event"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_token_env tests (TASK-082)
+    // -----------------------------------------------------------------------
+
+    /// Helper to set/clear a test-specific env var that does NOT collide with
+    /// the HA_URL/HA_TOKEN vars used by the other tests.
+    fn set_token_env(name: &str, value: Option<&str>) {
+        match value {
+            Some(v) => unsafe { std::env::set_var(name, v) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+    }
+
+    /// A minimal stub `Config` for `resolve_token_env` tests.  We don't need
+    /// a real URL/token — `resolve_token_env` reads a DIFFERENT env var by
+    /// name, not the `Config`-internal token.
+    fn stub_config() -> Config {
+        // Build directly to avoid env mutations in other tests.
+        Config::new_for_testing("ws://stub".to_string())
+    }
+
+    #[test]
+    fn resolve_token_env_returns_value_when_present() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        set_token_env("HANUI_TEST_HA_TOKEN_082", Some("my-ha-token"));
+
+        let cfg = stub_config();
+        let result = cfg
+            .resolve_token_env("HANUI_TEST_HA_TOKEN_082")
+            .expect("must succeed when env var is set and non-empty");
+        assert_eq!(result, "my-ha-token");
+
+        set_token_env("HANUI_TEST_HA_TOKEN_082", None);
+    }
+
+    #[test]
+    fn resolve_token_env_returns_not_found_when_absent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Ensure the var is absent.
+        set_token_env("HANUI_TEST_HA_TOKEN_082_ABSENT", None);
+
+        let cfg = stub_config();
+        let err = cfg
+            .resolve_token_env("HANUI_TEST_HA_TOKEN_082_ABSENT")
+            .expect_err("must fail when env var is absent");
+        assert!(
+            matches!(err, ConfigError::TokenEnvNotFound { ref name } if name == "HANUI_TEST_HA_TOKEN_082_ABSENT"),
+            "expected TokenEnvNotFound, got: {err}"
+        );
+        assert!(err.to_string().contains("HANUI_TEST_HA_TOKEN_082_ABSENT"));
+    }
+
+    #[test]
+    fn resolve_token_env_returns_empty_when_var_is_empty() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        set_token_env("HANUI_TEST_HA_TOKEN_082_EMPTY", Some(""));
+
+        let cfg = stub_config();
+        let err = cfg
+            .resolve_token_env("HANUI_TEST_HA_TOKEN_082_EMPTY")
+            .expect_err("must fail when env var is set but empty");
+        assert!(
+            matches!(err, ConfigError::TokenEnvEmpty { ref name } if name == "HANUI_TEST_HA_TOKEN_082_EMPTY"),
+            "expected TokenEnvEmpty, got: {err}"
+        );
+        assert!(err.to_string().contains("HANUI_TEST_HA_TOKEN_082_EMPTY"));
+
+        set_token_env("HANUI_TEST_HA_TOKEN_082_EMPTY", None);
     }
 }

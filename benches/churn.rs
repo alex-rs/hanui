@@ -67,7 +67,7 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use hanui::dashboard::view_spec::{
+use hanui::dashboard::schema::{
     Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
 };
 use hanui::ha::client::WsClient;
@@ -215,10 +215,12 @@ fn build_bench_dashboard() -> Arc<Dashboard> {
             },
             options: vec![],
             placement: None,
+            visibility: "always".to_string(),
         })
         .collect();
 
     Arc::new(Dashboard {
+        call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
         version: 1,
         device_profile: "desktop".to_owned(),
         home_assistant: None,
@@ -229,6 +231,7 @@ fn build_bench_dashboard() -> Arc<Dashboard> {
             title: "Bench".to_owned(),
             layout: Layout::Sections,
             sections: vec![Section {
+                grid: hanui::dashboard::schema::SectionGrid::default(),
                 id: "main".to_owned(),
                 title: "Main".to_owned(),
                 widgets,

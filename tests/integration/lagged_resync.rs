@@ -58,8 +58,8 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 
 use hanui::actions::Action;
-use hanui::dashboard::view_spec::{
-    Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
+use hanui::dashboard::schema::{
+    Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
 };
 use hanui::ha::client::event_to_entity_update;
 use hanui::ha::entity::{Entity, EntityId};
@@ -181,8 +181,9 @@ impl BridgeSink for RecordingSink {
 /// Single-entity dashboard that references `entity_id` with an `EntityTile`.
 fn single_entity_dashboard(entity_id: &str) -> Dashboard {
     Dashboard {
+        call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
         version: 1,
-        device_profile: "rpi4".to_string(),
+        device_profile: ProfileKey::Rpi4,
         home_assistant: None,
         theme: None,
         default_view: "home".to_string(),
@@ -191,6 +192,7 @@ fn single_entity_dashboard(entity_id: &str) -> Dashboard {
             title: "Home".to_string(),
             layout: Layout::Sections,
             sections: vec![Section {
+                grid: hanui::dashboard::schema::SectionGrid::default(),
                 id: "test_section".to_string(),
                 title: "Test".to_string(),
                 widgets: vec![Widget {
@@ -207,8 +209,9 @@ fn single_entity_dashboard(entity_id: &str) -> Dashboard {
                         preferred_columns: 2,
                         preferred_rows: 1,
                     },
-                    options: vec![],
+                    options: None,
                     placement: None,
+                    visibility: "always".to_string(),
                 }],
             }],
         }],
@@ -446,13 +449,15 @@ fn three_entity_dashboard(ids: [&str; 3]) -> Dashboard {
                 preferred_columns: 2,
                 preferred_rows: 1,
             },
-            options: vec![],
+            options: None,
             placement: None,
+            visibility: "always".to_string(),
         })
         .collect();
     Dashboard {
+        call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
         version: 1,
-        device_profile: "rpi4".to_string(),
+        device_profile: ProfileKey::Rpi4,
         home_assistant: None,
         theme: None,
         default_view: "home".to_string(),
@@ -461,6 +466,7 @@ fn three_entity_dashboard(ids: [&str; 3]) -> Dashboard {
             title: "Home".to_string(),
             layout: Layout::Sections,
             sections: vec![Section {
+                grid: hanui::dashboard::schema::SectionGrid::default(),
                 id: "test_section".to_string(),
                 title: "Test".to_string(),
                 widgets,

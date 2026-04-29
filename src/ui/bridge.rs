@@ -55,7 +55,7 @@
 //! Slint callback or animation timer (per the slint-engineer charter
 //! hot-path discipline).
 
-use crate::dashboard::view_spec::{Dashboard, Placement, WidgetKind};
+use crate::dashboard::schema::{Dashboard, Placement, WidgetKind};
 use crate::ha::entity::{EntityId, EntityKind};
 use crate::ha::store::EntityStore;
 
@@ -66,7 +66,7 @@ use crate::ha::store::EntityStore;
 
 /// Computed grid placement for a tile, mirroring `TilePlacement` /
 /// `SensorTilePlacement` / `EntityTilePlacement` in the Slint tile files and
-/// `dashboard::view_spec::Placement` in the data layer.
+/// `dashboard::schema::Placement` in the data layer.
 ///
 /// Field names use snake_case throughout; the Slint compiler converts these to
 /// kebab-case (`span-cols`, `span-rows`) in its own struct declarations.
@@ -299,7 +299,17 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                                 placement,
                                 pending: false,
                             }),
-                            WidgetKind::EntityTile => TileVM::Entity(EntityTileVM {
+                            // Phase 4 schema adds Camera, History, Fan, Lock, Alarm
+                            // variants. Until dedicated Slint tile components exist
+                            // (TASK-085+), these are rendered as EntityTileVM — the
+                            // generic entity tile covers the state display until
+                            // per-kind tiles ship.
+                            WidgetKind::EntityTile
+                            | WidgetKind::Camera
+                            | WidgetKind::History
+                            | WidgetKind::Fan
+                            | WidgetKind::Lock
+                            | WidgetKind::Alarm => TileVM::Entity(EntityTileVM {
                                 name,
                                 state,
                                 icon_id,
@@ -1129,7 +1139,7 @@ async fn run_state_watcher<S: BridgeSink>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dashboard::view_spec::default_dashboard;
+    use crate::dashboard::fixture::fixture_dashboard;
     use crate::ha::fixture;
 
     /// Path to the canonical Phase 1 fixture.
@@ -1138,13 +1148,13 @@ mod tests {
     const FIXTURE_PATH: &str = "examples/ha-states.json";
 
     // -----------------------------------------------------------------------
-    // Smoke test: fixture store + default_dashboard → ≥1 VM per tile kind
+    // Smoke test: fixture store + fixture_dashboard → ≥1 VM per tile kind
     // -----------------------------------------------------------------------
 
     #[test]
     fn smoke_build_tiles_all_three_kinds() {
         let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
-        let dashboard = default_dashboard();
+        let dashboard = fixture_dashboard();
 
         let tiles = build_tiles(&store, &dashboard);
 
@@ -1177,7 +1187,7 @@ mod tests {
     #[test]
     fn light_tile_vm_fields_from_fixture() {
         let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
-        let dashboard = default_dashboard();
+        let dashboard = fixture_dashboard();
 
         let tiles = build_tiles(&store, &dashboard);
         let light_vm = tiles
@@ -1198,7 +1208,7 @@ mod tests {
         );
         // state comes from entity.state.
         assert_eq!(light_vm.state, "on", "state must be 'on' for light.kitchen");
-        // icon_id: no widget.icon set in default_dashboard, so default is "mdi:lightbulb".
+        // icon_id: no widget.icon set in fixture_dashboard, so default is "mdi:lightbulb".
         assert_eq!(
             light_vm.icon_id, "mdi:lightbulb",
             "default icon_id for Light"
@@ -1206,7 +1216,7 @@ mod tests {
         // preferred_columns from widget.layout.
         assert_eq!(light_vm.preferred_columns, 2);
         assert_eq!(light_vm.preferred_rows, 2);
-        // placement: no placement in default_dashboard so default_for(2,2).
+        // placement: no placement in fixture_dashboard so default_for(2,2).
         assert_eq!(
             light_vm.placement,
             TilePlacement {
@@ -1225,7 +1235,7 @@ mod tests {
     #[test]
     fn sensor_tile_vm_fields_from_fixture() {
         let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
-        let dashboard = default_dashboard();
+        let dashboard = fixture_dashboard();
 
         let tiles = build_tiles(&store, &dashboard);
         let sensor_vm = tiles
@@ -1262,7 +1272,7 @@ mod tests {
     #[test]
     fn entity_tile_vm_fields_from_fixture() {
         let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
-        let dashboard = default_dashboard();
+        let dashboard = fixture_dashboard();
 
         let tiles = build_tiles(&store, &dashboard);
         let entity_vm = tiles
@@ -1276,7 +1286,7 @@ mod tests {
             })
             .expect("expected at least one EntityTileVM");
 
-        // default_dashboard() has widget.name = Some("Living Room") for the entity tile;
+        // fixture_dashboard() has widget.name = Some("Living Room") for the entity tile;
         // explicit widget name always takes precedence over the fixture friendly_name.
         assert_eq!(
             entity_vm.name, "Living Room",
@@ -1321,18 +1331,19 @@ mod tests {
 
     #[test]
     fn missing_entity_produces_entity_tile_vm_with_unavailable() {
-        use crate::dashboard::view_spec::{
-            Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
+        use crate::dashboard::schema::{
+            Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
         };
 
         let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
 
         // Build a dashboard that deliberately references an entity ID not present
         // in the fixture, so we can assert the unavailable fallback independent of
-        // whatever default_dashboard() points at.
+        // whatever fixture_dashboard() points at.
         let dashboard = Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
             version: 1,
-            device_profile: "rpi4".to_string(),
+            device_profile: ProfileKey::Rpi4,
             home_assistant: None,
             theme: None,
             default_view: "home".to_string(),
@@ -1341,6 +1352,7 @@ mod tests {
                 title: "Home".to_string(),
                 layout: Layout::Sections,
                 sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
                     id: "s1".to_string(),
                     title: "Test".to_string(),
                     widgets: vec![Widget {
@@ -1357,8 +1369,9 @@ mod tests {
                             preferred_columns: 2,
                             preferred_rows: 1,
                         },
-                        options: vec![],
+                        options: None,
                         placement: None,
+                        visibility: "always".to_string(),
                     }],
                 }],
             }],
@@ -1385,15 +1398,16 @@ mod tests {
     #[test]
     fn icon_id_override_in_widget_config_takes_precedence() {
         use crate::actions::Action;
-        use crate::dashboard::view_spec::{
-            Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
+        use crate::dashboard::schema::{
+            Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
         };
 
         let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
 
         let dashboard = Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
             version: 1,
-            device_profile: "rpi4".to_string(),
+            device_profile: ProfileKey::Rpi4,
             home_assistant: None,
             theme: None,
             default_view: "home".to_string(),
@@ -1402,6 +1416,7 @@ mod tests {
                 title: "Home".to_string(),
                 layout: Layout::Sections,
                 sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
                     id: "s1".to_string(),
                     title: "Test".to_string(),
                     widgets: vec![Widget {
@@ -1418,8 +1433,9 @@ mod tests {
                             preferred_columns: 1,
                             preferred_rows: 1,
                         },
-                        options: vec![],
+                        options: None,
                         placement: None,
+                        visibility: "always".to_string(),
                     }],
                 }],
             }],
@@ -1435,20 +1451,22 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Placement from view_spec::Placement when present
+    // Placement from schema::Placement when present
     // -----------------------------------------------------------------------
 
     #[test]
     fn explicit_placement_in_widget_is_used_verbatim() {
-        use crate::dashboard::view_spec::{
-            Dashboard, Layout, Placement, Section, View, Widget, WidgetKind, WidgetLayout,
+        use crate::dashboard::schema::{
+            Dashboard, Layout, Placement, ProfileKey, Section, View, Widget, WidgetKind,
+            WidgetLayout,
         };
 
         let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
 
         let dashboard = Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
             version: 1,
-            device_profile: "rpi4".to_string(),
+            device_profile: ProfileKey::Rpi4,
             home_assistant: None,
             theme: None,
             default_view: "home".to_string(),
@@ -1457,6 +1475,7 @@ mod tests {
                 title: "Home".to_string(),
                 layout: Layout::Sections,
                 sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
                     id: "s1".to_string(),
                     title: "Test".to_string(),
                     widgets: vec![Widget {
@@ -1473,13 +1492,14 @@ mod tests {
                             preferred_columns: 2,
                             preferred_rows: 1,
                         },
-                        options: vec![],
+                        options: None,
                         placement: Some(Placement {
                             col: 3,
                             row: 1,
                             span_cols: 2,
                             span_rows: 1,
                         }),
+                        visibility: "always".to_string(),
                     }],
                 }],
             }],
@@ -1508,16 +1528,17 @@ mod tests {
 
     #[test]
     fn name_falls_back_to_entity_id_when_no_friendly_name() {
-        use crate::dashboard::view_spec::{
-            Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
+        use crate::dashboard::schema::{
+            Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
         };
 
         let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
 
         // binary_sensor.foo has an empty attributes map (no friendly_name).
         let dashboard = Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
             version: 1,
-            device_profile: "rpi4".to_string(),
+            device_profile: ProfileKey::Rpi4,
             home_assistant: None,
             theme: None,
             default_view: "home".to_string(),
@@ -1526,6 +1547,7 @@ mod tests {
                 title: "Home".to_string(),
                 layout: Layout::Sections,
                 sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
                     id: "s1".to_string(),
                     title: "Test".to_string(),
                     widgets: vec![Widget {
@@ -1542,8 +1564,9 @@ mod tests {
                             preferred_columns: 1,
                             preferred_rows: 1,
                         },
-                        options: vec![],
+                        options: None,
                         placement: None,
+                        visibility: "always".to_string(),
                     }],
                 }],
             }],
@@ -1567,13 +1590,14 @@ mod tests {
 
     #[test]
     fn empty_dashboard_produces_empty_vec() {
-        use crate::dashboard::view_spec::{Dashboard, Layout, View};
+        use crate::dashboard::schema::{Dashboard, Layout, ProfileKey, View};
 
         let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
 
         let dashboard = Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
             version: 1,
-            device_profile: "rpi4".to_string(),
+            device_profile: ProfileKey::Rpi4,
             home_assistant: None,
             theme: None,
             default_view: "empty".to_string(),
@@ -2272,12 +2296,13 @@ mod tests {
 
     /// Minimal dashboard with one Light widget pointing at `light.kitchen`.
     fn one_widget_dashboard() -> Dashboard {
-        use crate::dashboard::view_spec::{
-            Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
+        use crate::dashboard::schema::{
+            Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
         };
         Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
             version: 1,
-            device_profile: "rpi4".to_string(),
+            device_profile: ProfileKey::Rpi4,
             home_assistant: None,
             theme: None,
             default_view: "home".to_string(),
@@ -2286,6 +2311,7 @@ mod tests {
                 title: "Home".to_string(),
                 layout: Layout::Sections,
                 sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
                     id: "s1".to_string(),
                     title: "Test".to_string(),
                     widgets: vec![Widget {
@@ -2302,8 +2328,9 @@ mod tests {
                             preferred_columns: 2,
                             preferred_rows: 2,
                         },
-                        options: vec![],
+                        options: None,
                         placement: None,
+                        visibility: "always".to_string(),
                     }],
                 }],
             }],
@@ -2334,8 +2361,8 @@ mod tests {
 
     #[test]
     fn collect_visible_entity_ids_walks_dashboard_in_document_order() {
-        use crate::dashboard::view_spec::{
-            Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
+        use crate::dashboard::schema::{
+            Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
         };
         let make_widget = |entity: &str| Widget {
             id: format!("w-{entity}"),
@@ -2351,12 +2378,14 @@ mod tests {
                 preferred_columns: 1,
                 preferred_rows: 1,
             },
-            options: vec![],
+            options: None,
             placement: None,
+            visibility: "always".to_string(),
         };
         let dashboard = Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
             version: 1,
-            device_profile: "rpi4".to_string(),
+            device_profile: ProfileKey::Rpi4,
             home_assistant: None,
             theme: None,
             default_view: "home".to_string(),
@@ -2365,6 +2394,7 @@ mod tests {
                 title: "Home".to_string(),
                 layout: Layout::Sections,
                 sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
                     id: "s1".to_string(),
                     title: "Test".to_string(),
                     widgets: vec![
@@ -2684,12 +2714,13 @@ mod tests {
     #[test]
     fn collect_visible_entity_ids_skips_widgets_without_entity() {
         // Coverage: exercise the `widget.entity = None` skip branch.
-        use crate::dashboard::view_spec::{
-            Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
+        use crate::dashboard::schema::{
+            Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
         };
         let dashboard = Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
             version: 1,
-            device_profile: "rpi4".to_string(),
+            device_profile: ProfileKey::Rpi4,
             home_assistant: None,
             theme: None,
             default_view: "home".to_string(),
@@ -2698,6 +2729,7 @@ mod tests {
                 title: "Home".to_string(),
                 layout: Layout::Sections,
                 sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
                     id: "s1".to_string(),
                     title: "Test".to_string(),
                     widgets: vec![Widget {
@@ -2714,8 +2746,9 @@ mod tests {
                             preferred_columns: 1,
                             preferred_rows: 1,
                         },
-                        options: vec![],
+                        options: None,
                         placement: None,
+                        visibility: "always".to_string(),
                     }],
                 }],
             }],
@@ -2868,8 +2901,8 @@ mod tests {
         // Coverage: exercises the for-loop body in LiveBridge::spawn that
         // creates one subscriber task per unique id, and the dedup path
         // (the dashboard references `light.kitchen` twice).
-        use crate::dashboard::view_spec::{
-            Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
+        use crate::dashboard::schema::{
+            Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
         };
         ensure_icons_init();
 
@@ -2887,12 +2920,14 @@ mod tests {
                 preferred_columns: 1,
                 preferred_rows: 1,
             },
-            options: vec![],
+            options: None,
             placement: None,
+            visibility: "always".to_string(),
         };
         let dashboard = Arc::new(Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
             version: 1,
-            device_profile: "rpi4".to_string(),
+            device_profile: ProfileKey::Rpi4,
             home_assistant: None,
             theme: None,
             default_view: "home".to_string(),
@@ -2901,6 +2936,7 @@ mod tests {
                 title: "Home".to_string(),
                 layout: Layout::Sections,
                 sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
                     id: "s1".to_string(),
                     title: "Test".to_string(),
                     widgets: vec![
@@ -2964,14 +3000,15 @@ mod tests {
         // Coverage: exercises line 302 — the
         // `.unwrap_or_else(|| entity_id_str.to_string())` arm in the
         // missing-entity policy when widget.name is also None.
-        use crate::dashboard::view_spec::{
-            Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
+        use crate::dashboard::schema::{
+            Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
         };
         let store = StubStore::new(vec![]); // no entities loaded → all missing
 
         let dashboard = Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
             version: 1,
-            device_profile: "rpi4".to_string(),
+            device_profile: ProfileKey::Rpi4,
             home_assistant: None,
             theme: None,
             default_view: "home".to_string(),
@@ -2980,6 +3017,7 @@ mod tests {
                 title: "Home".to_string(),
                 layout: Layout::Sections,
                 sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
                     id: "s1".to_string(),
                     title: "Test".to_string(),
                     widgets: vec![Widget {
@@ -2996,8 +3034,9 @@ mod tests {
                             preferred_columns: 1,
                             preferred_rows: 1,
                         },
-                        options: vec![],
+                        options: None,
                         placement: None,
+                        visibility: "always".to_string(),
                     }],
                 }],
             }],
@@ -3325,8 +3364,8 @@ mod tests {
         // one).  This test uses a 3-widget dashboard with three distinct
         // entities, lags one of them, and asserts that get-call counts went
         // up for every subscribed id afterward.
-        use crate::dashboard::view_spec::{
-            Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
+        use crate::dashboard::schema::{
+            Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
         };
         ensure_icons_init();
 
@@ -3344,12 +3383,14 @@ mod tests {
                 preferred_columns: 1,
                 preferred_rows: 1,
             },
-            options: vec![],
+            options: None,
             placement: None,
+            visibility: "always".to_string(),
         };
         let dashboard = Arc::new(Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
             version: 1,
-            device_profile: "rpi4".to_string(),
+            device_profile: ProfileKey::Rpi4,
             home_assistant: None,
             theme: None,
             default_view: "home".to_string(),
@@ -3358,6 +3399,7 @@ mod tests {
                 title: "Home".to_string(),
                 layout: Layout::Sections,
                 sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
                     id: "s1".to_string(),
                     title: "Test".to_string(),
                     widgets: vec![

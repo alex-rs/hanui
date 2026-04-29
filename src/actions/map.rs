@@ -2,9 +2,10 @@
 //! `(entity_id, tap, hold, double_tap)`.
 //!
 //! Phase 3 ships this module with an in-code builder driven from
-//! [`crate::dashboard::view_spec::Dashboard`]; Phase 4 will replace the
-//! builder with a YAML deserializer without changing the lookup API or the
-//! dispatcher (locked_decisions.phase4_forward_compat).
+//! [`crate::dashboard::schema::Dashboard`] (the canonical Phase 4 typed
+//! schema; TASK-082 migrated from the retired `view_spec::Dashboard`).
+//! Phase 4 wires the YAML loader output here without changing the lookup API
+//! or the dispatcher (locked_decisions.phase4_forward_compat).
 //!
 //! # Why each entry carries `entity_id`
 //!
@@ -13,13 +14,13 @@
 //! single source of truth for the entity associated with a widget at
 //! dispatch time. The dispatcher reads `entity_id` from the entry for both
 //! WS dispatch (Toggle / CallService default-target) and more-info modal
-//! routing — it never performs a second lookup against the dashboard view
-//! spec while resolving an action (Risk #12).
+//! routing — it never performs a second lookup against the dashboard schema
+//! while resolving an action (Risk #12).
 //!
 //! Widgets that have no associated HA entity are skipped by
 //! [`WidgetActionMap::from_view_spec`]: there is nothing for the dispatcher
-//! to route on. The Phase 4 YAML loader is expected to enforce the same
-//! invariant at parse time.
+//! to route on. The Phase 4 YAML loader enforces the same invariant at
+//! parse time.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -27,7 +28,7 @@ use std::fmt;
 use smol_str::SmolStr;
 
 use crate::actions::Action;
-use crate::dashboard::view_spec::Dashboard;
+use crate::dashboard::schema::Dashboard;
 use crate::ha::entity::EntityId;
 
 // ---------------------------------------------------------------------------
@@ -137,15 +138,14 @@ impl WidgetActionMap {
     ///   field, defaulting to [`Action::None`] when the field is `None`.
     ///
     /// Widgets without an `entity` are skipped: they have nothing for the
-    /// dispatcher to route on. Phase 4's YAML loader is expected to refuse
-    /// configs that pair a non-`None` action with a missing entity.
+    /// dispatcher to route on. The YAML loader refuses configs that pair a
+    /// non-`None` action with a missing entity.
     ///
     /// If the dashboard contains duplicate widget ids across views or
     /// sections the **last** occurrence wins; this matches `HashMap`'s
     /// natural behaviour and is a documented gotcha for the Phase 4 schema
-    /// validator. Phase 3's hand-built `default_dashboard` does not produce
-    /// duplicates, so the policy is observable but not exercised in the
-    /// fixture.
+    /// validator. The fixture dashboard (`fixture_dashboard`) does not produce
+    /// duplicates, so the policy is observable but not exercised there.
     #[must_use]
     pub fn from_view_spec(spec: &Dashboard) -> Self {
         let mut map = HashMap::new();
@@ -208,7 +208,7 @@ impl WidgetActionMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dashboard::view_spec::default_dashboard;
+    use crate::dashboard::fixture::fixture_dashboard;
 
     // -----------------------------------------------------------------------
     // WidgetId
@@ -277,11 +277,11 @@ mod tests {
         // This is the Phase 3 invariant from
         // `locked_decisions.more_info_modal` and acceptance criterion.
         // No entry is allowed to omit `entity_id`.
-        let dashboard = default_dashboard();
+        let dashboard = fixture_dashboard();
         let map = WidgetActionMap::from_view_spec(&dashboard);
         assert!(
             !map.is_empty(),
-            "default_dashboard fixture must produce at least one entry"
+            "fixture_dashboard must produce at least one entry"
         );
         for (widget_id, entry) in &map.inner {
             // entity_id must be a non-empty string — entry construction
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn from_view_spec_populates_kitchen_light_with_toggle_and_more_info() {
-        let dashboard = default_dashboard();
+        let dashboard = fixture_dashboard();
         let map = WidgetActionMap::from_view_spec(&dashboard);
         let entry = map
             .lookup(&WidgetId::from("kitchen_light"))
@@ -316,7 +316,7 @@ mod tests {
     fn from_view_spec_defaults_missing_actions_to_action_none() {
         // hallway_temperature in the fixture has all three actions set to
         // None; the map entry must reflect Action::None for each.
-        let dashboard = default_dashboard();
+        let dashboard = fixture_dashboard();
         let map = WidgetActionMap::from_view_spec(&dashboard);
         let entry = map
             .lookup(&WidgetId::from("hallway_temperature"))
@@ -335,7 +335,7 @@ mod tests {
         // living_room_entity in the fixture has a double_tap_action of
         // Navigate { view_id: "home" }. The map must round-trip the
         // payload without re-encoding the variant.
-        let dashboard = default_dashboard();
+        let dashboard = fixture_dashboard();
         let map = WidgetActionMap::from_view_spec(&dashboard);
         let entry = map
             .lookup(&WidgetId::from("living_room_entity"))
@@ -354,12 +354,13 @@ mod tests {
     #[test]
     fn from_view_spec_skips_widgets_without_entity() {
         // Build a widget with `entity: None` and assert it is omitted.
-        use crate::dashboard::view_spec::{
-            Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
+        use crate::dashboard::schema::{
+            Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
         };
         let dashboard = Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
             version: 1,
-            device_profile: "rpi4".to_owned(),
+            device_profile: ProfileKey::Rpi4,
             home_assistant: None,
             theme: None,
             default_view: "home".to_owned(),
@@ -368,6 +369,7 @@ mod tests {
                 title: "Home".to_owned(),
                 layout: Layout::Sections,
                 sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
                     id: "overview".to_owned(),
                     title: "Overview".to_owned(),
                     widgets: vec![Widget {
@@ -384,8 +386,9 @@ mod tests {
                             preferred_columns: 1,
                             preferred_rows: 1,
                         },
-                        options: vec![],
+                        options: None,
                         placement: None,
+                        visibility: "always".to_string(),
                     }],
                 }],
             }],
@@ -403,8 +406,8 @@ mod tests {
 
     #[test]
     fn from_view_spec_traverses_multiple_sections_and_views() {
-        use crate::dashboard::view_spec::{
-            Dashboard, Layout, Section, View, Widget, WidgetKind, WidgetLayout,
+        use crate::dashboard::schema::{
+            Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
         };
         // Two views, each with one widget, both bound to entities.
         fn make_widget(id: &str, entity: &str) -> Widget {
@@ -422,13 +425,15 @@ mod tests {
                     preferred_columns: 1,
                     preferred_rows: 1,
                 },
-                options: vec![],
+                options: None,
                 placement: None,
+                visibility: "always".to_string(),
             }
         }
         let dashboard = Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
             version: 1,
-            device_profile: "rpi4".to_owned(),
+            device_profile: ProfileKey::Rpi4,
             home_assistant: None,
             theme: None,
             default_view: "home".to_owned(),
@@ -438,6 +443,7 @@ mod tests {
                     title: "Home".to_owned(),
                     layout: Layout::Sections,
                     sections: vec![Section {
+                        grid: crate::dashboard::schema::SectionGrid::default(),
                         id: "main".to_owned(),
                         title: "Main".to_owned(),
                         widgets: vec![make_widget("alpha", "switch.alpha")],
@@ -448,6 +454,7 @@ mod tests {
                     title: "Office".to_owned(),
                     layout: Layout::Sections,
                     sections: vec![Section {
+                        grid: crate::dashboard::schema::SectionGrid::default(),
                         id: "desk".to_owned(),
                         title: "Desk".to_owned(),
                         widgets: vec![make_widget("beta", "light.beta")],
@@ -469,7 +476,7 @@ mod tests {
 
     #[test]
     fn lookup_unknown_widget_returns_none() {
-        let dashboard = default_dashboard();
+        let dashboard = fixture_dashboard();
         let map = WidgetActionMap::from_view_spec(&dashboard);
         assert!(map.lookup(&WidgetId::from("does_not_exist")).is_none());
     }
