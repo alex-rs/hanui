@@ -60,12 +60,90 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use jiff::Timestamp;
 use tokio::sync::{broadcast, mpsc};
 
+use crate::actions::map::{WidgetActionMap, WidgetId};
 use crate::ha::client::OutboundCommand;
 use crate::ha::entity::{Entity, EntityId};
 use crate::ha::services::{ServiceMeta, ServiceRegistry, ServiceRegistryHandle};
 use crate::ha::store::{EntityStore, EntityUpdate};
+
+// ---------------------------------------------------------------------------
+// Optimistic UI (TASK-064)
+// ---------------------------------------------------------------------------
+
+/// Default per-entity cap on concurrent optimistic entries
+/// (`locked_decisions.backpressure`).
+pub const DEFAULT_PER_ENTITY_OPTIMISTIC_CAP: usize = 4;
+
+/// Default global cap on concurrent optimistic entries across all entities
+/// (`locked_decisions.backpressure`).
+pub const DEFAULT_GLOBAL_OPTIMISTIC_CAP: usize = 64;
+
+/// One in-flight optimistic UI prediction for a dispatched action.
+///
+/// The dispatcher (TASK-064) creates an `OptimisticEntry` immediately after
+/// pushing an `OutboundCommand` to the WS client. The Slint rendering layer
+/// (TASK-067) consults [`LiveStore::pending_for_widget`] to drive the per-tile
+/// pending spinner; the dispatcher's reconciliation task uses the entry's
+/// fields to decide whether to drop, hold, or revert based on inbound HA
+/// events and the service-call ack.
+///
+/// # Field semantics
+///
+/// * `entity_id` — the HA entity the action targets. Multiple entries may
+///   live under the same `entity_id` when a burst of taps fires (subject to
+///   [`DEFAULT_PER_ENTITY_OPTIMISTIC_CAP`]).
+/// * `request_id` — a dispatcher-allocated, monotonic identity used to
+///   correlate the entry with its reconciliation task. Per
+///   `locked_decisions.ws_command_ack_envelope` the dispatcher does NOT see
+///   the WS-client-allocated id, so this field is the dispatcher's local
+///   identity (deterministic for tests, opaque to HA).
+/// * `dispatched_at` — wall-clock timestamp captured at dispatch time. The
+///   reconciliation key is `entity.last_changed > entry.dispatched_at`
+///   (`locked_decisions.optimistic_reconciliation_key`); ANY HA `state_changed`
+///   that updates `last_changed` past this point is treated as the
+///   confirming truth and the entry is dropped (rule 1).
+/// * `tentative_state` — what the optimistic update predicts. Rule 2
+///   (ack-success without state_changed) compares this against the current
+///   entity state at ack time to decide drop-vs-hold.
+/// * `prior_state` — the entity state at dispatch time. Rule 4 (ack-error)
+///   and rule 5 (timeout) revert to this value. Per
+///   `locked_decisions.action_timing` `LastWriteWins`, when a second gesture
+///   fires while the first is pending, the new entry's `prior_state` is the
+///   cancelled entry's `prior_state` (chain-root preservation, NOT the
+///   cancelled entry's `tentative_state`).
+#[derive(Debug, Clone)]
+pub struct OptimisticEntry {
+    /// HA entity this action targets.
+    pub entity_id: EntityId,
+    /// Dispatcher-local monotonic identity (NOT the WS client's id).
+    pub request_id: u32,
+    /// Wall-clock dispatch timestamp; reconciliation compares against
+    /// `entity.last_changed`.
+    pub dispatched_at: Timestamp,
+    /// What the optimistic update predicts (e.g. `"on"` after a Toggle on
+    /// an off light).
+    pub tentative_state: Arc<str>,
+    /// Pre-dispatch state value; revert target on ack-error / timeout.
+    pub prior_state: Arc<str>,
+}
+
+/// Outcome reported by [`LiveStore::insert_optimistic_entry`] when capacity
+/// is saturated (`locked_decisions.backpressure`).
+///
+/// The dispatcher maps this onto a `BackpressureRejected` error and emits a
+/// toast event on the toast channel — never silently drops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptimisticInsertError {
+    /// The per-entity cap (default [`DEFAULT_PER_ENTITY_OPTIMISTIC_CAP`])
+    /// has been reached for this entity.
+    PerEntityCap,
+    /// The global cap (default [`DEFAULT_GLOBAL_OPTIMISTIC_CAP`]) has been
+    /// reached across all entities.
+    GlobalCap,
+}
 
 // ---------------------------------------------------------------------------
 // LiveStore
@@ -123,6 +201,39 @@ pub struct LiveStore {
     ///
     /// [`WsClient`]: crate::ha::client::WsClient
     pub services_handle: ServiceRegistryHandle,
+
+    /// In-flight optimistic UI predictions, keyed by `entity_id` (TASK-064).
+    ///
+    /// Populated by the dispatcher's [`Self::insert_optimistic_entry`] after a
+    /// successful `OutboundCommand` push, drained by reconciliation rules
+    /// (success / error / timeout / state_changed) and by the
+    /// `LastWriteWins` cancellation path. The Slint rendering layer
+    /// (TASK-067) reads [`Self::pending_for_widget`] to drive the per-tile
+    /// spinner.
+    ///
+    /// Multiple entries may live under one `entity_id` (rapid taps); the
+    /// outer cap is [`Self::per_entity_optimistic_cap`] entries per entity
+    /// and [`Self::global_optimistic_cap`] across all entities.
+    optimistic: RwLock<HashMap<EntityId, Vec<OptimisticEntry>>>,
+
+    /// Per-entity cap on concurrent optimistic entries
+    /// (`locked_decisions.backpressure`). Defaults to
+    /// [`DEFAULT_PER_ENTITY_OPTIMISTIC_CAP`].
+    per_entity_optimistic_cap: usize,
+
+    /// Global cap on concurrent optimistic entries across all entities
+    /// (`locked_decisions.backpressure`). Defaults to
+    /// [`DEFAULT_GLOBAL_OPTIMISTIC_CAP`].
+    global_optimistic_cap: usize,
+
+    /// Optional `WidgetActionMap` snapshot used to resolve
+    /// [`Self::pending_for_widget`] queries from `WidgetId` → `EntityId`.
+    ///
+    /// Set once at startup via [`Self::set_widget_action_map`]; clones are
+    /// cheap (`Arc`). When unset, [`Self::pending_for_widget`] returns
+    /// `false` for every input — TASK-067's spinner sees "no pending" until
+    /// the orchestrator wires the map.
+    widget_action_map: RwLock<Option<Arc<WidgetActionMap>>>,
 }
 
 impl LiveStore {
@@ -143,6 +254,10 @@ impl LiveStore {
             senders: RwLock::new(HashMap::new()),
             command_tx: RwLock::new(None),
             services_handle: ServiceRegistry::new_handle(),
+            optimistic: RwLock::new(HashMap::new()),
+            per_entity_optimistic_cap: DEFAULT_PER_ENTITY_OPTIMISTIC_CAP,
+            global_optimistic_cap: DEFAULT_GLOBAL_OPTIMISTIC_CAP,
+            widget_action_map: RwLock::new(None),
         }
     }
 
@@ -258,6 +373,210 @@ impl LiveStore {
         *guard = None;
     }
 
+    // -----------------------------------------------------------------------
+    // Optimistic UI (TASK-064)
+    // -----------------------------------------------------------------------
+
+    /// Configure the per-entity cap on concurrent optimistic entries.
+    ///
+    /// Builder-style; chains with [`Self::with_global_optimistic_cap`].
+    /// Default is [`DEFAULT_PER_ENTITY_OPTIMISTIC_CAP`] per
+    /// `locked_decisions.backpressure`. Phase 4 `DeviceProfile` may override.
+    #[must_use]
+    pub fn with_per_entity_optimistic_cap(mut self, cap: usize) -> Self {
+        self.per_entity_optimistic_cap = cap;
+        self
+    }
+
+    /// Configure the global cap on concurrent optimistic entries.
+    ///
+    /// Builder-style; chains with [`Self::with_per_entity_optimistic_cap`].
+    /// Default is [`DEFAULT_GLOBAL_OPTIMISTIC_CAP`] per
+    /// `locked_decisions.backpressure`. Phase 4 `DeviceProfile` may override.
+    #[must_use]
+    pub fn with_global_optimistic_cap(mut self, cap: usize) -> Self {
+        self.global_optimistic_cap = cap;
+        self
+    }
+
+    /// Returns the current per-entity optimistic-entry cap.
+    #[must_use]
+    pub fn per_entity_optimistic_cap(&self) -> usize {
+        self.per_entity_optimistic_cap
+    }
+
+    /// Returns the current global optimistic-entry cap.
+    #[must_use]
+    pub fn global_optimistic_cap(&self) -> usize {
+        self.global_optimistic_cap
+    }
+
+    /// Install the dashboard `WidgetActionMap` so [`Self::pending_for_widget`]
+    /// can resolve `WidgetId → EntityId`.
+    ///
+    /// Wired once at startup by `src/lib.rs` after the dashboard view spec is
+    /// loaded. The Slint rendering layer (TASK-067) does not call this — it
+    /// only reads [`Self::pending_for_widget`].
+    pub fn set_widget_action_map(&self, map: Arc<WidgetActionMap>) {
+        let mut guard = self
+            .widget_action_map
+            .write()
+            .expect("LiveStore widget_action_map RwLock poisoned");
+        *guard = Some(map);
+    }
+
+    /// **Cross-owner read API consumed by TASK-067 (per-tile spinner).**
+    ///
+    /// Returns `true` if any [`OptimisticEntry`] currently exists for the
+    /// entity bound to `widget_id` (resolved via the previously-installed
+    /// [`WidgetActionMap`]). Returns `false` when the widget has no entry in
+    /// the map, no map has been installed yet, or the entity has zero
+    /// pending optimistic entries.
+    ///
+    /// Per `locked_decisions.pending_state_read_api`, this is the **single**
+    /// pending-state read API the slint-engineer binds to. TASK-067's spinner
+    /// visibility binds to this method's return value, NOT a parallel
+    /// pending-state path. Codex review 2026-04-28 caught the cross-owner
+    /// risk (#14) of a parallel API diverging.
+    #[must_use]
+    pub fn pending_for_widget(&self, widget_id: &WidgetId) -> bool {
+        // 1. Resolve widget_id → entity_id via the installed
+        //    `WidgetActionMap`. Cloning the `Arc` releases the read-lock
+        //    before the map lookup so concurrent
+        //    `set_widget_action_map` writes are not blocked on this read.
+        let map_arc = {
+            let guard = self
+                .widget_action_map
+                .read()
+                .expect("LiveStore widget_action_map RwLock poisoned");
+            match guard.as_ref() {
+                Some(arc) => Arc::clone(arc),
+                None => return false,
+            }
+        };
+        let Some(entry) = map_arc.lookup(widget_id) else {
+            return false;
+        };
+        // 2. Test for any optimistic entry on that entity_id.
+        let guard = self
+            .optimistic
+            .read()
+            .expect("LiveStore optimistic RwLock poisoned");
+        guard
+            .get(&entry.entity_id)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Insert a new optimistic entry, enforcing per-entity and global caps.
+    ///
+    /// Returns `Ok(())` on success; `Err(OptimisticInsertError::PerEntityCap)`
+    /// or `Err(OptimisticInsertError::GlobalCap)` when capacity is saturated
+    /// (`locked_decisions.backpressure`). The dispatcher converts either
+    /// `Err` into `DispatchError::BackpressureRejected` plus a toast event —
+    /// never silently drops.
+    pub fn insert_optimistic_entry(
+        &self,
+        entry: OptimisticEntry,
+    ) -> Result<(), OptimisticInsertError> {
+        let mut guard = self
+            .optimistic
+            .write()
+            .expect("LiveStore optimistic RwLock poisoned");
+
+        // Global cap: total across all entities (Σ vec lengths).
+        let global_total: usize = guard.values().map(|v| v.len()).sum();
+        if global_total >= self.global_optimistic_cap {
+            return Err(OptimisticInsertError::GlobalCap);
+        }
+
+        let bucket = guard.entry(entry.entity_id.clone()).or_default();
+        if bucket.len() >= self.per_entity_optimistic_cap {
+            return Err(OptimisticInsertError::PerEntityCap);
+        }
+        bucket.push(entry);
+        Ok(())
+    }
+
+    /// Remove the optimistic entry with `(entity_id, request_id)` if present.
+    ///
+    /// Returns `Some(entry)` if the entry was found and removed (so the
+    /// caller can trigger any side effects — e.g. emit a revert broadcast),
+    /// `None` if the entry was not present (already drained by another
+    /// reconciliation path, or cancelled by `LastWriteWins`).
+    pub fn drop_optimistic_entry(
+        &self,
+        entity_id: &EntityId,
+        request_id: u32,
+    ) -> Option<OptimisticEntry> {
+        let mut guard = self
+            .optimistic
+            .write()
+            .expect("LiveStore optimistic RwLock poisoned");
+        let bucket = guard.get_mut(entity_id)?;
+        let pos = bucket.iter().position(|e| e.request_id == request_id)?;
+        let removed = bucket.remove(pos);
+        if bucket.is_empty() {
+            guard.remove(entity_id);
+        }
+        Some(removed)
+    }
+
+    /// Drop and return ALL optimistic entries for `entity_id`.
+    ///
+    /// Used by the dispatcher's `LastWriteWins` cancellation path: a second
+    /// gesture on the same widget cancels the pending entries (returning them
+    /// so the new entry's `prior_state` can preserve the chain root). The
+    /// new entry's `prior_state` is the FIRST cancelled entry's `prior_state`
+    /// per `locked_decisions.action_timing` (the chain root, NOT the most
+    /// recent cancelled `tentative_state`).
+    pub fn drop_all_optimistic_entries(&self, entity_id: &EntityId) -> Vec<OptimisticEntry> {
+        let mut guard = self
+            .optimistic
+            .write()
+            .expect("LiveStore optimistic RwLock poisoned");
+        guard.remove(entity_id).unwrap_or_default()
+    }
+
+    /// Returns `true` if an optimistic entry with `(entity_id, request_id)`
+    /// is currently present.
+    ///
+    /// Used by the dispatcher's reconciliation task to detect whether its
+    /// entry has already been removed (by an inbound `state_changed` event
+    /// or by a `LastWriteWins` cancellation) before deciding whether to
+    /// revert.
+    #[must_use]
+    pub fn has_optimistic_entry(&self, entity_id: &EntityId, request_id: u32) -> bool {
+        let guard = self
+            .optimistic
+            .read()
+            .expect("LiveStore optimistic RwLock poisoned");
+        guard
+            .get(entity_id)
+            .map(|v| v.iter().any(|e| e.request_id == request_id))
+            .unwrap_or(false)
+    }
+
+    /// Snapshot the current pending entries for `entity_id` (test/diagnostic).
+    #[must_use]
+    pub fn optimistic_entries_for(&self, entity_id: &EntityId) -> Vec<OptimisticEntry> {
+        let guard = self
+            .optimistic
+            .read()
+            .expect("LiveStore optimistic RwLock poisoned");
+        guard.get(entity_id).cloned().unwrap_or_default()
+    }
+
+    /// Total number of optimistic entries across all entities (test/diagnostic).
+    #[must_use]
+    pub fn optimistic_total(&self) -> usize {
+        let guard = self
+            .optimistic
+            .read()
+            .expect("LiveStore optimistic RwLock poisoned");
+        guard.values().map(|v| v.len()).sum()
+    }
+
     /// Replace the entire entity map atomically.
     ///
     /// Called after the initial `get_states` reply (and after each reconnect
@@ -283,6 +602,18 @@ impl LiveStore {
     /// After the snapshot is updated, a broadcast is sent to any active
     /// per-entity subscriber.  If no subscriber exists for this entity, the
     /// broadcast is silently discarded.
+    ///
+    /// # Optimistic UI reconciliation (TASK-064)
+    ///
+    /// Per `locked_decisions.optimistic_reconciliation_key`, any optimistic
+    /// entry on this entity whose `dispatched_at` is strictly less than the
+    /// inbound entity's `last_changed` is dropped (rule 1: ack-success WITH
+    /// state_changed). Attribute-only events leave entries intact (rule 3:
+    /// `last_changed` does not advance for attribute-only updates).
+    /// Removal events (`update.entity == None`) do NOT drop entries — that
+    /// path is taken when HA reports the entity disappeared, which is not
+    /// the optimistic-reconciliation seam (the entry will time out via
+    /// rule 5).
     pub fn apply_event(&self, update: EntityUpdate) {
         // Update the snapshot under a write-lock.
         {
@@ -302,6 +633,25 @@ impl LiveStore {
                 }
             }
             *guard = Arc::new(new_map);
+        }
+
+        // Reconciliation rule 1 (ack-success WITH state_changed): drop any
+        // optimistic entries on this entity whose `dispatched_at` predates
+        // the inbound `last_changed`. Rule 3 (attribute-only state_changed)
+        // is captured by the strict-greater-than: an attribute-only event
+        // carries the SAME `last_changed`, so no entries are dropped.
+        if let Some(ref entity) = update.entity {
+            let new_last_changed = entity.last_changed;
+            let mut guard = self
+                .optimistic
+                .write()
+                .expect("LiveStore optimistic RwLock poisoned");
+            if let Some(bucket) = guard.get_mut(&update.id) {
+                bucket.retain(|entry| entry.dispatched_at >= new_last_changed);
+                if bucket.is_empty() {
+                    guard.remove(&update.id);
+                }
+            }
         }
 
         // Broadcast to any active per-entity subscriber.  Holding the senders
