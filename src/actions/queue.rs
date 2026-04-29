@@ -17,15 +17,34 @@
 //! * [`Action::Url`] — non-idempotent. Each replay spawns a new external
 //!   process. **Never queued.**
 //! * [`Action::CallService`] — context-dependent. Idempotent in HA semantics
-//!   only when the service is one of an explicit allowlist (`turn_on`,
-//!   `turn_off`, `set_*`). Other services (`delete_*`, `restart`, etc.) are
-//!   rejected at enqueue time. **Allowlisted only.**
+//!   only when the `(domain, service)` pair is on the per-config
+//!   [`CallServiceAllowlist`](crate::dashboard::schema::CallServiceAllowlist)
+//!   produced by the YAML validator (TASK-083). When no YAML is loaded
+//!   (`--fixture` mode), the Phase 3 prefix rule (`turn_on`, `turn_off`,
+//!   `set_*`) is the fallback gate, with a once-per-process
+//!   `tracing::warn!` flagging that the loose gate is active. Other
+//!   services (`delete_*`, `restart`, etc.) are rejected at enqueue time.
+//!   **Allowlisted only.**
 //!
 //! The schema's `Action::idempotency()` const marker is the first gate; the
 //! `CallService` allowlist is the second. Both fire at enqueue time so that
 //! [`OfflineQueue::flush`] never has to repeat the check (Risk #6:
 //! "logic error here would let a non-idempotent action enqueue and fire
 //! twice on reconnect").
+//!
+//! # Allowlist source (TASK-090)
+//!
+//! Per `locked_decisions.call_service_allowlist_runtime_access` in
+//! `docs/plans/2026-04-29-phase-4-layout.md`, the queue is constructed at
+//! startup with an `Option<Arc<CallServiceAllowlist>>`:
+//! - `Some(arc)` — production / YAML path. The validator-derived per-config
+//!   set is the strict gate; `(domain, service)` pairs not in the set are
+//!   rejected even if they would have satisfied the prefix rule.
+//! - `None` — `--fixture` mode (no YAML loaded). The Phase 3 prefix rule is
+//!   the fallback. A once-per-process `tracing::warn!` (gated by an atomic
+//!   latch — semantically a `OnceLock<()>`) fires the first time this path
+//!   is exercised so operators see the loose gate is active. Production
+//!   should always load a Dashboard via `dashboard::loader::load()`.
 //!
 //! # Capacity & age-out (`locked_decisions.action_timing`)
 //!
@@ -54,12 +73,15 @@
 //! * Reconnect-flush FIFO ordering, age-out, capacity overflow.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use jiff::{SignedDuration, Timestamp};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::actions::schema::{Action, Idempotency};
+use crate::dashboard::schema::CallServiceAllowlist;
 use crate::ha::client::{AckResult, OutboundCommand, OutboundFrame};
 use crate::ha::entity::EntityId;
 
@@ -198,10 +220,13 @@ pub struct FlushOutcome {
 
 /// FIFO offline-action queue.
 ///
-/// Construction is `OfflineQueue::with_capacity(cap, max_age_ms)`. Tests
-/// inject a clock via [`OfflineQueue::enqueue_at`] /
-/// [`OfflineQueue::flush_at`]; production paths use [`OfflineQueue::enqueue`]
-/// and [`OfflineQueue::flush`] which read `Timestamp::now()`.
+/// Construction is `OfflineQueue::with_capacity(cap, max_age_ms)` (no
+/// allowlist — fallback prefix rule applies) or
+/// [`OfflineQueue::with_allowlist`] (validator-derived per-config allowlist
+/// is the primary gate). Tests inject a clock via
+/// [`OfflineQueue::enqueue_at`] / [`OfflineQueue::flush_at`]; production
+/// paths use [`OfflineQueue::enqueue`] and [`OfflineQueue::flush`] which read
+/// `Timestamp::now()`.
 ///
 /// The queue is `Send` and is intended to be wrapped in
 /// `Arc<Mutex<OfflineQueue>>` in production so the dispatcher and the
@@ -211,10 +236,23 @@ pub struct OfflineQueue {
     entries: VecDeque<QueueEntry>,
     max_age_ms: u64,
     capacity: usize,
+    /// Per-config `(domain, service)` allowlist produced by the YAML
+    /// validator (TASK-083). `None` means no YAML was loaded (`--fixture`
+    /// mode); enqueue falls back to the Phase 3 prefix rule with a
+    /// once-per-process `tracing::warn!`. See module-level
+    /// `# Allowlist source (TASK-090)` for the threat-model rationale.
+    allowlist: Option<Arc<CallServiceAllowlist>>,
 }
 
 impl OfflineQueue {
-    /// Construct a new queue with explicit capacity + age-out window.
+    /// Construct a new queue with explicit capacity + age-out window. The
+    /// queue runs without a validator-derived allowlist — the Phase 3
+    /// prefix rule (`turn_on`, `turn_off`, `set_*`) is the fallback gate.
+    /// A once-per-process `tracing::warn!` fires the first time this path
+    /// is exercised so operators see the loose gate is active.
+    ///
+    /// Use [`Self::with_allowlist`] in production when a Dashboard is
+    /// loaded.
     #[must_use]
     pub fn with_capacity(capacity: usize, max_age_ms: u64) -> Self {
         // VecDeque::with_capacity is a hint; the queue's hard cap is
@@ -223,15 +261,61 @@ impl OfflineQueue {
             entries: VecDeque::with_capacity(capacity),
             max_age_ms,
             capacity,
+            allowlist: None,
         }
     }
 
     /// Construct a queue with the Phase 3 defaults
     /// (`DEFAULT_OFFLINE_QUEUE_CAPACITY` entries, `DEFAULT_QUEUE_MAX_AGE_MS`
-    /// age-out).
+    /// age-out) and no allowlist (fallback prefix rule).
+    ///
+    /// Production should prefer [`Self::with_allowlist`] when a Dashboard
+    /// has been loaded — the validator-derived per-config set is the strict
+    /// gate per `locked_decisions.call_service_allowlist_runtime_access`.
     #[must_use]
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_OFFLINE_QUEUE_CAPACITY, DEFAULT_QUEUE_MAX_AGE_MS)
+    }
+
+    /// Construct a queue with an explicit per-config
+    /// [`CallServiceAllowlist`] sourced from a loaded
+    /// [`Dashboard`](crate::dashboard::schema::Dashboard).
+    ///
+    /// Capacity and age-out window default to
+    /// [`DEFAULT_OFFLINE_QUEUE_CAPACITY`] /
+    /// [`DEFAULT_QUEUE_MAX_AGE_MS`] respectively.
+    ///
+    /// `allowlist` is `Some(arc)` for the YAML path (strict per-domain
+    /// gate); `None` falls back to the Phase 3 prefix rule. The arc is
+    /// shared with `Dashboard.call_service_allowlist` per
+    /// `locked_decisions.call_service_allowlist_runtime_access`.
+    #[must_use]
+    pub fn with_allowlist(allowlist: Option<Arc<CallServiceAllowlist>>) -> Self {
+        Self::with_capacity_and_allowlist(
+            DEFAULT_OFFLINE_QUEUE_CAPACITY,
+            DEFAULT_QUEUE_MAX_AGE_MS,
+            allowlist,
+        )
+    }
+
+    /// Construct a queue with explicit capacity + age-out window AND an
+    /// optional validator-derived allowlist.
+    ///
+    /// This is the most general constructor; the simpler
+    /// [`Self::with_capacity`] / [`Self::with_allowlist`] / [`Self::new`]
+    /// forms are convenience wrappers around it.
+    #[must_use]
+    pub fn with_capacity_and_allowlist(
+        capacity: usize,
+        max_age_ms: u64,
+        allowlist: Option<Arc<CallServiceAllowlist>>,
+    ) -> Self {
+        OfflineQueue {
+            entries: VecDeque::with_capacity(capacity),
+            max_age_ms,
+            capacity,
+            allowlist,
+        }
     }
 
     /// Number of entries currently in the queue.
@@ -310,10 +394,11 @@ impl OfflineQueue {
             Action::CallService {
                 domain, service, ..
             } => {
-                if !is_service_allowlisted(service.as_str()) {
+                if !is_service_allowlisted(self.allowlist.as_ref(), domain, service) {
                     warn!(
                         domain = %domain,
                         service = %service,
+                        allowlist_source = if self.allowlist.is_some() { "yaml" } else { "fallback-prefix" },
                         "offline queue: rejecting non-allowlisted CallService"
                     );
                     return Err(QueueError::ServiceNotAllowlisted {
@@ -483,25 +568,107 @@ impl Default for OfflineQueue {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Runtime `CallService` allowlist per
-/// `locked_decisions.idempotency_marker`.
+/// Runtime `CallService` allowlist gate (TASK-090).
 ///
-/// Returns `true` for `turn_on`, `turn_off`, and any name beginning with
-/// `set_` (e.g. `set_temperature`, `set_brightness`). Anything else is
-/// rejected at enqueue time.
+/// Returns `true` if the `(domain, service)` pair is permitted to enqueue
+/// for offline replay.
 ///
-/// # Why a prefix-allowlist (not a regex / not "everything-not-listed")
+/// # Source-of-truth ordering
+///
+/// 1. If `allowlist` is `Some(arc)` — the validator-derived per-config set
+///    (TASK-083) is the strict gate. Only pairs that appear verbatim in the
+///    set are permitted. The Phase 3 prefix rule does NOT apply.
+/// 2. If `allowlist` is `None` — `--fixture` mode (no YAML loaded). The
+///    Phase 3 prefix fallback (`turn_on`, `turn_off`, `set_*`) is the gate.
+///    A once-per-process `tracing::warn!` ([`warn_once_about_fallback`])
+///    fires the first time this branch is hit.
+///
+/// # Why two sources
+///
+/// The validator-derived allowlist is per-config explicit (no prefix
+/// heuristic — verb-named services like `cover.open_cover` are routable
+/// when they appear in the YAML, while `light.set_brightness` is rejected
+/// when the YAML only declares `light.turn_on`). Phase 4 production runs
+/// always load a YAML; the prefix fallback is a development/test
+/// convenience and emits the warn so an operator who sees it in CI logs
+/// knows the loose gate is active.
+///
+/// # Why a prefix fallback at all
 ///
 /// `set_*` matches the conventional HA set-attribute-shape services that
 /// HA itself documents as idempotent (set_temperature replays harmlessly).
-/// Adding regex would invite escape-character footguns; using a denylist
-/// would mean every new HA service requires a security review of whether
-/// it should land in the queue. The Phase 4 YAML static validator
-/// (`docs/PHASES.md` Phase 4) is a separate, stricter gate; Phase 3 cannot
-/// rely on it because Phase 4 has not landed yet.
+/// Using a denylist would mean every new HA service requires a security
+/// review of whether it should land in the queue. The fallback exists so
+/// `--fixture` mode (and pre-Phase-4 paths) still rejects destructive
+/// services like `delete_user` / `restart` while permitting common `set_*`
+/// flows.
 #[must_use]
-pub fn is_service_allowlisted(service: &str) -> bool {
-    service == "turn_on" || service == "turn_off" || service.starts_with("set_")
+pub fn is_service_allowlisted(
+    allowlist: Option<&Arc<CallServiceAllowlist>>,
+    domain: &str,
+    service: &str,
+) -> bool {
+    match allowlist {
+        Some(set) => {
+            // The set is keyed by owned `String` tuples. Avoid two
+            // allocations per call by constructing the lookup tuple
+            // explicitly — `BTreeSet::contains` requires `Borrow<K>` which
+            // for `(String, String)` does not extend to `(&str, &str)`.
+            // This branch is only on the YAML path; the allocation cost is
+            // acceptable per `locked_decisions.call_service_allowlist_runtime_access`.
+            set.contains(&(domain.to_string(), service.to_string()))
+        }
+        None => {
+            warn_once_about_fallback();
+            service == "turn_on" || service == "turn_off" || service.starts_with("set_")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Once-per-process fallback warn (TASK-090)
+// ---------------------------------------------------------------------------
+
+/// Latch for the once-per-process fallback warn. Implemented as
+/// `AtomicBool` rather than `std::sync::Once` / `OnceLock<()>` so tests
+/// can deterministically reset it via [`reset_fallback_warned_for_test`]
+/// without depending on cargo test ordering — a single-process test run
+/// otherwise lets only the first test that exercises the fallback path
+/// observe the warn output. Production semantics ("warn fires exactly once
+/// per process") are preserved: `swap(true)` returns `false` exactly once
+/// for the lifetime of the latch and only that caller emits the warn.
+///
+/// Per `locked_decisions.call_service_allowlist_runtime_access` the
+/// "OnceLock<()> or Once" guidance is honoured semantically — `AtomicBool`
+/// with a `swap(true)` is the same one-shot latch pattern.
+static FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Emit the fallback-prefix-allowlist warn the first time per process.
+///
+/// Invoked from [`is_service_allowlisted`] whenever the YAML allowlist is
+/// `None` (no Dashboard loaded, e.g. `--fixture` mode). Subsequent calls
+/// after the first are silent — the latch ensures the warn never spams the
+/// log on every offline enqueue.
+fn warn_once_about_fallback() {
+    if !FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
+        warn!(
+            "offline queue using Phase-3 prefix-allowlist fallback (no YAML loaded; \
+             --fixture mode). Production should load a Dashboard via \
+             `dashboard::loader::load()` so the validator-derived per-config \
+             allowlist is the primary gate. This warn fires once per process."
+        );
+    }
+}
+
+/// Reset the once-per-process fallback-warn latch.
+///
+/// Test-only: production code never resets the latch (the warn is
+/// intentionally one-shot). Tests that exercise the fallback path call
+/// this at the top of `#[traced_test]` bodies so cargo's randomised test
+/// ordering does not cause an earlier test to consume the latch.
+#[cfg(test)]
+pub(crate) fn reset_fallback_warned_for_test() {
+    FALLBACK_WARNED.store(false, Ordering::Relaxed);
 }
 
 /// Reconstruct the [`OutboundFrame`] from a queued entry at flush time.
@@ -595,28 +762,104 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Allowlist helper
+    // Allowlist helper — fallback prefix rule (None allowlist, --fixture mode)
+    //
+    // Per TASK-090: the prefix rule is retained as the FALLBACK only when no
+    // YAML is loaded. These tests assert the fallback semantics are unchanged
+    // from Phase 3.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn allowlist_accepts_turn_on_turn_off_and_set_prefix() {
-        assert!(is_service_allowlisted("turn_on"));
-        assert!(is_service_allowlisted("turn_off"));
-        assert!(is_service_allowlisted("set_temperature"));
-        assert!(is_service_allowlisted("set_brightness"));
-        assert!(is_service_allowlisted("set_"));
+    fn fallback_allowlist_accepts_turn_on_turn_off_and_set_prefix() {
+        // Reset the once-per-process latch so this test deterministically
+        // observes the fallback path regardless of test ordering.
+        reset_fallback_warned_for_test();
+
+        assert!(is_service_allowlisted(None, "light", "turn_on"));
+        assert!(is_service_allowlisted(None, "switch", "turn_off"));
+        assert!(is_service_allowlisted(None, "climate", "set_temperature"));
+        assert!(is_service_allowlisted(None, "light", "set_brightness"));
+        assert!(is_service_allowlisted(None, "any_domain", "set_"));
     }
 
     #[test]
-    fn allowlist_rejects_destructive_and_neutral_services() {
-        assert!(!is_service_allowlisted("delete_user"));
-        assert!(!is_service_allowlisted("restart"));
-        assert!(!is_service_allowlisted("reload"));
+    fn fallback_allowlist_rejects_destructive_and_neutral_services() {
+        reset_fallback_warned_for_test();
+
+        assert!(!is_service_allowlisted(None, "user", "delete_user"));
+        assert!(!is_service_allowlisted(None, "homeassistant", "restart"));
+        assert!(!is_service_allowlisted(None, "homeassistant", "reload"));
         // case-sensitive: only lower-case kebab/snake matches the allowlist
-        assert!(!is_service_allowlisted("Turn_On"));
-        assert!(!is_service_allowlisted(""));
+        assert!(!is_service_allowlisted(None, "light", "Turn_On"));
+        assert!(!is_service_allowlisted(None, "light", ""));
         // Pre-set-prefix substrings must NOT slip through.
-        assert!(!is_service_allowlisted("xset_value"));
+        assert!(!is_service_allowlisted(None, "fake", "xset_value"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Allowlist helper — YAML-derived strict gate (Some allowlist)
+    //
+    // Per TASK-090: the validator-derived allowlist supersedes the prefix
+    // rule. A `(domain, service)` pair is allowed iff it appears verbatim in
+    // the set; otherwise it is rejected even when the prefix rule WOULD have
+    // allowed it.
+    // -----------------------------------------------------------------------
+
+    fn allowlist_of(pairs: &[(&str, &str)]) -> Arc<CallServiceAllowlist> {
+        let set: CallServiceAllowlist = pairs
+            .iter()
+            .map(|(d, s)| ((*d).to_string(), (*s).to_string()))
+            .collect();
+        Arc::new(set)
+    }
+
+    #[test]
+    fn yaml_allowlist_permits_only_listed_pairs() {
+        let allowlist = allowlist_of(&[("light", "turn_on"), ("light", "turn_off")]);
+        assert!(is_service_allowlisted(Some(&allowlist), "light", "turn_on"));
+        assert!(is_service_allowlisted(
+            Some(&allowlist),
+            "light",
+            "turn_off"
+        ));
+        // set_brightness WOULD pass the prefix fallback but the YAML
+        // allowlist only declares turn_on / turn_off — strict gate REJECTS.
+        assert!(!is_service_allowlisted(
+            Some(&allowlist),
+            "light",
+            "set_brightness"
+        ));
+        // domain mismatch — same service, different domain.
+        assert!(!is_service_allowlisted(
+            Some(&allowlist),
+            "switch",
+            "turn_on"
+        ));
+    }
+
+    #[test]
+    fn yaml_allowlist_permits_verb_named_services_unreachable_by_prefix() {
+        // The Phase 3 prefix rule rejects open_cover / close_cover (neither
+        // turn_on nor turn_off nor set_*). The YAML-derived allowlist is per-
+        // config explicit — declaring these services in the YAML routes them.
+        let allowlist = allowlist_of(&[("cover", "open_cover"), ("cover", "close_cover")]);
+        assert!(is_service_allowlisted(
+            Some(&allowlist),
+            "cover",
+            "open_cover"
+        ));
+        assert!(is_service_allowlisted(
+            Some(&allowlist),
+            "cover",
+            "close_cover"
+        ));
+        // A service not declared in the YAML is rejected even if it matches
+        // the prefix rule — strict gate.
+        assert!(!is_service_allowlisted(
+            Some(&allowlist),
+            "cover",
+            "set_position"
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -1008,5 +1251,205 @@ mod tests {
         assert_eq!(q.capacity(), DEFAULT_OFFLINE_QUEUE_CAPACITY);
         assert_eq!(q.max_age_ms(), DEFAULT_QUEUE_MAX_AGE_MS);
         assert!(q.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-090 — validator-derived per-config allowlist (queue-level)
+    //
+    // The four tests below mirror the ticket's `tests_added` block:
+    //
+    //   queue::tests::yaml_allowlist_rejects_set_brightness_when_only_turn_on_off_listed
+    //   queue::tests::yaml_allowlist_permits_verb_named_open_cover
+    //   queue::tests::fixture_mode_fallback_warn_fires_once
+    //   queue::tests::fixture_mode_fallback_enqueues_set_temperature
+    //
+    // The pure helper-level tests (above) cover `is_service_allowlisted` in
+    // isolation; these exercise the same gates through the full `enqueue`
+    // path so the wiring between `OfflineQueue.allowlist` and the Gate-2
+    // call site is regression-protected.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn yaml_allowlist_rejects_set_brightness_when_only_turn_on_off_listed() {
+        // YAML declares `light: [turn_on, turn_off]` only. An attempt to
+        // enqueue `light.set_brightness` MUST be rejected even though the
+        // Phase 3 prefix rule WOULD have allowed it. This is the closing
+        // promise of TASK-077 / TASK-090: the validator-derived allowlist
+        // is strict, the prefix rule is fallback-only.
+        let allowlist = Some(allowlist_of(&[("light", "turn_on"), ("light", "turn_off")]));
+        let mut queue = OfflineQueue::with_allowlist(allowlist);
+
+        let action = Action::CallService {
+            domain: "light".to_owned(),
+            service: "set_brightness".to_owned(),
+            target: Some("light.kitchen".to_owned()),
+            data: Some(json!({ "brightness": 128 })),
+        };
+        match queue.enqueue(action, target_kitchen(), None) {
+            Err(QueueError::ServiceNotAllowlisted { domain, service }) => {
+                assert_eq!(domain, "light");
+                assert_eq!(service, "set_brightness");
+            }
+            other => {
+                panic!("expected ServiceNotAllowlisted for light.set_brightness, got {other:?}")
+            }
+        }
+        assert_eq!(queue.len(), 0, "rejected action must not enter the queue");
+
+        // Sanity: the listed pairs ARE permitted by the same allowlist.
+        queue
+            .enqueue(call_service("turn_on"), target_kitchen(), None)
+            .expect("light.turn_on is in the YAML allowlist");
+        queue
+            .enqueue(call_service("turn_off"), target_kitchen(), None)
+            .expect("light.turn_off is in the YAML allowlist");
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn yaml_allowlist_permits_verb_named_open_cover() {
+        // YAML declares `cover: [open_cover, close_cover]`. The prefix rule
+        // would REJECT `cover.open_cover` (neither turn_on / turn_off /
+        // set_*). The YAML allowlist permits it — verb-named idempotent
+        // services become routable by per-config declaration.
+        let allowlist = Some(allowlist_of(&[
+            ("cover", "open_cover"),
+            ("cover", "close_cover"),
+        ]));
+        let mut queue = OfflineQueue::with_allowlist(allowlist);
+
+        let open = Action::CallService {
+            domain: "cover".to_owned(),
+            service: "open_cover".to_owned(),
+            target: Some("cover.living_room".to_owned()),
+            data: None,
+        };
+        queue
+            .enqueue(open, Some(EntityId::from("cover.living_room")), None)
+            .expect("cover.open_cover is declared in the YAML allowlist");
+
+        let close = Action::CallService {
+            domain: "cover".to_owned(),
+            service: "close_cover".to_owned(),
+            target: Some("cover.living_room".to_owned()),
+            data: None,
+        };
+        queue
+            .enqueue(close, Some(EntityId::from("cover.living_room")), None)
+            .expect("cover.close_cover is declared in the YAML allowlist");
+
+        assert_eq!(queue.len(), 2);
+
+        // A non-listed pair is still rejected.
+        let set_pos = Action::CallService {
+            domain: "cover".to_owned(),
+            service: "set_cover_position".to_owned(),
+            target: Some("cover.living_room".to_owned()),
+            data: Some(json!({ "position": 50 })),
+        };
+        assert!(matches!(
+            queue.enqueue(set_pos, None, None),
+            Err(QueueError::ServiceNotAllowlisted { .. })
+        ));
+        assert_eq!(queue.len(), 2, "non-listed pair must not enter the queue");
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn fixture_mode_fallback_warn_fires_once() {
+        // 100 enqueues in --fixture mode (allowlist=None). The fallback
+        // prefix rule allows `set_temperature` on every call, but the
+        // tracing::warn! must fire EXACTLY ONCE for the entire batch — not
+        // 100 times. Per locked_decisions.call_service_allowlist_runtime_access
+        // Test 2.
+        reset_fallback_warned_for_test();
+
+        // capacity=128 so all 100 entries fit without drop-oldest churn
+        // muddying the assertion. The constructor still uses the
+        // None-allowlist (fallback prefix rule active).
+        let mut queue = OfflineQueue::with_capacity_and_allowlist(128, 60_000, None);
+        for i in 0..100 {
+            let action = Action::CallService {
+                domain: "climate".to_owned(),
+                service: "set_temperature".to_owned(),
+                target: Some(format!("climate.room_{i}")),
+                data: Some(json!({ "temperature": 21 })),
+            };
+            queue
+                .enqueue(action, None, None)
+                .expect("set_temperature is allowlisted by the fallback prefix rule");
+        }
+        assert_eq!(queue.len(), 100, "100 enqueues must all succeed");
+
+        // Assert the warn message appears exactly ONCE in this test's
+        // captured tracing output. The substring is matched against the
+        // fixture-warn message body emitted by warn_once_about_fallback.
+        logs_assert(|lines: &[&str]| {
+            let needle = "offline queue using Phase-3 prefix-allowlist fallback";
+            let count = lines.iter().filter(|l| l.contains(needle)).count();
+            if count == 1 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected fallback warn exactly once across 100 enqueues, observed {count}; \
+                     captured lines: {lines:?}"
+                ))
+            }
+        });
+    }
+
+    #[test]
+    fn fixture_mode_fallback_enqueues_set_temperature() {
+        // No YAML loaded (allowlist=None) → the fallback prefix rule lets
+        // `climate.set_temperature` enter the queue. The warn fires (once
+        // per process; reset for determinism), but enqueue succeeds.
+        reset_fallback_warned_for_test();
+
+        let mut queue = OfflineQueue::with_allowlist(None);
+        let action = Action::CallService {
+            domain: "climate".to_owned(),
+            service: "set_temperature".to_owned(),
+            target: Some("climate.living_room".to_owned()),
+            data: Some(json!({ "temperature": 22 })),
+        };
+        queue
+            .enqueue(action, Some(EntityId::from("climate.living_room")), None)
+            .expect("set_temperature must enqueue under the fallback prefix rule");
+        assert_eq!(queue.len(), 1);
+
+        // The fallback warn latch is now set — a second fixture-mode enqueue
+        // must not re-fire the warn. We verify the latch state directly: a
+        // second swap(true) MUST observe `true` (the previous enqueue set
+        // it). Direct latch state is checked rather than re-grepping logs
+        // because `traced_test` is not in scope on this `#[test]`-only path.
+        assert!(
+            FALLBACK_WARNED.load(Ordering::Relaxed),
+            "fallback warn latch must be set after the first fixture-mode enqueue"
+        );
+    }
+
+    #[test]
+    fn yaml_allowlist_constructor_threads_arc_to_enqueue_gate() {
+        // The Arc passed to `with_allowlist` is the same one consulted at
+        // enqueue time — proving the constructor is not a no-op. Without
+        // this assertion a regression that swallowed the Arc (e.g. by
+        // shadowing the field) would compile and silently fall back to the
+        // prefix rule.
+        let allowlist = allowlist_of(&[("light", "turn_on")]);
+        let mut queue = OfflineQueue::with_allowlist(Some(allowlist.clone()));
+
+        // Enqueue a service NOT on the allowlist but allowed by the prefix
+        // rule. The strict gate must reject it — proving the Arc is the
+        // gate, not the prefix rule.
+        let set_brightness = Action::CallService {
+            domain: "light".to_owned(),
+            service: "set_brightness".to_owned(),
+            target: Some("light.kitchen".to_owned()),
+            data: None,
+        };
+        assert!(matches!(
+            queue.enqueue(set_brightness, None, None),
+            Err(QueueError::ServiceNotAllowlisted { .. })
+        ));
     }
 }

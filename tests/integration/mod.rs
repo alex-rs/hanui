@@ -40,6 +40,7 @@ pub mod lagged_resync;
 pub mod layout;
 pub mod loader;
 pub mod more_info_modal;
+pub mod offline_queue;
 pub mod schema_lock;
 pub mod toast_spinner;
 pub mod url_action;
