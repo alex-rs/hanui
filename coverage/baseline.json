@@ -4,74 +4,101 @@
     "enforcement": "ops/checks/coverage-ratchet.js",
     "tool": "cargo-llvm-cov",
     "tool_version": "cargo-llvm-cov 0.8.5",
-    "seeded_at": "2026-04-29T22:48:43Z",
-    "seeded_from": "a1ab217605a052cbfc9e23cc14041715fb01873a"
+    "seeded_at": "2026-04-30T00:00:00Z",
+    "seeded_from": "26075c4b630f7ef0b5c20130df3d71256b06405a",
+    "regenerated": "2026-04-30",
+    "regenerated_for": "Interim re-seed for Phase 6 Wave 0 (post-TASK-097 main SHA 26075c4). Captures cumulative drift from TASK-095 through TASK-101. Final re-seed will occur after TASK-112 per TASK-113 plan entry."
   },
   "files": {
-    "src/actions/schema.rs": {
-      "lines_total": 119,
-      "lines_covered": 119,
-      "pct": 100
-    },
-    "src/actions/timing.rs": {
-      "lines_total": 114,
-      "lines_covered": 114,
-      "pct": 100
+    "src/actions/dispatcher.rs": {
+      "lines_total": 2328,
+      "lines_covered": 2248,
+      "pct": 96.6
     },
     "src/actions/map.rs": {
       "lines_total": 442,
       "lines_covered": 442,
-      "pct": 100
+      "pct": 100.0
     },
-    "src/actions/dispatcher.rs": {
-      "lines_total": 1867,
-      "lines_covered": 1793,
-      "pct": 96
-    },
-    "src/actions/url.rs": {
-      "lines_total": 506,
-      "lines_covered": 459,
-      "pct": 90.7
+    "src/actions/mod.rs": {
+      "lines_total": 0,
+      "lines_covered": 0,
+      "pct": 0.0
     },
     "src/actions/queue.rs": {
-      "lines_total": 679,
+      "lines_total": 680,
       "lines_covered": 642,
-      "pct": 94.6
+      "pct": 94.4
+    },
+    "src/actions/schema.rs": {
+      "lines_total": 329,
+      "lines_covered": 329,
+      "pct": 100.0
+    },
+    "src/actions/service_map.rs": {
+      "lines_total": 338,
+      "lines_covered": 334,
+      "pct": 98.8
+    },
+    "src/actions/timing.rs": {
+      "lines_total": 114,
+      "lines_covered": 114,
+      "pct": 100.0
+    },
+    "src/actions/url.rs": {
+      "lines_total": 602,
+      "lines_covered": 549,
+      "pct": 91.2
     },
     "src/assets/icons.rs": {
       "lines_total": 156,
       "lines_covered": 156,
-      "pct": 100
+      "pct": 100.0
+    },
+    "src/assets/mod.rs": {
+      "lines_total": 0,
+      "lines_covered": 0,
+      "pct": 0.0
+    },
+    "src/audit/mod.rs": {
+      "lines_total": 155,
+      "lines_covered": 145,
+      "pct": 93.5
     },
     "src/dashboard/fixture.rs": {
       "lines_total": 163,
       "lines_covered": 163,
-      "pct": 100
+      "pct": 100.0
     },
     "src/dashboard/layout.rs": {
       "lines_total": 217,
       "lines_covered": 217,
-      "pct": 100
+      "pct": 100.0
     },
     "src/dashboard/loader.rs": {
       "lines_total": 225,
-      "lines_covered": 209,
-      "pct": 92.9
+      "lines_covered": 208,
+      "pct": 92.4
+    },
+    "src/dashboard/mod.rs": {
+      "lines_total": 0,
+      "lines_covered": 0,
+      "pct": 0.0
     },
     "src/dashboard/profiles.rs": {
       "lines_total": 206,
       "lines_covered": 206,
-      "pct": 100
+      "pct": 100.0
     },
     "src/dashboard/schema.rs": {
-      "lines_total": 127,
-      "lines_covered": 126,
-      "pct": 99.2
+      "lines_total": 389,
+      "lines_covered": 389,
+      "pct": 100.0
     },
     "src/dashboard/validate.rs": {
-      "lines_total": 707,
-      "lines_covered": 687,
-      "pct": 97.2
+      "lines_total": 1052,
+      "lines_covered": 1038,
+      "pct": 98.7
     },
     "src/ha/client.rs": {
       "lines_total": 2230,
@@ -81,22 +108,32 @@
     "src/ha/entity.rs": {
       "lines_total": 114,
       "lines_covered": 114,
-      "pct": 100
+      "pct": 100.0
     },
     "src/ha/fixture.rs": {
       "lines_total": 210,
       "lines_covered": 203,
       "pct": 96.7
     },
+    "src/ha/http.rs": {
+      "lines_total": 514,
+      "lines_covered": 331,
+      "pct": 64.4
+    },
     "src/ha/live_store.rs": {
       "lines_total": 572,
       "lines_covered": 558,
       "pct": 97.6
     },
+    "src/ha/mod.rs": {
+      "lines_total": 0,
+      "lines_covered": 0,
+      "pct": 0.0
+    },
     "src/ha/protocol.rs": {
       "lines_total": 424,
       "lines_covered": 390,
-      "pct": 92
+      "pct": 92.0
     },
     "src/ha/services.rs": {
       "lines_total": 317,
@@ -106,7 +143,7 @@
     "src/ha/store.rs": {
       "lines_total": 198,
       "lines_covered": 190,
-      "pct": 96
+      "pct": 96.0
     },
     "src/lib.rs": {
       "lines_total": 480,
@@ -116,27 +153,37 @@
     "src/main.rs": {
       "lines_total": 6,
       "lines_covered": 0,
-      "pct": 0
+      "pct": 0.0
     },
     "src/platform/config.rs": {
       "lines_total": 169,
       "lines_covered": 169,
-      "pct": 100
+      "pct": 100.0
+    },
+    "src/platform/mod.rs": {
+      "lines_total": 0,
+      "lines_covered": 0,
+      "pct": 0.0
     },
     "src/platform/status.rs": {
       "lines_total": 91,
       "lines_covered": 91,
-      "pct": 100
+      "pct": 100.0
     },
     "src/ui/bridge.rs": {
-      "lines_total": 2228,
-      "lines_covered": 2196,
+      "lines_total": 2304,
+      "lines_covered": 2272,
       "pct": 98.6
     },
+    "src/ui/mod.rs": {
+      "lines_total": 0,
+      "lines_covered": 0,
+      "pct": 0.0
+    },
     "src/ui/more_info.rs": {
-      "lines_total": 133,
-      "lines_covered": 125,
-      "pct": 94
+      "lines_total": 369,
+      "lines_covered": 349,
+      "pct": 94.6
     },
     "src/ui/toast.rs": {
       "lines_total": 396,
@@ -147,36 +194,6 @@
       "lines_total": 125,
       "lines_covered": 124,
       "pct": 99.2
-    },
-    "src/actions/mod.rs": {
-      "lines_total": 0,
-      "lines_covered": 0,
-      "pct": 0.0
-    },
-    "src/assets/mod.rs": {
-      "lines_total": 0,
-      "lines_covered": 0,
-      "pct": 0.0
-    },
-    "src/dashboard/mod.rs": {
-      "lines_total": 0,
-      "lines_covered": 0,
-      "pct": 0.0
-    },
-    "src/ha/mod.rs": {
-      "lines_total": 0,
-      "lines_covered": 0,
-      "pct": 0.0
-    },
-    "src/platform/mod.rs": {
-      "lines_total": 0,
-      "lines_covered": 0,
-      "pct": 0.0
-    },
-    "src/ui/mod.rs": {
-      "lines_total": 0,
-      "lines_covered": 0,
-      "pct": 0.0
     },
     "tests/common/slint_harness.rs": {
       "lines_total": 0,
