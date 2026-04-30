@@ -568,8 +568,11 @@ impl HaHttpClient {
         let bytes = self.fetch_with_retry(url).await?;
 
         // Decode to RGBA8 using the `image` crate.
-        let trace_id = next_trace_id();
-        let decoded = decode_rgba8(&bytes).ok_or(HttpError::ImageDecode { trace_id })?;
+        let max_image_px = {
+            let inner = self.inner.lock().expect("inner lock poisoned");
+            inner.max_image_px
+        };
+        let decoded = decode_rgba8(&bytes, max_image_px)?;
         let img = Arc::new(decoded);
 
         // Per-entry size check: max_image_px^2 * 4 bytes.
@@ -777,15 +780,46 @@ fn classify_reqwest_error(e: &reqwest::Error) -> &'static str {
 
 /// Decode raw bytes into an RGBA8 [`DecodedImage`] using the `image` crate.
 ///
-/// Returns `None` if the bytes cannot be parsed as a supported image format.
-/// Supported formats: JPEG, PNG, GIF, BMP, WebP, and any format the `image`
-/// crate supports by default.
-fn decode_rgba8(bytes: &[u8]) -> Option<DecodedImage> {
-    use image::GenericImageView as _;
-    let img = image::load_from_memory(bytes).ok()?;
-    let (width, height) = img.dimensions();
-    let data = img.into_rgba8().into_raw();
-    Some(DecodedImage {
+/// Enforces `Limits` before decoding so that a crafted image header claiming
+/// gigapixel dimensions is rejected BEFORE the allocator is touched.
+/// `max_image_px` is the per-axis pixel cap; the allocator limit is derived
+/// as `max_image_px² × 4` bytes.
+///
+/// Supported formats: JPEG, PNG, and any format the `image` crate
+/// enables via the `Cargo.toml` feature flags (`jpeg`, `png`).
+///
+/// # Errors
+///
+/// Returns [`HttpError::ImageDecode`] if the format cannot be guessed, if the
+/// header violates the limits, or if decoding fails for any other reason.
+fn decode_rgba8(bytes: &[u8], max_image_px: u32) -> Result<DecodedImage, HttpError> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_e| HttpError::ImageDecode {
+            trace_id: next_trace_id(),
+        })?;
+
+    let mut limits = image::Limits::default();
+    // Reject gigapixel headers BEFORE decoding to prevent OOM on resource-
+    // constrained hardware (opi_zero3). The post-decode size check in
+    // get_image() is a belt-and-braces guard for headers that do not lie.
+    limits.max_image_width = Some(max_image_px);
+    limits.max_image_height = Some(max_image_px);
+    // Cap pre-allocation: max_image_px² × 4 bytes RGBA.
+    limits.max_alloc = Some(
+        (max_image_px as u64)
+            .saturating_mul(max_image_px as u64)
+            .saturating_mul(4),
+    );
+    reader.limits(limits);
+
+    let img = reader.decode().map_err(|_e| HttpError::ImageDecode {
+        trace_id: next_trace_id(),
+    })?;
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let data = rgba.into_raw();
+    Ok(DecodedImage {
         data,
         width,
         height,
@@ -1143,11 +1177,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn decode_rgba8_returns_none_on_invalid_bytes() {
+    fn decode_rgba8_errors_on_invalid_bytes() {
         let garbage = b"not an image";
         assert!(
-            decode_rgba8(garbage).is_none(),
-            "garbage bytes must not decode"
+            matches!(
+                decode_rgba8(garbage, 4096),
+                Err(HttpError::ImageDecode { .. })
+            ),
+            "garbage bytes must produce HttpError::ImageDecode"
         );
     }
 
@@ -1155,11 +1192,41 @@ mod tests {
     fn decode_rgba8_decodes_valid_png() {
         // Encode a 2x2 RGBA PNG and decode it.
         let png = encode_png_bytes(2, 2);
-        let decoded = decode_rgba8(&png).expect("2x2 PNG must decode");
+        let decoded = decode_rgba8(&png, 4096).expect("2x2 PNG must decode");
         assert_eq!(decoded.width, 2);
         assert_eq!(decoded.height, 2);
         assert_eq!(decoded.data.len(), 2 * 2 * 4);
         assert_eq!(decoded.byte_cost(), 2 * 2 * 4);
+    }
+
+    /// Regression test for the image-decompression-bomb DoS.
+    ///
+    /// A crafted PNG header claims dimensions far exceeding `max_image_px`.
+    /// The decoder MUST reject the header BEFORE allocating the pixel buffer,
+    /// so the test passes if `decode_rgba8` returns an `ImageDecode` error
+    /// without OOM-killing the process.
+    #[test]
+    fn decode_rejects_gigapixel_header_without_oom() {
+        // Hand-craft a PNG with an IHDR claiming 65535×65535 pixels.
+        // 65535² × 4 ≈ 16 GiB — would OOM-kill opi_zero3 if allocated.
+        let mut png = Vec::with_capacity(64);
+        png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        // IHDR chunk: 13-byte data length, "IHDR", width=65535, height=65535,
+        // bit_depth=8, color_type=6 (RGBA), compression=0, filter=0, interlace=0.
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&65535u32.to_be_bytes());
+        png.extend_from_slice(&65535u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        // CRC32 placeholder — image crate may reject the chunk on CRC mismatch
+        // BEFORE limit enforcement, but either path returns ImageDecode (no OOM).
+        png.extend_from_slice(&[0, 0, 0, 0]);
+
+        let result = decode_rgba8(&png, 4096);
+        assert!(
+            matches!(result, Err(HttpError::ImageDecode { .. })),
+            "gigapixel header must be rejected as ImageDecode, got: {result:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
