@@ -752,3 +752,165 @@ fn reconnect_diff_full_cap() {
     assert!(p_p50 > 0);
     assert!(t_p50 > 0);
 }
+
+// ---------------------------------------------------------------------------
+// Scenario (e): contention at OPI-profile caps (TASK-117 / F1, Risk #1)
+// ---------------------------------------------------------------------------
+//
+// Writer/reader contention at OPI Zero 3 caps with multiple concurrent
+// writers and readers hammering the `RwLock`-backed `LiveStore`.  Validates
+// the F1 in-place mutation does not regress p95 lock-wait time on the
+// most-loaded SBC profile.
+//
+// Configuration (Risk #9 mitigation: explicit warm-up + sample count):
+//   warm_up_iters             = WARM_UP_ITERS
+//   sample_count_per_writer   = CONTENTION_OPS_PER_WRITER
+//   writer_tasks              = CONTENTION_WRITERS
+//   reader_tasks              = CONTENTION_READERS
+//
+// Operation under measurement: each `apply_event` call's wall-clock
+// duration as observed by the writer task (i.e. lock-wait + in-place
+// `HashMap::insert` + per-entity broadcast).  Reader tasks call
+// `for_each` continuously to maximize read-side contention against the
+// `RwLock` write half — they are NOT measured directly; their purpose is
+// to load the lock so writer-side p95 is meaningful.
+//
+// Target (per TASK-117 acceptance criteria): p95 < 1 ms at OPI-profile
+// caps and event-rate cap (50 ev/s).  Bench DOES NOT assert the 1 ms
+// target — `performance-engineer` parses the BENCH-RESULT line and
+// compares against `benches/baseline.json`.  If the captured number is
+// > 1 ms, escalate to backend-engineer for sharding (separate plan) per
+// TASK-117 spec.
+//
+// Label convention (per advisory from performance-engineer on TASK-116):
+// flat snake_case labels matching the BENCH-RESULT scrape format used by
+// the regression parser, e.g. `contention_opi_profile__write_p95_ms`.
+
+/// Concurrent writer tasks for the contention scenario.
+const CONTENTION_WRITERS: usize = 4;
+
+/// Concurrent reader tasks for the contention scenario.
+const CONTENTION_READERS: usize = 4;
+
+/// `apply_event` operations per writer task in the timed phase.
+/// 4 writers × 256 ops = 1024 timed write samples — comfortably above the
+/// 100-sample Criterion default for stable p95 estimation.
+const CONTENTION_OPS_PER_WRITER: usize = 256;
+
+/// OPI Zero 3 profile entity cap. Mirrors `PROFILE_OPI_ZERO3.max_entities`
+/// (held as a literal here to avoid pulling the constant through a
+/// non-pub re-export).
+const CONTENTION_ENTITY_COUNT: usize = 2_048;
+
+/// `for_each` invocations per reader task in the timed phase. Unbounded
+/// readers would dominate the run wall-clock; this bound keeps the run
+/// duration predictable while still saturating the read-lock side.
+const CONTENTION_READS_PER_READER: usize = 4_096;
+
+#[test]
+fn contention_opi_profile() {
+    use std::thread;
+
+    let store = Arc::new(LiveStore::new());
+    populate_store(&store, CONTENTION_ENTITY_COUNT);
+
+    // Warm-up phase: discarded.  A small number of single-threaded writes
+    // primes the snapshot map so the timed phase is not measuring first-
+    // touch allocator behaviour.
+    for i in 0..WARM_UP_ITERS {
+        let id = format!("light.e{}", i % CONTENTION_ENTITY_COUNT);
+        store.apply_event(make_state_changed_update(&id, "off"));
+    }
+
+    // Timed phase: spawn writers + readers, collect per-write durations.
+    //
+    // Each writer collects its own Vec<u128> of per-call durations to
+    // avoid contending on a shared aggregator (which would dirty the
+    // measurement). The aggregator merges after all writers have joined.
+    //
+    // Readers do NOT record samples; their purpose is to load the read
+    // half of the RwLock so writer-side p95 reflects realistic contention.
+    let writer_handles: Vec<thread::JoinHandle<Vec<u128>>> = (0..CONTENTION_WRITERS)
+        .map(|writer_idx| {
+            let store = Arc::clone(&store);
+            thread::spawn(move || {
+                let mut samples = Vec::with_capacity(CONTENTION_OPS_PER_WRITER);
+                for op_idx in 0..CONTENTION_OPS_PER_WRITER {
+                    // Spread writes across all entities so writers do not
+                    // serialise on a single key's hash bucket.
+                    let entity_idx =
+                        (writer_idx * CONTENTION_OPS_PER_WRITER + op_idx) % CONTENTION_ENTITY_COUNT;
+                    let id_str = format!("light.e{entity_idx}");
+                    let new_state = if op_idx % 2 == 0 { "on" } else { "off" };
+                    let update = make_state_changed_update(&id_str, new_state);
+
+                    let t0 = Instant::now();
+                    let _changed = store.apply_event(update);
+                    samples.push(t0.elapsed().as_nanos());
+                }
+                samples
+            })
+        })
+        .collect();
+
+    let reader_handles: Vec<thread::JoinHandle<()>> = (0..CONTENTION_READERS)
+        .map(|_| {
+            let store: Arc<LiveStore> = Arc::clone(&store);
+            thread::spawn(move || {
+                // Cast to &dyn EntityStore so for_each is dispatched via the
+                // visitor seam — same path the bridge takes during a flush.
+                for _ in 0..CONTENTION_READS_PER_READER {
+                    let entity_store: &dyn EntityStore = &*store;
+                    let mut count = 0usize;
+                    entity_store.for_each(&mut |_id, _entity| {
+                        count += 1;
+                    });
+                    std::hint::black_box(count);
+                }
+            })
+        })
+        .collect();
+
+    // Join writers; merge per-thread sample vectors.
+    let mut all_samples_ns: Vec<u128> =
+        Vec::with_capacity(CONTENTION_WRITERS * CONTENTION_OPS_PER_WRITER);
+    for h in writer_handles {
+        let samples = h.join().expect("writer thread panicked");
+        all_samples_ns.extend(samples);
+    }
+    // Drain readers — they have no samples to collect.
+    for h in reader_handles {
+        h.join().expect("reader thread panicked");
+    }
+
+    all_samples_ns.sort_unstable();
+    let (p50, p95, mean) = percentiles(&all_samples_ns);
+
+    // Convert ns → ms for the readability of the human label, while still
+    // emitting the canonical ns fields so the regression parser sees the
+    // same shape as the other scenarios.  Per the TASK-117 advisory from
+    // performance-engineer, also emit a single explicit "p95_ms" line so a
+    // glance at the bench output reveals whether the < 1 ms target holds.
+    print_result(
+        "contention_opi_profile__write",
+        p50,
+        p95,
+        mean,
+        all_samples_ns.len(),
+    );
+    let p95_ms = p95 as f64 / 1_000_000.0;
+    println!(
+        "BENCH-RESULT scenario=contention_opi_profile__write_p95_ms value_ms={p95_ms:.4} \
+        target_ms=1.0 writers={CONTENTION_WRITERS} readers={CONTENTION_READERS} \
+        ops_per_writer={CONTENTION_OPS_PER_WRITER} entity_count={CONTENTION_ENTITY_COUNT}"
+    );
+
+    assert!(p50 > 0, "p50 must be > 0 ns");
+    assert!(p95 >= p50, "p95 must be >= p50");
+    // NOTE: we deliberately do NOT assert p95 < 1 ms here. The 1 ms target
+    // is enforced by `performance-engineer` reading the BENCH-RESULT line
+    // against `benches/baseline.json`. Asserting in-process would either
+    // (a) regress to a bench-broken-blocker on noisy runners, or
+    // (b) silently mask a real regression when the assertion is too loose.
+    // The regression check is the single source of truth.
+}

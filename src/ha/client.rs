@@ -226,10 +226,31 @@ pub fn full_jitter<R: Rng>(window: Duration, rng: &mut R) -> Duration {
 /// Minimal store interface used by [`WsClient`] during reconnect snapshot diff.
 ///
 /// Only entities whose `last_updated` timestamp changed produce broadcast
-/// `EntityUpdate` events.  The Arc swap is atomic — no per-entity churn.
+/// `EntityUpdate` events.  The snapshot replacement is a single batch
+/// mutation — no per-entity churn.
 ///
 /// `pub` so TASK-034's reconnect loop can wire `LiveStore` into this trait
 /// without re-exporting it.  The blanket impl for `LiveStore` is below.
+///
+/// # TASK-117 (F1) reconnect-batch contract
+///
+/// The reconnect catch-up path is split across two methods that the diff
+/// loop calls back-to-back:
+///
+/// 1. [`apply_full_snapshot`][SnapshotApplier::apply_full_snapshot] — single
+///    batch mutation that replaces the entire entity map.
+/// 2. [`broadcast_changed_event`][SnapshotApplier::broadcast_changed_event] —
+///    per-changed-entity broadcast ONLY (no map mutation, the snapshot above
+///    is already authoritative).
+///
+/// This split avoids the pre-TASK-117 anti-pattern where the diff loop
+/// called `apply_changed_event` per changed entity — and that method
+/// re-`insert`ed each entity into the map on top of the just-installed
+/// snapshot, paying an extra lock acquisition + `HashMap::insert` per
+/// changed entity for a write the snapshot already performed.
+///
+/// `apply_changed_event` survives for the buffered-event-replay and
+/// steady-state Live event paths, where the map mutation IS necessary.
 pub trait SnapshotApplier: Send + Sync {
     /// Return the current snapshot as an `Arc<HashMap>`.
     fn current_snapshot(&self) -> Arc<HashMap<EntityId, Entity>>;
@@ -237,14 +258,25 @@ pub trait SnapshotApplier: Send + Sync {
     /// Replace the snapshot atomically with a new entity list.
     ///
     /// Does NOT broadcast any `EntityUpdate` events — the diff step is
-    /// performed by the caller via `apply_changed_event`.
+    /// performed by the caller via `broadcast_changed_event`.
     fn apply_full_snapshot(&self, entities: Vec<Entity>);
 
-    /// Broadcast an incremental update for a single entity.
+    /// Apply an incremental update — mutates the snapshot AND broadcasts.
     ///
-    /// Called by the diff step for each entity whose `last_updated` changed
-    /// across the reconnect snapshot.
+    /// Used by the buffered-event-replay path (events arrived during the
+    /// snapshot fetch window) and by the steady-state Live event handler.
+    /// NOT used by the reconnect diff loop, which calls
+    /// [`broadcast_changed_event`][SnapshotApplier::broadcast_changed_event]
+    /// instead — see the trait-level docs.
     fn apply_changed_event(&self, update: EntityUpdate);
+
+    /// Broadcast a per-entity change WITHOUT mutating the snapshot.
+    ///
+    /// Used by the WS reconnect diff loop (TASK-117 / F1) after
+    /// `apply_full_snapshot` has already installed the authoritative entity
+    /// map.  Per-entity calls only fire the broadcast — they do not
+    /// re-insert into the map (which would be wasted work).
+    fn broadcast_changed_event(&self, update: EntityUpdate);
 }
 
 /// Blanket impl of [`SnapshotApplier`] for [`LiveStore`].
@@ -261,7 +293,14 @@ impl SnapshotApplier for LiveStore {
     }
 
     fn apply_changed_event(&self, update: EntityUpdate) {
-        self.apply_event(update);
+        // EntityId return value is intentionally discarded here: the WS
+        // client's per-event path does not consume it (F2 / TASK-119 will
+        // reuse `apply_event`'s return value via a different seam).
+        let _ = self.apply_event(update);
+    }
+
+    fn broadcast_changed_event(&self, update: EntityUpdate) {
+        let _ = self.broadcast_event(update);
     }
 }
 
@@ -995,6 +1034,18 @@ impl WsClient {
     /// This is called after `apply_full_snapshot` has already swapped the new
     /// snapshot into the store.  The diff runs against `old_snap` (captured
     /// before the swap) and the new snapshot returned by `store.current_snapshot()`.
+    ///
+    /// # TASK-117 (F1) batch-snapshot invariant
+    ///
+    /// Per-entity calls go through
+    /// [`broadcast_changed_event`][SnapshotApplier::broadcast_changed_event],
+    /// NOT [`apply_changed_event`][SnapshotApplier::apply_changed_event].
+    /// The store's snapshot is already authoritative at this point — the
+    /// purpose of this loop is to fire per-entity broadcasts so subscribers
+    /// resync.  Routing through `apply_changed_event` (which mutates the
+    /// snapshot) would re-`insert` each changed entity on top of the
+    /// just-installed map: wasted lock acquisitions + `HashMap::insert`s
+    /// for writes that `apply_full_snapshot` already performed.
     pub fn diff_and_broadcast<S: SnapshotApplier + ?Sized>(
         old_snap: &Arc<HashMap<EntityId, Entity>>,
         store: &S,
@@ -1009,7 +1060,9 @@ impl WsClient {
                 .unwrap_or(true); // new entity → always broadcast
 
             if changed {
-                store.apply_changed_event(EntityUpdate {
+                // BROADCAST ONLY (TASK-117 / F1): the snapshot is already
+                // authoritative post-`apply_full_snapshot`; do NOT re-insert.
+                store.broadcast_changed_event(EntityUpdate {
                     id: id.clone(),
                     entity: Some(new_entity.clone()),
                 });
@@ -1019,7 +1072,10 @@ impl WsClient {
         // Entities removed (in old but not in new) → broadcast removal.
         for id in old_snap.keys() {
             if !new_snap.contains_key(id) {
-                store.apply_changed_event(EntityUpdate {
+                // BROADCAST ONLY (TASK-117 / F1): the snapshot's removal of
+                // this entity is already authoritative post-
+                // `apply_full_snapshot`.
+                store.broadcast_changed_event(EntityUpdate {
                     id: id.clone(),
                     entity: None,
                 });
@@ -1726,6 +1782,14 @@ mod tests {
         }
 
         fn apply_changed_event(&self, update: EntityUpdate) {
+            self.events.lock().unwrap().push(update);
+        }
+
+        fn broadcast_changed_event(&self, update: EntityUpdate) {
+            // For test-double purposes the recorded-events vector is the
+            // single seam observed by diff_and_broadcast tests; mirror the
+            // same recording behaviour the production `LiveStore` does (see
+            // `LiveStore::broadcast_event` which fires per-entity broadcasts).
             self.events.lock().unwrap().push(update);
         }
     }
