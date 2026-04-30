@@ -16,8 +16,9 @@
 //! This is the mechanical schema-drift gate for TASK-089.
 
 use hanui::dashboard::schema::{
-    Dashboard, HomeAssistant, Issue, Layout, ProfileKey, Section, SectionGrid, Severity, Theme,
-    ValidationRule, View, Widget, WidgetKind, WidgetLayout,
+    CodeFormat, Dashboard, HomeAssistant, Issue, Layout, MediaTransport, PinPolicy, ProfileKey,
+    Section, SectionGrid, Severity, Theme, ValidationRule, View, Widget, WidgetKind, WidgetLayout,
+    WidgetOptions,
 };
 use std::sync::Arc;
 
@@ -92,6 +93,46 @@ const SCHEMA_FIELD_REGISTRY: &[(&str, &str)] = &[
         "views[].sections[].widgets[].layout.preferred_rows",
         "preferred_rows",
     ),
+    // Phase 6: WidgetOptions.Camera extended fields
+    ("options.camera.interval_seconds", "interval_seconds"),
+    ("options.camera.url", "url"),
+    // Phase 6: WidgetOptions.History extended fields
+    ("options.history.window_seconds", "window_seconds"),
+    ("options.history.max_points", "max_points"),
+    // Phase 6: WidgetOptions.Lock extended fields
+    ("options.lock.pin_policy", "pin_policy"),
+    (
+        "options.lock.require_confirmation_on_unlock",
+        "require_confirmation_on_unlock",
+    ),
+    // Phase 6: WidgetOptions.Alarm fields
+    ("options.alarm.pin_policy", "pin_policy"),
+    // Phase 6: PinPolicy enum fields
+    ("options.lock.pin_policy.required.length", "length"),
+    (
+        "options.lock.pin_policy.required.code_format",
+        "code_format",
+    ),
+    // Phase 6: Cover options
+    ("options.cover.position_min", "position_min"),
+    ("options.cover.position_max", "position_max"),
+    // Phase 6: MediaPlayer options
+    ("options.media_player.transport_set", "transport_set"),
+    ("options.media_player.volume_step", "volume_step"),
+    // Phase 6: Climate options
+    ("options.climate.min_temp", "min_temp"),
+    ("options.climate.max_temp", "max_temp"),
+    ("options.climate.step", "step"),
+    ("options.climate.hvac_modes", "hvac_modes"),
+    // Phase 6: PowerFlow options
+    ("options.power_flow.grid_entity", "grid_entity"),
+    ("options.power_flow.solar_entity", "solar_entity"),
+    ("options.power_flow.battery_entity", "battery_entity"),
+    (
+        "options.power_flow.battery_soc_entity",
+        "battery_soc_entity",
+    ),
+    ("options.power_flow.home_entity", "home_entity"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -406,6 +447,11 @@ fn field_widget_id_and_type_all_kinds_round_trip() {
         ("fan", WidgetKind::Fan),
         ("lock", WidgetKind::Lock),
         ("alarm", WidgetKind::Alarm),
+        // Phase 6 additions:
+        ("cover", WidgetKind::Cover),
+        ("media_player", WidgetKind::MediaPlayer),
+        ("climate", WidgetKind::Climate),
+        ("power_flow", WidgetKind::PowerFlow),
     ];
 
     for (yaml_kind, expected_kind) in kind_pairs {
@@ -670,6 +716,7 @@ views:
 }
 
 /// `widgets[].options` camera variant: round-trips with externally-tagged form.
+/// Phase 6: extended with `url` field.
 #[test]
 fn field_widget_options_camera_round_trips() {
     let yaml = r#"version: 1
@@ -694,24 +741,27 @@ views:
             options:
               camera:
                 interval_seconds: 10
+                url: "http://cam.local/snapshot"
 "#;
     let d = assert_round_trips("widget.options:camera", yaml);
     let opts = d.views[0].sections[0].widgets[0]
         .options
         .as_ref()
         .expect("options must be present");
-    assert!(
-        matches!(
-            opts,
-            hanui::dashboard::schema::WidgetOptions::Camera {
-                interval_seconds: 10
-            }
-        ),
-        "camera options must have interval_seconds=10"
-    );
+    match opts {
+        WidgetOptions::Camera {
+            interval_seconds,
+            url,
+        } => {
+            assert_eq!(*interval_seconds, 10);
+            assert_eq!(url, "http://cam.local/snapshot");
+        }
+        other => panic!("expected Camera options; got: {other:?}"),
+    }
 }
 
 /// `widgets[].options` history variant: round-trips with externally-tagged form.
+/// Phase 6: extended with `max_points` field.
 #[test]
 fn field_widget_options_history_round_trips() {
     let yaml = r#"version: 1
@@ -736,21 +786,23 @@ views:
             options:
               history:
                 window_seconds: 3600
+                max_points: 120
 "#;
     let d = assert_round_trips("widget.options:history", yaml);
     let opts = d.views[0].sections[0].widgets[0]
         .options
         .as_ref()
         .expect("options must be present");
-    assert!(
-        matches!(
-            opts,
-            hanui::dashboard::schema::WidgetOptions::History {
-                window_seconds: 3600
-            }
-        ),
-        "history options must have window_seconds=3600"
-    );
+    match opts {
+        WidgetOptions::History {
+            window_seconds,
+            max_points,
+        } => {
+            assert_eq!(*window_seconds, 3600);
+            assert_eq!(*max_points, 120);
+        }
+        other => panic!("expected History options; got: {other:?}"),
+    }
 }
 
 /// `widgets[].options` fan variant: round-trips with externally-tagged form.
@@ -800,8 +852,8 @@ views:
     }
 }
 
-/// `widgets[].options` lock variant: round-trips with externally-tagged form +
-/// `pin_policy.code_format`.
+/// `widgets[].options` lock variant: round-trips with PinPolicy enum.
+/// Phase 6: PinPolicy migrated from struct to enum per `locked_decisions.pin_policy_migration`.
 #[test]
 fn field_widget_options_lock_round_trips() {
     let yaml = r#"version: 1
@@ -826,7 +878,10 @@ views:
             options:
               lock:
                 pin_policy:
-                  code_format: "Number"
+                  required:
+                    length: 4
+                    code_format: number
+                require_confirmation_on_unlock: true
 "#;
     let d = assert_round_trips("widget.options:lock", yaml);
     let opts = d.views[0].sections[0].widgets[0]
@@ -834,15 +889,28 @@ views:
         .as_ref()
         .expect("options must be present");
     match opts {
-        hanui::dashboard::schema::WidgetOptions::Lock { pin_policy } => {
-            assert_eq!(pin_policy.code_format, "Number");
+        WidgetOptions::Lock {
+            pin_policy,
+            require_confirmation_on_unlock,
+        } => {
+            assert!(
+                matches!(
+                    pin_policy,
+                    PinPolicy::Required {
+                        length: 4,
+                        code_format: CodeFormat::Number
+                    }
+                ),
+                "expected Required pin policy; got: {pin_policy:?}"
+            );
+            assert!(*require_confirmation_on_unlock);
         }
         other => panic!("expected Lock options; got: {other:?}"),
     }
 }
 
-/// `widgets[].options` alarm variant: round-trips with externally-tagged form +
-/// `pin_policy.code_format`.
+/// `widgets[].options` alarm variant: round-trips with PinPolicy enum.
+/// Phase 6: PinPolicy migrated from struct to enum; tests RequiredOnDisarm variant.
 #[test]
 fn field_widget_options_alarm_round_trips() {
     let yaml = r#"version: 1
@@ -867,7 +935,9 @@ views:
             options:
               alarm:
                 pin_policy:
-                  code_format: "Any"
+                  required_on_disarm:
+                    length: 6
+                    code_format: any
 "#;
     let d = assert_round_trips("widget.options:alarm", yaml);
     let opts = d.views[0].sections[0].widgets[0]
@@ -875,10 +945,219 @@ views:
         .as_ref()
         .expect("options must be present");
     match opts {
-        hanui::dashboard::schema::WidgetOptions::Alarm { pin_policy } => {
-            assert_eq!(pin_policy.code_format, "Any");
+        WidgetOptions::Alarm { pin_policy } => {
+            assert!(
+                matches!(
+                    pin_policy,
+                    PinPolicy::RequiredOnDisarm {
+                        length: 6,
+                        code_format: CodeFormat::Any
+                    }
+                ),
+                "expected RequiredOnDisarm pin policy; got: {pin_policy:?}"
+            );
         }
         other => panic!("expected Alarm options; got: {other:?}"),
+    }
+}
+
+/// Phase 6: Cover options round-trip test.
+#[test]
+fn field_widget_options_cover_round_trips() {
+    let yaml = r#"version: 1
+device_profile: desktop
+default_view: home
+views:
+  - id: home
+    title: Home
+    layout: sections
+    sections:
+      - id: s1
+        title: S1
+        grid:
+          columns: 4
+        widgets:
+          - id: cover1
+            type: cover
+            entity: cover.patio
+            layout:
+              preferred_columns: 2
+              preferred_rows: 2
+            options:
+              cover:
+                position_min: 0
+                position_max: 100
+"#;
+    let d = assert_round_trips("widget.options:cover", yaml);
+    let opts = d.views[0].sections[0].widgets[0]
+        .options
+        .as_ref()
+        .expect("options must be present");
+    match opts {
+        WidgetOptions::Cover {
+            position_min,
+            position_max,
+        } => {
+            assert_eq!(*position_min, 0);
+            assert_eq!(*position_max, 100);
+        }
+        other => panic!("expected Cover options; got: {other:?}"),
+    }
+}
+
+/// Phase 6: MediaPlayer options round-trip test.
+#[test]
+fn field_widget_options_media_player_round_trips() {
+    let yaml = r#"version: 1
+device_profile: desktop
+default_view: home
+views:
+  - id: home
+    title: Home
+    layout: sections
+    sections:
+      - id: s1
+        title: S1
+        grid:
+          columns: 4
+        widgets:
+          - id: mp1
+            type: media_player
+            entity: media_player.living_room
+            layout:
+              preferred_columns: 4
+              preferred_rows: 2
+            options:
+              media_player:
+                transport_set:
+                  - play
+                  - pause
+                  - stop
+                volume_step: 0.1
+"#;
+    let d = assert_round_trips("widget.options:media_player", yaml);
+    let opts = d.views[0].sections[0].widgets[0]
+        .options
+        .as_ref()
+        .expect("options must be present");
+    match opts {
+        WidgetOptions::MediaPlayer {
+            transport_set,
+            volume_step,
+        } => {
+            assert_eq!(transport_set.len(), 3);
+            assert!(transport_set.contains(&MediaTransport::Play));
+            assert!(transport_set.contains(&MediaTransport::Pause));
+            assert!(transport_set.contains(&MediaTransport::Stop));
+            assert!((*volume_step - 0.1_f32).abs() < 1e-5);
+        }
+        other => panic!("expected MediaPlayer options; got: {other:?}"),
+    }
+}
+
+/// Phase 6: Climate options round-trip test.
+#[test]
+fn field_widget_options_climate_round_trips() {
+    let yaml = r#"version: 1
+device_profile: desktop
+default_view: home
+views:
+  - id: home
+    title: Home
+    layout: sections
+    sections:
+      - id: s1
+        title: S1
+        grid:
+          columns: 4
+        widgets:
+          - id: clim1
+            type: climate
+            entity: climate.living_room
+            layout:
+              preferred_columns: 2
+              preferred_rows: 2
+            options:
+              climate:
+                min_temp: 16.0
+                max_temp: 30.0
+                step: 0.5
+                hvac_modes:
+                  - heat
+                  - cool
+                  - off
+"#;
+    let d = assert_round_trips("widget.options:climate", yaml);
+    let opts = d.views[0].sections[0].widgets[0]
+        .options
+        .as_ref()
+        .expect("options must be present");
+    match opts {
+        WidgetOptions::Climate {
+            min_temp,
+            max_temp,
+            step,
+            hvac_modes,
+        } => {
+            assert!((*min_temp - 16.0_f32).abs() < 1e-5);
+            assert!((*max_temp - 30.0_f32).abs() < 1e-5);
+            assert!((*step - 0.5_f32).abs() < 1e-5);
+            assert_eq!(hvac_modes.len(), 3);
+            assert!(hvac_modes.contains(&"heat".to_string()));
+        }
+        other => panic!("expected Climate options; got: {other:?}"),
+    }
+}
+
+/// Phase 6: PowerFlow options round-trip test.
+#[test]
+fn field_widget_options_power_flow_round_trips() {
+    let yaml = r#"version: 1
+device_profile: desktop
+default_view: home
+views:
+  - id: home
+    title: Home
+    layout: sections
+    sections:
+      - id: s1
+        title: S1
+        grid:
+          columns: 4
+        widgets:
+          - id: pf1
+            type: power_flow
+            layout:
+              preferred_columns: 4
+              preferred_rows: 3
+            options:
+              power_flow:
+                grid_entity: sensor.grid_power
+                solar_entity: sensor.solar_power
+                battery_entity: sensor.battery_power
+                battery_soc_entity: sensor.battery_soc
+                home_entity: sensor.home_power
+"#;
+    let d = assert_round_trips("widget.options:power_flow", yaml);
+    let opts = d.views[0].sections[0].widgets[0]
+        .options
+        .as_ref()
+        .expect("options must be present");
+    match opts {
+        WidgetOptions::PowerFlow {
+            grid_entity,
+            solar_entity,
+            battery_entity,
+            battery_soc_entity,
+            home_entity,
+        } => {
+            assert_eq!(grid_entity, "sensor.grid_power");
+            assert_eq!(solar_entity.as_deref(), Some("sensor.solar_power"));
+            assert_eq!(battery_entity.as_deref(), Some("sensor.battery_power"));
+            assert_eq!(battery_soc_entity.as_deref(), Some("sensor.battery_soc"));
+            assert_eq!(home_entity.as_deref(), Some("sensor.home_power"));
+        }
+        other => panic!("expected PowerFlow options; got: {other:?}"),
     }
 }
 
@@ -987,6 +1266,28 @@ fn every_doc_field_round_trips() {
             "SCHEMA_FIELD_REGISTRY missing top-level path '{required}'"
         );
     }
+
+    // Phase 6: verify new option paths are present in the registry.
+    let phase6_paths = [
+        "options.camera.url",
+        "options.history.max_points",
+        "options.lock.require_confirmation_on_unlock",
+        "options.cover.position_min",
+        "options.cover.position_max",
+        "options.media_player.transport_set",
+        "options.media_player.volume_step",
+        "options.climate.min_temp",
+        "options.climate.max_temp",
+        "options.climate.step",
+        "options.climate.hvac_modes",
+        "options.power_flow.grid_entity",
+    ];
+    for path in phase6_paths {
+        assert!(
+            top_level_paths.contains(&path),
+            "SCHEMA_FIELD_REGISTRY missing Phase 6 path '{path}'"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,7 +1303,7 @@ fn every_doc_field_round_trips() {
 /// in addition to the validation.rs test (runtime assertion).
 #[test]
 fn schema_lock_all_validation_rule_variants_are_named() {
-    // Error rules (8 variants)
+    // Error rules (Phase 4 + Phase 6 additions = 12 variants)
     let error_cases = [
         ValidationRule::SpanOverflow,
         ValidationRule::UnknownWidgetType,
@@ -1011,7 +1312,13 @@ fn schema_lock_all_validation_rule_variants_are_named() {
         ValidationRule::MaxWidgetsPerViewExceeded,
         ValidationRule::CameraIntervalBelowMin,
         ValidationRule::HistoryWindowAboveMax,
-        ValidationRule::PinPolicyInvalidCodeFormat,
+        // Phase 6: PinPolicyInvalidCodeFormat replaced by PinPolicyRequiredOnDisarmOnLock
+        ValidationRule::PinPolicyRequiredOnDisarmOnLock,
+        // Phase 6 new rules:
+        ValidationRule::CoverPositionOutOfBounds,
+        ValidationRule::ClimateMinMaxTempInvalid,
+        ValidationRule::MediaTransportNotAllowed,
+        ValidationRule::HistoryMaxPointsExceeded,
     ];
     for rule in error_cases {
         let issue = Issue {
@@ -1028,10 +1335,12 @@ fn schema_lock_all_validation_rule_variants_are_named() {
         );
     }
 
-    // Warning rules (2 variants)
+    // Warning rules (Phase 4 + Phase 6 = 3 variants)
     let warning_cases = [
         ValidationRule::ImageOptionExceedsMaxPx,
         ValidationRule::CameraIntervalBelowDefault,
+        // Phase 6 new warning (reserved per locked_decisions.validation_rule_identifiers):
+        ValidationRule::PowerFlowBatteryWithoutSoC,
     ];
     for rule in warning_cases {
         let issue = Issue {

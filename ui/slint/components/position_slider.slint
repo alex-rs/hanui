@@ -1,0 +1,22 @@
+// position_slider.slint — stub per locked_decisions.cover_slider_component
+//
+// Minimal compilable stub with the API surface required by TASK-102 (cover tile)
+// and TASK-108 (climate tile). Visual design filled in by TASK-108.
+//
+// API:
+//   in-out property <float> value;       Current slider value (clamped to min..max).
+//   in     property <float> min-value;   Minimum allowed value (inclusive).
+//   in     property <float> max-value;   Maximum allowed value (inclusive).
+
+component PositionSlider {
+    in-out property <float> value;
+    in property <float> min-value;
+    in property <float> max-value;
+
+    // Stub: no visual content. TASK-108 fills in the visual design.
+    Rectangle {
+        background: transparent;
+    }
+}
+
+export { PositionSlider }

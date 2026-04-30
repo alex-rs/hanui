@@ -116,9 +116,15 @@ fn rule_to_str(rule: ValidationRule) -> &'static str {
         ValidationRule::MaxWidgetsPerViewExceeded => "MaxWidgetsPerViewExceeded",
         ValidationRule::CameraIntervalBelowMin => "CameraIntervalBelowMin",
         ValidationRule::HistoryWindowAboveMax => "HistoryWindowAboveMax",
-        ValidationRule::PinPolicyInvalidCodeFormat => "PinPolicyInvalidCodeFormat",
+        // Phase 6: PinPolicyInvalidCodeFormat replaced by PinPolicyRequiredOnDisarmOnLock
+        ValidationRule::PinPolicyRequiredOnDisarmOnLock => "PinPolicyRequiredOnDisarmOnLock",
+        ValidationRule::CoverPositionOutOfBounds => "CoverPositionOutOfBounds",
+        ValidationRule::ClimateMinMaxTempInvalid => "ClimateMinMaxTempInvalid",
+        ValidationRule::MediaTransportNotAllowed => "MediaTransportNotAllowed",
+        ValidationRule::HistoryMaxPointsExceeded => "HistoryMaxPointsExceeded",
         ValidationRule::ImageOptionExceedsMaxPx => "ImageOptionExceedsMaxPx",
         ValidationRule::CameraIntervalBelowDefault => "CameraIntervalBelowDefault",
+        ValidationRule::PowerFlowBatteryWithoutSoC => "PowerFlowBatteryWithoutSoC",
     }
 }
 

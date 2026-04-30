@@ -1,8 +1,11 @@
 # Dashboard Schema
 
 This document is the **source of truth** for the `dashboard.yaml` configuration
-file consumed by `src/dashboard/loader.rs`. The schema is locked at Phase 4
-(`docs/plans/2026-04-29-phase-4-layout.md`, `locked_decisions.schema_finalization_gate`).
+file consumed by `src/dashboard/loader.rs`. The schema was locked at Phase 4
+(`docs/plans/2026-04-29-phase-4-layout.md`, `locked_decisions.schema_finalization_gate`)
+and extended in Phase 6 (`docs/plans/2026-04-30-phase-6-advanced-widgets.md`,
+`locked_decisions.schema_finalization_gate` part (a) follow-on).
+
 After the lock, schema additions require an explicit follow-on PR; any diff to
 `src/dashboard/schema.rs` must be accompanied by a diff to this document (enforced
 by the CI co-travel check added in TASK-093).
@@ -203,9 +206,9 @@ Unique within the section.
 
 **Type**: `String`  
 **Required**: yes  
-**Registered values** (Phase 1 set): `light_tile`, `sensor_tile`, `entity_tile`  
-**Forward-compat values** (schema-locked in Phase 4, renderer in Phase 6+):
-`camera_tile`, `history_tile`, `fan_tile`, `lock_tile`, `alarm_tile`
+**Registered values** (Phase 1–4 set): `light_tile`, `sensor_tile`, `entity_tile`,
+`camera`, `history`, `fan`, `lock`, `alarm`  
+**Phase 6 additions**: `cover`, `media_player`, `climate`, `power_flow`
 
 An unknown value fails validation (`ValidationRule::UnknownWidgetType`).
 
@@ -243,10 +246,11 @@ When absent, falls back to the entity's domain icon.
 **Default**: `always`
 
 Phase 4 locks the predicate namespace even though evaluation lands in Phase 6.
+Phase 6 widens the namespace per `locked_decisions.visibility_predicate_vocabulary`.
 Known predicates are stored as opaque strings and passed through. Unknown
 predicates fail validation with `ValidationRule::UnknownVisibilityPredicate`.
 
-See **Visibility predicates** section below for the locked namespace.
+See **Visibility predicates** section below for the full namespace.
 
 ### `widgets[].tap_action` / `widgets[].hold_action` / `widgets[].double_tap_action`
 
@@ -355,10 +359,14 @@ validation time by the active `DeviceProfile` (see **Bounds** section).
 options:
   camera:
     interval_seconds: 5    # u32; see Bounds section
+    url: "http://..."      # String; snapshot or MJPEG stream URL (Phase 6)
 ```
 
 `interval_seconds`: snapshot refresh interval in seconds. Validated against
 `DeviceProfile.camera_interval_min_s`.
+
+`url`: (Phase 6) stream URL for the camera feed. Required field — specifies the
+snapshot or MJPEG endpoint to poll.
 
 ### `options.history`
 
@@ -366,17 +374,22 @@ options:
 options:
   history:
     window_seconds: 86400    # u32; see Bounds section
+    max_points: 60           # u32; default 60, max 240 (Phase 6)
 ```
 
 `window_seconds`: width of the history window in seconds. Validated against
 `DeviceProfile.history_window_max_s`.
+
+`max_points`: (Phase 6) maximum number of data points after LTTB downsampling.
+Default `60`. Validator enforces max `240` per `locked_decisions.history_render_path`.
+Values exceeding `240` are `ValidationRule::HistoryMaxPointsExceeded` (Error).
 
 ### `options.fan`
 
 ```yaml
 options:
   fan:
-    speed_count: 3                  # u8; number of discrete speed steps
+    speed_count: 3                  # u32; number of discrete speed steps
     preset_modes: ["low", "high"]   # Vec<String>; named preset mode labels
 ```
 
@@ -388,23 +401,184 @@ options:
 ```yaml
 options:
   lock:
+    pin_policy: none                    # PinPolicy::None
+    # or:
     pin_policy:
-      code_format: "Number"    # String; the HA lock's code_format attribute value
+      required:
+        length: 4                       # u8; expected PIN length
+        code_format: number             # number | any
+    require_confirmation_on_unlock: false   # bool; default false (Phase 6)
 ```
 
-`pin_policy.code_format`: must be a string value. A non-string value is a
-`ValidationRule::PinPolicyInvalidCodeFormat` Error.
+`pin_policy`: controls PIN requirements for lock/unlock. See **`pin_policy`** section.
+
+`require_confirmation_on_unlock`: (Phase 6) when `true`, the UI shows a confirmation
+dialog before dispatching an `Unlock` action. Per `locked_decisions.confirmation_on_lock_unlock`:
+this flag lives in `WidgetOptions::Lock`, NOT in the Action variant, so offline
+queue replay skips the confirmation prompt correctly (the action was already confirmed
+at the original dispatch time).
 
 ### `options.alarm`
 
 ```yaml
 options:
   alarm:
+    pin_policy: none                    # PinPolicy::None
+    # or:
     pin_policy:
-      code_format: "Number"    # String; the HA alarm's code_format attribute value
+      required:
+        length: 4
+        code_format: number
+    # or (alarm-only):
+    pin_policy:
+      required_on_disarm:
+        length: 4
+        code_format: number
 ```
 
-Same structure as `options.lock.pin_policy`.
+`pin_policy`: controls PIN requirements for alarm arm/disarm. See **`pin_policy`** section.
+`RequiredOnDisarm` is valid only on alarm widgets (not lock). The validator emits
+`ValidationRule::PinPolicyRequiredOnDisarmOnLock` (Error) if used on a lock widget.
+
+### `options.cover`
+
+**Phase 6 addition** per `locked_decisions.cover_position_bounds`.
+
+```yaml
+options:
+  cover:
+    position_min: 0     # u8; minimum position (inclusive), 0..=100
+    position_max: 100   # u8; maximum position (inclusive), 0..=100
+```
+
+`position_min`: minimum position value for the position slider UI. Must be ≤ `position_max`
+and ≤ 100. The Slint `PositionSlider` component is bounded by these values at render time.
+
+`position_max`: maximum position value. Must be ≥ `position_min` and ≤ 100.
+
+Validation: `position_min > position_max` or either value > 100 is
+`ValidationRule::CoverPositionOutOfBounds` (Error).
+
+### `options.media_player`
+
+**Phase 6 addition**.
+
+```yaml
+options:
+  media_player:
+    transport_set:         # Vec<MediaTransport>
+      - play
+      - pause
+      - stop
+      - next              # NonIdempotent — advances track
+      - prev              # NonIdempotent — goes back
+      - volume_up
+      - volume_down
+      - mute
+    volume_step: 0.05     # f32; volume step per tap, 0.0 < step ≤ 1.0
+```
+
+`transport_set`: the set of transport controls to expose in the media player UI.
+Must contain at least one entry (empty set is `ValidationRule::MediaTransportNotAllowed` Error).
+Allowed values: `play`, `pause`, `stop`, `next`, `prev`, `volume_up`, `volume_down`, `mute`.
+Per `locked_decisions.idempotency_marker_phase6_variants`: `Next` and `Prev` are
+NonIdempotent (must not be queued offline; fail loudly if dispatched while offline).
+
+`volume_step`: volume increment/decrement per tap. Must be > 0.0. A zero or negative
+value is `ValidationRule::MediaTransportNotAllowed` (Error).
+
+### `options.climate`
+
+**Phase 6 addition**.
+
+```yaml
+options:
+  climate:
+    min_temp: 16.0          # f32; minimum setpoint temperature
+    max_temp: 30.0          # f32; maximum setpoint temperature; must be > min_temp
+    step: 0.5               # f32; setpoint adjustment step; must be > 0.0
+    hvac_modes:             # Vec<String>; free strings per locked_decisions.hvac_mode_vocabulary
+      - heat
+      - cool
+      - heat_cool
+      - off
+```
+
+`min_temp`: minimum setpoint temperature (°C or °F, per HA's unit configuration).
+
+`max_temp`: maximum setpoint temperature. Must be strictly greater than `min_temp`.
+`min_temp >= max_temp` is `ValidationRule::ClimateMinMaxTempInvalid` (Error).
+
+`step`: setpoint adjustment increment. Must be > 0.0.
+`step <= 0.0` is `ValidationRule::ClimateMinMaxTempInvalid` (Error).
+
+`hvac_modes`: free strings per `locked_decisions.hvac_mode_vocabulary` — HA allows
+custom HVAC modes beyond the standard set. The UI picker shows only the modes listed
+here. Standard HA modes: `off`, `heat`, `cool`, `heat_cool`, `auto`, `dry`, `fan_only`.
+
+### `options.power_flow`
+
+**Phase 6 addition** (6d sub-phase). Per `locked_decisions.power_flow_subphase_placement`,
+detailed validator rules (`PowerFlowGridEntityNotPower`, `PowerFlowBatteryWithoutSoC`,
+`PowerFlowIndividualLaneCountExceeded`) are owned by TASK-094.
+
+```yaml
+options:
+  power_flow:
+    grid_entity: sensor.grid_power             # String; required; must be power-class sensor
+    solar_entity: sensor.solar_power           # String; optional
+    battery_entity: sensor.battery_power       # String; optional; requires battery_soc_entity
+    battery_soc_entity: sensor.battery_soc     # String; optional; required if battery_entity set
+    home_entity: sensor.home_power             # String; optional
+```
+
+`grid_entity`: entity ID for the grid connection. Required. The TASK-094 validator
+checks this is a `sensor` domain entity with state class `power`
+(`ValidationRule::PowerFlowGridEntityNotPower`, Error).
+
+`solar_entity`: optional solar production entity.
+
+`battery_entity`: optional battery entity. When present, `battery_soc_entity` is
+also required; omitting it is `ValidationRule::PowerFlowBatteryWithoutSoC` (Warning).
+
+`battery_soc_entity`: optional state-of-charge entity (0–100 integer sensor). Required
+when `battery_entity` is set.
+
+`home_entity`: optional home consumption entity.
+
+---
+
+## `pin_policy`
+
+**Phase 6 change**: `pin_policy` is now an enum (previously a struct with `code_format: String`).
+Per `locked_decisions.pin_policy_migration`.
+
+The three variants:
+
+```yaml
+# No PIN required
+pin_policy: none
+
+# PIN required on every action
+pin_policy:
+  required:
+    length: 4          # u8; expected PIN length in digits/characters
+    code_format: number   # number | any
+
+# PIN required only on disarm (ALARM widgets only; Error on lock widgets)
+pin_policy:
+  required_on_disarm:
+    length: 4
+    code_format: number
+```
+
+**`code_format`** (closed enum, replaces the previous free-string field):
+- `number` — PIN must consist of digits only.
+- `any` — PIN may contain any characters.
+
+**`PinPolicy::RequiredOnDisarm`** is valid ONLY on `WidgetOptions::Alarm`. A lock
+widget with `required_on_disarm` is `ValidationRule::PinPolicyRequiredOnDisarmOnLock`
+(Error). Alarm widgets accept all three variants.
 
 ---
 
@@ -419,7 +593,13 @@ time and are checked exclusively in `src/dashboard/validate.rs`.
 | `options.camera.interval_seconds` (min) | `camera_interval_min_s` | `CameraIntervalBelowMin` | Error |
 | `options.camera.interval_seconds` (range) | `camera_interval_min_s` .. `camera_interval_default_s` | (Warning if below default but above min) | Warning |
 | `options.history.window_seconds` (max) | `history_window_max_s` | `HistoryWindowAboveMax` | Error |
+| `options.history.max_points` (max) | constant 240 | `HistoryMaxPointsExceeded` | Error |
 | `options.{image}.px` (max) | `max_image_px` | (pre-decode downscale; operator notified) | Warning |
+| `options.cover.position_min/max` | 0..=100 range + min ≤ max | `CoverPositionOutOfBounds` | Error |
+| `options.climate.min_temp/max_temp/step` | min < max, step > 0 | `ClimateMinMaxTempInvalid` | Error |
+| `options.media_player.volume_step` | > 0.0 | `MediaTransportNotAllowed` | Error |
+| `options.media_player.transport_set` | non-empty | `MediaTransportNotAllowed` | Error |
+| `options.power_flow.battery_soc_entity` | required if battery_entity set | `PowerFlowBatteryWithoutSoC` | Warning |
 
 Preset values for each profile:
 
@@ -441,47 +621,60 @@ migration or silent clamping; the config must be edited manually.
 
 ## Visibility predicates
 
-Phase 4 locks the predicate namespace even though evaluation lands in Phase 6.
-The schema stores predicate strings as opaque values and passes them through. An
-unknown predicate (not in the list below) is a `ValidationRule::UnknownVisibilityPredicate`
-Error at load time, so schemas written for Phase 4 do not silently ignore predicates
-that future clients would evaluate.
+Phase 4 locked the predicate namespace; Phase 6 widens it per
+`locked_decisions.visibility_predicate_vocabulary`. The schema stores predicate strings
+as opaque values and passes them through. An unknown predicate (not in the list below)
+is a `ValidationRule::UnknownVisibilityPredicate` Error at load time.
 
-**Locked predicate namespace (Phase 4)**:
+**Full predicate namespace (Phase 4 + Phase 6)**:
 
-| Predicate | Description |
-|---|---|
-| `always` | Widget is always visible (default). |
-| `never` | Widget is never rendered (useful for disabling without removing). |
-| `entity_available:<entity_id>` | Visible when the named entity's state is not `unavailable` or `unknown`. |
-| `state_equals:<entity_id>:<value>` | Visible when the named entity's state string equals the given value. |
-| `profile:<profile_key>` | Visible only on the named device profile (`rpi4`, `opi-zero3`, `desktop`). |
+| Predicate | Description | Phase |
+|---|---|---|
+| `always` | Widget is always visible (default). | Phase 4 |
+| `never` | Widget is never rendered (useful for disabling without removing). | Phase 4 |
+| `entity_available:<entity_id>` | Visible when the named entity's state is not `unavailable` or `unknown`. Alias for `<id> != unavailable`. | Phase 4 |
+| `state_equals:<entity_id>:<value>` | Visible when the named entity's state string equals the given value. Alias for `<id> == <value>`. | Phase 4 |
+| `profile:<profile_key>` | Visible only on the named device profile (`rpi4`, `opi-zero3`, `desktop`). | Phase 4 |
+| `<entity_id> == <value>` | Entity state string equality. | Phase 6 |
+| `<entity_id> != <value>` | Entity state string inequality. | Phase 6 |
+| `<entity_id> in [<v1>,<v2>,...]` | Entity state is in the given list. | Phase 6 |
+| `entity_state_numeric:<entity_id>:<op>:<N>` | Numeric comparison: `op` is `lt`/`lte`/`gt`/`gte`/`eq`/`ne`; `N` is f64-parseable. Example: `entity_state_numeric:sensor.temp:gt:20`. | Phase 6 |
 
-Predicates not in this list fail validation. Evaluation logic ships in Phase 6.
+Phase 4 alias forms (`entity_available:*`, `state_equals:*`) remain valid for
+backward compatibility with dashboards authored during Phase 4 testing.
+
+Evaluation logic ships in Phase 6 (TASK-110). Phase 4 and 6.0 only validate the namespace.
 
 ---
 
 ## Validation severity
 
 Severity rules are verbatim from `locked_decisions.validation_severity` in
-`docs/plans/2026-04-29-phase-4-layout.md`. Implementers MUST NOT soften or harden
-these without a plan amendment.
+`docs/plans/2026-04-29-phase-4-layout.md` and
+`locked_decisions.validation_rule_identifiers` in
+`docs/plans/2026-04-30-phase-6-advanced-widgets.md`. Implementers MUST NOT soften or
+harden these without a plan amendment.
 
 ### Error (halts load; no partial render)
 
 - **`SpanOverflow`**: a single widget's `preferred_columns > section.grid.columns`.
 - **`UnknownWidgetType`**: `type:` value not in the registered `WidgetKind` set.
-- **`UnknownVisibilityPredicate`**: `visibility:` value not in the locked predicate namespace (Phase 4 locks the namespace even though evaluation is Phase 6).
+- **`UnknownVisibilityPredicate`**: `visibility:` value not in the locked predicate namespace.
 - **`NonAllowlistedCallService`**: a `call-service` action references a service not in the per-domain allowlist.
 - **`MaxWidgetsPerViewExceeded`**: widget count in a view exceeds `DeviceProfile.max_widgets_per_view`.
 - **`CameraIntervalBelowMin`**: `options.camera.interval_seconds < DeviceProfile.camera_interval_min_s`.
 - **`HistoryWindowAboveMax`**: `options.history.window_seconds > DeviceProfile.history_window_max_s`.
-- **`PinPolicyInvalidCodeFormat`**: `options.lock.pin_policy.code_format` or `options.alarm.pin_policy.code_format` is not a string value.
+- **`HistoryMaxPointsExceeded`**: `options.history.max_points > 240` (Phase 6).
+- **`PinPolicyRequiredOnDisarmOnLock`**: `options.lock.pin_policy` is `RequiredOnDisarm` — only valid on alarm widgets (Phase 6, replaces `PinPolicyInvalidCodeFormat`).
+- **`CoverPositionOutOfBounds`**: `options.cover.position_min > position_max` or either bound > 100 (Phase 6).
+- **`ClimateMinMaxTempInvalid`**: `options.climate.min_temp >= max_temp` or `step <= 0.0` (Phase 6).
+- **`MediaTransportNotAllowed`**: `options.media_player.transport_set` is empty or `volume_step <= 0.0` (Phase 6).
 
 ### Warning (renders with a banner; does not halt load)
 
-- **`ImageSizeAboveMax`**: image options exceed `DeviceProfile.max_image_px`; pre-decode downscale is applied and the operator is notified.
+- **`ImageOptionExceedsMaxPx`**: image options exceed `DeviceProfile.max_image_px`; pre-decode downscale is applied and the operator is notified.
 - **`CameraIntervalBelowDefault`**: `options.camera.interval_seconds` is between `camera_interval_min_s` and `camera_interval_default_s` — allowed but flagged because the interval is tighter than the profile's recommended default.
+- **`PowerFlowBatteryWithoutSoC`**: `options.power_flow.battery_entity` is set but `battery_soc_entity` is absent — the SoC label cannot be rendered (Phase 6, owned by TASK-094).
 
 Severity changes require a plan amendment approved by the founder. The schema-lock
 test in TASK-089 includes a `severity_pin` test that asserts each rule's severity by
@@ -497,4 +690,29 @@ offending field path (e.g., `views[0].sections[0].widgets[2].options.camera.inte
 and the current bound from the active profile. No automatic migration or silent
 clamping occurs. Operators must edit the config file manually.
 
-There is no hot-reload in Phase 4. Restart is the update mechanism.
+There is no hot-reload in Phase 4/6. Restart is the update mechanism.
+
+### Phase 6 migration: `PinPolicy` struct → enum
+
+**Before (Phase 4)**:
+```yaml
+options:
+  lock:
+    pin_policy:
+      code_format: "Number"
+```
+
+**After (Phase 6)**:
+```yaml
+options:
+  lock:
+    pin_policy:
+      required:
+        length: 4
+        code_format: number
+    # or:
+    pin_policy: none
+```
+
+The `code_format: "Number"` or `code_format: "Any"` string form is no longer valid.
+Use `pin_policy: none` or `pin_policy: { required: { length: N, code_format: number|any } }`.

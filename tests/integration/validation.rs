@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use hanui::dashboard::profiles::{PROFILE_DESKTOP, PROFILE_RPI4};
 use hanui::dashboard::schema::{
-    Dashboard, Issue, Layout, PinPolicy, ProfileKey, Section, SectionGrid, Severity,
+    CodeFormat, Dashboard, Issue, Layout, PinPolicy, ProfileKey, Section, SectionGrid, Severity,
     ValidationRule, View, Widget, WidgetKind, WidgetLayout, WidgetOptions,
 };
 use hanui::dashboard::validate;
@@ -112,7 +112,13 @@ fn severity_pin_per_rule() {
         ValidationRule::MaxWidgetsPerViewExceeded,
         ValidationRule::CameraIntervalBelowMin,
         ValidationRule::HistoryWindowAboveMax,
-        ValidationRule::PinPolicyInvalidCodeFormat,
+        // Phase 6: PinPolicyInvalidCodeFormat replaced by PinPolicyRequiredOnDisarmOnLock
+        ValidationRule::PinPolicyRequiredOnDisarmOnLock,
+        // Phase 6 new Error rules:
+        ValidationRule::CoverPositionOutOfBounds,
+        ValidationRule::ClimateMinMaxTempInvalid,
+        ValidationRule::MediaTransportNotAllowed,
+        ValidationRule::HistoryMaxPointsExceeded,
     ];
     for rule in error_rules {
         let issue = severity_for(rule, Severity::Error);
@@ -128,6 +134,8 @@ fn severity_pin_per_rule() {
     let warning_rules = [
         ValidationRule::ImageOptionExceedsMaxPx,
         ValidationRule::CameraIntervalBelowDefault,
+        // Phase 6 new Warning rule (reserved per locked_decisions.validation_rule_identifiers):
+        ValidationRule::PowerFlowBatteryWithoutSoC,
     ];
     for rule in warning_rules {
         let issue = severity_for(rule, Severity::Warning);
@@ -357,6 +365,7 @@ fn validation_camera_interval_below_min_is_error_rpi4() {
     widget.widget_type = WidgetKind::Camera;
     widget.options = Some(WidgetOptions::Camera {
         interval_seconds: 4, // below rpi4 min (5)
+        url: "http://cam.local/snapshot".to_string(),
     });
 
     let section = section_with_cols(4, vec![widget]);
@@ -379,6 +388,7 @@ fn validation_camera_interval_below_min_is_error_desktop() {
     widget.widget_type = WidgetKind::Camera;
     widget.options = Some(WidgetOptions::Camera {
         interval_seconds: 0, // below desktop min (1)
+        url: "http://cam.local/snapshot".to_string(),
     });
 
     let section = section_with_cols(4, vec![widget]);
@@ -406,6 +416,7 @@ fn validation_history_window_above_max_is_error_rpi4() {
     widget.widget_type = WidgetKind::History;
     widget.options = Some(WidgetOptions::History {
         window_seconds: rpi4_max + 1,
+        max_points: 60,
     });
 
     let section = section_with_cols(4, vec![widget]);
@@ -433,6 +444,7 @@ fn validation_history_window_above_max_is_error_desktop() {
     widget.widget_type = WidgetKind::History;
     widget.options = Some(WidgetOptions::History {
         window_seconds: desktop_max + 1,
+        max_points: 60,
     });
 
     let section = section_with_cols(4, vec![widget]);
@@ -448,19 +460,22 @@ fn validation_history_window_above_max_is_error_desktop() {
 }
 
 // ---------------------------------------------------------------------------
-// PinPolicyInvalidCodeFormat
+// PinPolicyRequiredOnDisarmOnLock (Phase 6: replaces PinPolicyInvalidCodeFormat)
 // ---------------------------------------------------------------------------
 
-/// `ValidationRule::PinPolicyInvalidCodeFormat` fires as `Severity::Error`
-/// when `pin_policy.code_format` is not `"Number"` or `"Any"`.
+/// `ValidationRule::PinPolicyRequiredOnDisarmOnLock` fires as `Severity::Error`
+/// when a lock widget uses `PinPolicy::RequiredOnDisarm`, which is only valid
+/// for alarm widgets per `locked_decisions.pin_policy_migration`.
 #[test]
-fn validation_pin_policy_invalid_code_format_is_error() {
+fn validation_pin_policy_required_on_disarm_on_lock_is_error() {
     let mut widget = minimal_widget("lock1", 1);
     widget.widget_type = WidgetKind::Lock;
     widget.options = Some(WidgetOptions::Lock {
-        pin_policy: PinPolicy {
-            code_format: "INVALID_FORMAT".to_string(),
+        pin_policy: PinPolicy::RequiredOnDisarm {
+            length: 4,
+            code_format: CodeFormat::Number,
         },
+        require_confirmation_on_unlock: false,
     });
 
     let section = section_with_cols(4, vec![widget]);
@@ -470,8 +485,10 @@ fn validation_pin_policy_invalid_code_format_is_error() {
 
     let issue = issues
         .iter()
-        .find(|i| i.rule == ValidationRule::PinPolicyInvalidCodeFormat)
-        .expect("PinPolicyInvalidCodeFormat must be emitted for lock widget");
+        .find(|i| i.rule == ValidationRule::PinPolicyRequiredOnDisarmOnLock)
+        .expect(
+            "PinPolicyRequiredOnDisarmOnLock must be emitted for lock widget with RequiredOnDisarm",
+        );
     assert_eq!(issue.severity, Severity::Error);
 }
 
@@ -520,6 +537,7 @@ fn validation_camera_interval_below_default_is_warning() {
     widget.widget_type = WidgetKind::Camera;
     widget.options = Some(WidgetOptions::Camera {
         interval_seconds: 3, // above desktop min (1), below desktop default (5)
+        url: "http://cam.local/snapshot".to_string(),
     });
 
     let section = section_with_cols(4, vec![widget]);
@@ -545,6 +563,7 @@ fn validation_camera_interval_below_default_is_warning_rpi4() {
     widget.widget_type = WidgetKind::Camera;
     widget.options = Some(WidgetOptions::Camera {
         interval_seconds: 7, // above rpi4 min (5), below rpi4 default (10)
+        url: "http://cam.local/snapshot".to_string(),
     });
 
     let section = section_with_cols(4, vec![widget]);
@@ -584,6 +603,7 @@ fn token_env_value_does_not_leak_into_issues() {
     widget.widget_type = WidgetKind::Camera;
     widget.options = Some(WidgetOptions::Camera {
         interval_seconds: 0,
+        url: "http://cam.local/snapshot".to_string(),
     }); // BelowMin
     widget.visibility = "bad_predicate".to_string(); // UnknownVisibilityPredicate
 

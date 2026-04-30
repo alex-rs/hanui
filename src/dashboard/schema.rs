@@ -1,4 +1,4 @@
-//! Canonical Phase 4 typed schema for the dashboard configuration.
+//! Canonical Phase 4/6 typed schema for the dashboard configuration.
 //!
 //! # Staging note (`locked_decisions.view_spec_disposition`)
 //!
@@ -18,10 +18,13 @@
 //!
 //! # Parent plan
 //!
-//! `docs/plans/2026-04-29-phase-4-layout.md` —
+//! `docs/plans/2026-04-29-phase-4-layout.md` and
+//! `docs/plans/2026-04-30-phase-6-advanced-widgets.md` —
 //! relevant decisions: `serde_yaml_crate_choice`, `serde_yaml_security_review`,
 //! `view_spec_disposition`, `no_hashmap_in_deserialized_types`,
-//! `validation_rule_identifiers`.
+//! `validation_rule_identifiers`, `pin_policy_migration`,
+//! `visibility_predicate_vocabulary`, `cover_position_bounds`,
+//! `history_render_path`, `confirmation_on_lock_unlock`.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -91,6 +94,15 @@ pub enum WidgetKind {
     Lock,
     /// `type: alarm`
     Alarm,
+    // Phase 6 additions:
+    /// `type: cover`
+    Cover,
+    /// `type: media_player`
+    MediaPlayer,
+    /// `type: climate`
+    Climate,
+    /// `type: power_flow`
+    PowerFlow,
 }
 
 // ---------------------------------------------------------------------------
@@ -225,18 +237,95 @@ pub struct Theme {
 }
 
 // ---------------------------------------------------------------------------
+// CodeFormat  (used by PinPolicy)
+// ---------------------------------------------------------------------------
+
+/// The format of PIN codes entered for lock / alarm interactions.
+///
+/// Per `locked_decisions.pin_policy_migration`: `CodeFormat` is a closed enum
+/// replacing the previous `code_format: String` free-form field. Using a closed
+/// enum prevents invalid format values from ever being constructed at the schema
+/// level — a `PinPolicyInvalidCodeFormat` Error is no longer needed because the
+/// type system enforces the constraint at deserialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeFormat {
+    /// PIN must consist of digits only.
+    Number,
+    /// PIN may contain any characters.
+    Any,
+}
+
+// ---------------------------------------------------------------------------
 // PinPolicy  (used by Lock and Alarm widget options)
 // ---------------------------------------------------------------------------
 
 /// PIN policy configuration for lock and alarm widgets.
 ///
-/// `code_format` is a string pattern (e.g. `"[0-9]{4}"`) describing the
-/// allowed PIN code shape. A non-string value in YAML is a
-/// [`ValidationRule::PinPolicyInvalidCodeFormat`] Error.
+/// Per `locked_decisions.pin_policy_migration`: replaces the previous
+/// `struct PinPolicy { code_format: String }`. The enum encodes the three
+/// possible policies in the type system rather than as a string field.
+///
+/// `PinPolicy::RequiredOnDisarm` is valid ONLY on `WidgetOptions::Alarm`.
+/// The validator enforces this: a `WidgetOptions::Lock` with
+/// `PinPolicy::RequiredOnDisarm` is a `ValidationRule::PinPolicyRequiredOnDisarmOnLock`
+/// Error.
+///
+/// Serde shape: `#[serde(rename_all = "snake_case")]`.
+/// - `None` serializes as `"none"` (unit variant → bare string in YAML).
+/// - `Required` serializes as `required: { length: N, code_format: ... }`.
+/// - `RequiredOnDisarm` serializes as
+///   `required_on_disarm: { length: N, code_format: ... }`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PinPolicy {
-    /// Pattern string describing valid PIN codes.
-    pub code_format: String,
+#[serde(rename_all = "snake_case")]
+pub enum PinPolicy {
+    /// No PIN required.
+    None,
+    /// PIN required; specifies allowed length and format.
+    Required {
+        /// Expected PIN length in digits/characters.
+        length: u8,
+        /// Format constraint on the PIN.
+        code_format: CodeFormat,
+    },
+    /// PIN is required only on disarm (alarm-only; rejected on lock widgets
+    /// by `ValidationRule::PinPolicyRequiredOnDisarmOnLock`).
+    RequiredOnDisarm {
+        /// Expected PIN length in digits/characters.
+        length: u8,
+        /// Format constraint on the PIN.
+        code_format: CodeFormat,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// MediaTransport  (closed enum for media player transport controls)
+// ---------------------------------------------------------------------------
+
+/// The set of media transport operations that a media player widget can expose.
+///
+/// Per `locked_decisions.idempotency_marker_phase6_variants`:
+/// - `Play`, `Pause`, `Stop` are idempotent (safe to queue offline).
+/// - `Next`, `Prev` are NonIdempotent (must NOT be queued; fail loudly offline).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaTransport {
+    /// Start or resume playback.
+    Play,
+    /// Pause playback.
+    Pause,
+    /// Stop playback.
+    Stop,
+    /// Skip to the next track (NonIdempotent).
+    Next,
+    /// Go to the previous track (NonIdempotent).
+    Prev,
+    /// Increase volume by one step.
+    VolumeUp,
+    /// Decrease volume by one step.
+    VolumeDown,
+    /// Toggle mute.
+    Mute,
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +340,15 @@ pub struct PinPolicy {
 ///
 /// Per `locked_decisions.no_hashmap_in_deserialized_types`: no `HashMap` is
 /// used here; map-shaped data is expressed as named fields or `BTreeMap`.
+///
+/// Phase 6 additions per `locked_decisions`:
+/// - `Camera` extended with `url: String` field.
+/// - `History` extended with `max_points: u32` (default 60, validator max 240
+///   per `locked_decisions.history_render_path`).
+/// - `Cover`, `MediaPlayer`, `Climate`, `PowerFlow` variants added.
+/// - `Lock` extended with `require_confirmation_on_unlock: bool`
+///   (per `locked_decisions.confirmation_on_lock_unlock`).
+/// - `PinPolicy` is now an enum (per `locked_decisions.pin_policy_migration`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WidgetOptions {
@@ -258,11 +356,18 @@ pub enum WidgetOptions {
     Camera {
         /// Poll interval in seconds. Must be ≥ `DeviceProfile.camera_interval_min_s`.
         interval_seconds: u32,
+        /// Stream URL for the camera feed (e.g. MJPEG or snapshot endpoint).
+        url: String,
     },
     /// Options for `type: history` widgets.
     History {
         /// History window in seconds. Must be ≤ `DeviceProfile.history_window_max_s`.
         window_seconds: u32,
+        /// Maximum number of data points to render (after LTTB downsampling).
+        /// Default 60; validator enforces max 240 per
+        /// `locked_decisions.history_render_path`.
+        #[serde(default = "WidgetOptions::default_max_points")]
+        max_points: u32,
     },
     /// Options for `type: fan` widgets.
     Fan {
@@ -275,13 +380,92 @@ pub enum WidgetOptions {
     /// Options for `type: lock` widgets.
     Lock {
         /// PIN policy for code-locked doors.
+        ///
+        /// Uses `singleton_map` so the YAML wire form is externally-tagged:
+        /// `pin_policy: none`, or `pin_policy:\n  required:\n    length: 4\n    code_format: number`.
+        #[serde(with = "serde_yaml_ng::with::singleton_map")]
         pin_policy: PinPolicy,
+        /// Whether to show a confirmation dialog before unlocking.
+        /// Per `locked_decisions.confirmation_on_lock_unlock`: the flag lives
+        /// here (not on the `Action` variant) so offline queue replay works
+        /// correctly (the queued action has no modal dependency).
+        #[serde(default)]
+        require_confirmation_on_unlock: bool,
     },
     /// Options for `type: alarm` widgets.
     Alarm {
         /// PIN policy for the alarm disarm code.
+        ///
+        /// Uses `singleton_map` so the YAML wire form is externally-tagged.
+        /// `RequiredOnDisarm` is valid only on Alarm; the validator enforces
+        /// `ValidationRule::PinPolicyRequiredOnDisarmOnLock` for Lock widgets.
+        #[serde(with = "serde_yaml_ng::with::singleton_map")]
         pin_policy: PinPolicy,
     },
+    // Phase 6 variants:
+    /// Options for `type: cover` widgets.
+    ///
+    /// Per `locked_decisions.cover_position_bounds`:
+    /// position values are in 0..=100; `position_min` must be ≤ `position_max`.
+    Cover {
+        /// Minimum position value (inclusive). Must be ≤ `position_max` and ≤ 100.
+        position_min: u8,
+        /// Maximum position value (inclusive). Must be ≥ `position_min` and ≤ 100.
+        position_max: u8,
+    },
+    /// Options for `type: media_player` widgets.
+    MediaPlayer {
+        /// The set of transport controls to expose in the UI.
+        /// Each entry must be a value from the `MediaTransport` enum.
+        /// Unknown values are `ValidationRule::MediaTransportNotAllowed` (Error).
+        transport_set: Vec<MediaTransport>,
+        /// Volume adjustment step (0.0..=1.0). Must be > 0.
+        volume_step: f32,
+    },
+    /// Options for `type: climate` widgets.
+    Climate {
+        /// Minimum setpoint temperature (°C or °F per HA unit config).
+        min_temp: f32,
+        /// Maximum setpoint temperature. Must be > `min_temp`.
+        max_temp: f32,
+        /// Setpoint adjustment step. Must be > 0.0.
+        step: f32,
+        /// Available HVAC modes exposed in the mode picker.
+        /// Free strings per `locked_decisions.hvac_mode_vocabulary` —
+        /// HA allows custom modes beyond the standard set.
+        #[serde(default)]
+        hvac_modes: Vec<String>,
+    },
+    /// Options for `type: power_flow` widgets.
+    ///
+    /// Power-flow detailed options are owned by TASK-094 (6d).
+    /// This variant is the Phase 6.0 schema reservation — the validator
+    /// rules `PowerFlowGridEntityNotPower`, `PowerFlowBatteryWithoutSoC`, and
+    /// `PowerFlowIndividualLaneCountExceeded` are added by TASK-094.
+    PowerFlow {
+        /// Entity ID for the grid connection (must be a power sensor entity).
+        grid_entity: String,
+        /// Entity ID for solar production (optional).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        solar_entity: Option<String>,
+        /// Entity ID for battery storage (optional; requires `battery_soc_entity`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        battery_entity: Option<String>,
+        /// Entity ID for battery state-of-charge (required when `battery_entity` is set).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        battery_soc_entity: Option<String>,
+        /// Entity ID for home consumption (optional).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        home_entity: Option<String>,
+    },
+}
+
+impl WidgetOptions {
+    /// Default value for `History::max_points` per `locked_decisions.history_render_path`.
+    #[must_use]
+    pub const fn default_max_points() -> u32 {
+        60
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -319,12 +503,17 @@ pub struct Widget {
     /// `visibility` — predicate string controlling when the widget is shown.
     ///
     /// Defaults to `"always"` when absent (the widget is always visible).
-    /// Phase 4 locks the predicate namespace; unknown values fail validation
-    /// with [`ValidationRule::UnknownVisibilityPredicate`]. Phase 6 evaluates
-    /// the predicate at runtime; Phase 4 only validates the namespace.
+    /// Phase 4 locked the Phase 4 predicate namespace; Phase 6 widens it.
+    /// Unknown values fail validation with
+    /// [`ValidationRule::UnknownVisibilityPredicate`]. Phase 6 TASK-110
+    /// evaluates predicates at runtime; Phase 4/6.0 only validates the namespace.
     ///
-    /// Known predicates: `always`, `never`, `entity_available:<entity_id>`,
+    /// Known predicates (Phase 4): `always`, `never`, `entity_available:<entity_id>`,
     /// `state_equals:<entity_id>:<value>`, `profile:<profile_key>`.
+    ///
+    /// Added in Phase 6 per `locked_decisions.visibility_predicate_vocabulary`:
+    /// `<id> == <value>`, `<id> != <value>`, `<id> in [<v1>,<v2>,...]`,
+    /// `entity_state_numeric:<id>:<op>:<N>`.
     #[serde(
         default = "Widget::default_visibility",
         skip_serializing_if = "Widget::is_default_visibility"
@@ -479,10 +668,13 @@ pub struct Dashboard {
 /// - `SpanOverflow`, `UnknownWidgetType`, `UnknownVisibilityPredicate`,
 ///   `NonAllowlistedCallService`, `MaxWidgetsPerViewExceeded`,
 ///   `CameraIntervalBelowMin`, `HistoryWindowAboveMax`,
-///   `PinPolicyInvalidCodeFormat`
+///   `PinPolicyRequiredOnDisarmOnLock`,
+///   `CoverPositionOutOfBounds`, `ClimateMinMaxTempInvalid`,
+///   `MediaTransportNotAllowed`, `HistoryMaxPointsExceeded`
 ///
 /// Warning rules (render with banner, do not halt load):
-/// - `ImageOptionExceedsMaxPx`, `CameraIntervalBelowDefault`
+/// - `ImageOptionExceedsMaxPx`, `CameraIntervalBelowDefault`,
+///   `PowerFlowBatteryWithoutSoC`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValidationRule {
     // ----- Error rules -----------------------------------------
@@ -500,8 +692,17 @@ pub enum ValidationRule {
     CameraIntervalBelowMin,
     /// A history widget's `window_seconds` exceeds `DeviceProfile.history_window_max_s`.
     HistoryWindowAboveMax,
-    /// The `pin_policy.code_format` field is not a string value.
-    PinPolicyInvalidCodeFormat,
+    /// `WidgetOptions::Lock` carries `PinPolicy::RequiredOnDisarm`, which is
+    /// only valid on alarm widgets per `locked_decisions.pin_policy_migration`.
+    PinPolicyRequiredOnDisarmOnLock,
+    /// A cover widget's `position_min > position_max`, or either bound is outside 0..=100.
+    CoverPositionOutOfBounds,
+    /// A climate widget's `min_temp >= max_temp`, or `step <= 0.0`.
+    ClimateMinMaxTempInvalid,
+    /// A media player widget's `transport_set` contains an unrecognised transport value.
+    MediaTransportNotAllowed,
+    /// A history widget's `max_points` exceeds the validator-enforced maximum (240).
+    HistoryMaxPointsExceeded,
     // ----- Warning rules ---------------------------------------
     /// An image option's pixel dimension exceeds `DeviceProfile.max_image_px`
     /// (a pre-decode downscale will be applied).
@@ -510,6 +711,10 @@ pub enum ValidationRule {
     /// and `camera_interval_default_s` (allowed but flagged as tighter than
     /// the profile's recommended default).
     CameraIntervalBelowDefault,
+    /// A power-flow widget has a `battery_entity` but no `battery_soc_entity`.
+    /// Per `locked_decisions.validation_rule_identifiers`: Warning (not Error),
+    /// owned by TASK-094. Reserved here for identifier consistency.
+    PowerFlowBatteryWithoutSoC,
 }
 
 // ---------------------------------------------------------------------------
@@ -636,6 +841,29 @@ views:
             layout:
               preferred_columns: 4
               preferred_rows: 2
+          - id: patio_cover
+            type: cover
+            entity: cover.patio
+            layout:
+              preferred_columns: 2
+              preferred_rows: 2
+          - id: living_room_media
+            type: media_player
+            entity: media_player.living_room
+            layout:
+              preferred_columns: 4
+              preferred_rows: 2
+          - id: thermostat
+            type: climate
+            entity: climate.living_room
+            layout:
+              preferred_columns: 2
+              preferred_rows: 2
+          - id: energy_flow
+            type: power_flow
+            layout:
+              preferred_columns: 4
+              preferred_rows: 3
 "#;
 
     /// Round-trip test: parse FIXTURE_YAML → serialize → parse again.
@@ -741,14 +969,16 @@ views:
         let yaml = r#"options:
   camera:
     interval_seconds: 10
+    url: "http://cam.local/snapshot"
 "#;
         let w: OptionsWrapper = serde_yaml_ng::from_str(yaml).unwrap();
-        assert!(matches!(
+        assert_eq!(
             w.options,
             WidgetOptions::Camera {
-                interval_seconds: 10
+                interval_seconds: 10,
+                url: "http://cam.local/snapshot".to_string(),
             }
-        ));
+        );
         let back = serde_yaml_ng::to_string(&w).unwrap();
         let w2: OptionsWrapper = serde_yaml_ng::from_str(&back).unwrap();
         assert_eq!(w, w2);
@@ -759,14 +989,33 @@ views:
         let yaml = r#"options:
   history:
     window_seconds: 3600
+    max_points: 120
 "#;
         let w: OptionsWrapper = serde_yaml_ng::from_str(yaml).unwrap();
-        assert!(matches!(
+        assert_eq!(
             w.options,
             WidgetOptions::History {
-                window_seconds: 3600
+                window_seconds: 3600,
+                max_points: 120,
             }
-        ));
+        );
+    }
+
+    #[test]
+    fn widget_options_history_default_max_points() {
+        let yaml = r#"options:
+  history:
+    window_seconds: 3600
+"#;
+        let w: OptionsWrapper = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(
+            w.options,
+            WidgetOptions::History {
+                window_seconds: 3600,
+                max_points: 60,
+            },
+            "max_points must default to 60"
+        );
     }
 
     #[test]
@@ -780,16 +1029,13 @@ views:
       - High
 "#;
         let w: OptionsWrapper = serde_yaml_ng::from_str(yaml).unwrap();
-        match w.options {
+        assert_eq!(
+            w.options,
             WidgetOptions::Fan {
-                speed_count,
-                ref preset_modes,
-            } => {
-                assert_eq!(speed_count, 3);
-                assert_eq!(preset_modes, &["Low", "Medium", "High"]);
+                speed_count: 3,
+                preset_modes: vec!["Low".to_string(), "Medium".to_string(), "High".to_string()],
             }
-            _ => panic!("expected Fan variant"),
-        }
+        );
     }
 
     #[test]
@@ -797,6 +1043,7 @@ views:
         let w = OptionsWrapper {
             options: WidgetOptions::Camera {
                 interval_seconds: 5,
+                url: "http://cam.local/snapshot".to_string(),
             },
         };
         let yaml = serde_yaml_ng::to_string(&w).expect("serialize");
@@ -809,6 +1056,7 @@ views:
             yaml.contains("interval_seconds: 5"),
             "field must serialize: {yaml}"
         );
+        assert!(yaml.contains("url:"), "url field must serialize: {yaml}");
         // Internal tag form would contain "kind: camera" — pin against regression.
         assert!(
             !yaml.contains("kind: camera"),
@@ -848,5 +1096,371 @@ views:
         assert!(kinds.contains(&&WidgetKind::Fan));
         assert!(kinds.contains(&&WidgetKind::Lock));
         assert!(kinds.contains(&&WidgetKind::Alarm));
+        // Phase 6 new kinds:
+        assert!(kinds.contains(&&WidgetKind::Cover));
+        assert!(kinds.contains(&&WidgetKind::MediaPlayer));
+        assert!(kinds.contains(&&WidgetKind::Climate));
+        assert!(kinds.contains(&&WidgetKind::PowerFlow));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6: PinPolicy enum round-trip tests
+    // -----------------------------------------------------------------------
+
+    /// Helper wrapper for PinPolicy serde tests through the singleton_map path.
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct LockWrapper {
+        #[serde(with = "serde_yaml_ng::with::singleton_map")]
+        options: WidgetOptions,
+    }
+
+    #[test]
+    fn pin_policy_enum_none_round_trip() {
+        let yaml = r#"options:
+  lock:
+    pin_policy: none
+"#;
+        let w: LockWrapper = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(
+            w.options,
+            WidgetOptions::Lock {
+                pin_policy: PinPolicy::None,
+                require_confirmation_on_unlock: false,
+            }
+        );
+        let back = serde_yaml_ng::to_string(&w).unwrap();
+        let w2: LockWrapper = serde_yaml_ng::from_str(&back).unwrap();
+        assert_eq!(w, w2);
+    }
+
+    #[test]
+    fn pin_policy_enum_required_round_trip() {
+        let yaml = r#"options:
+  lock:
+    pin_policy:
+      required:
+        length: 4
+        code_format: number
+"#;
+        let w: LockWrapper = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(
+            w.options,
+            WidgetOptions::Lock {
+                pin_policy: PinPolicy::Required {
+                    length: 4,
+                    code_format: CodeFormat::Number,
+                },
+                require_confirmation_on_unlock: false,
+            }
+        );
+        let back = serde_yaml_ng::to_string(&w).unwrap();
+        let w2: LockWrapper = serde_yaml_ng::from_str(&back).unwrap();
+        assert_eq!(w, w2);
+    }
+
+    #[test]
+    fn pin_policy_enum_required_on_disarm_alarm_round_trip() {
+        let yaml = r#"options:
+  alarm:
+    pin_policy:
+      required_on_disarm:
+        length: 6
+        code_format: any
+"#;
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct AlarmWrapper {
+            #[serde(with = "serde_yaml_ng::with::singleton_map")]
+            options: WidgetOptions,
+        }
+        let w: AlarmWrapper = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(
+            w.options,
+            WidgetOptions::Alarm {
+                pin_policy: PinPolicy::RequiredOnDisarm {
+                    length: 6,
+                    code_format: CodeFormat::Any,
+                },
+            }
+        );
+        let back = serde_yaml_ng::to_string(&w).unwrap();
+        let w2: AlarmWrapper = serde_yaml_ng::from_str(&back).unwrap();
+        assert_eq!(w, w2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6: Cover options round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cover_options_round_trip() {
+        let yaml = r#"options:
+  cover:
+    position_min: 0
+    position_max: 100
+"#;
+        let w: OptionsWrapper = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(
+            w.options,
+            WidgetOptions::Cover {
+                position_min: 0,
+                position_max: 100,
+            }
+        );
+        let back = serde_yaml_ng::to_string(&w).unwrap();
+        let w2: OptionsWrapper = serde_yaml_ng::from_str(&back).unwrap();
+        assert_eq!(w, w2);
+    }
+
+    #[test]
+    fn cover_options_serializes_externally_tagged() {
+        let w = OptionsWrapper {
+            options: WidgetOptions::Cover {
+                position_min: 10,
+                position_max: 90,
+            },
+        };
+        let yaml = serde_yaml_ng::to_string(&w).expect("serialize");
+        assert!(
+            yaml.contains("cover:"),
+            "must use externally-tagged form: {yaml}"
+        );
+        assert!(
+            yaml.contains("position_min: 10"),
+            "field must serialize: {yaml}"
+        );
+        assert!(
+            yaml.contains("position_max: 90"),
+            "field must serialize: {yaml}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6: MediaPlayer options round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn media_player_options_round_trip() {
+        let yaml = r#"options:
+  media_player:
+    transport_set:
+      - play
+      - pause
+      - stop
+      - next
+      - prev
+    volume_step: 0.05
+"#;
+        let w: OptionsWrapper = serde_yaml_ng::from_str(yaml).unwrap();
+        // Verify variant identity via PartialEq — no unreachable wildcard arm needed.
+        assert_eq!(
+            w.options,
+            WidgetOptions::MediaPlayer {
+                transport_set: vec![
+                    MediaTransport::Play,
+                    MediaTransport::Pause,
+                    MediaTransport::Stop,
+                    MediaTransport::Next,
+                    MediaTransport::Prev,
+                ],
+                volume_step: 0.05,
+            }
+        );
+        let back = serde_yaml_ng::to_string(&w).unwrap();
+        let w2: OptionsWrapper = serde_yaml_ng::from_str(&back).unwrap();
+        assert_eq!(w, w2);
+    }
+
+    #[test]
+    fn media_player_options_serializes_externally_tagged() {
+        let w = OptionsWrapper {
+            options: WidgetOptions::MediaPlayer {
+                transport_set: vec![MediaTransport::Play, MediaTransport::Pause],
+                volume_step: 0.1,
+            },
+        };
+        let yaml = serde_yaml_ng::to_string(&w).expect("serialize");
+        assert!(
+            yaml.contains("media_player:"),
+            "must use externally-tagged form: {yaml}"
+        );
+        assert!(
+            yaml.contains("volume_step:"),
+            "volume_step field must serialize: {yaml}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6: Climate options round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn climate_options_round_trip() {
+        let yaml = r#"options:
+  climate:
+    min_temp: 16.0
+    max_temp: 30.0
+    step: 0.5
+    hvac_modes:
+      - heat
+      - cool
+      - heat_cool
+      - off
+"#;
+        let w: OptionsWrapper = serde_yaml_ng::from_str(yaml).unwrap();
+        // Verify variant identity via PartialEq — no unreachable wildcard arm needed.
+        assert_eq!(
+            w.options,
+            WidgetOptions::Climate {
+                min_temp: 16.0,
+                max_temp: 30.0,
+                step: 0.5,
+                hvac_modes: vec![
+                    "heat".to_string(),
+                    "cool".to_string(),
+                    "heat_cool".to_string(),
+                    "off".to_string(),
+                ],
+            }
+        );
+        let back = serde_yaml_ng::to_string(&w).unwrap();
+        let w2: OptionsWrapper = serde_yaml_ng::from_str(&back).unwrap();
+        assert_eq!(w, w2);
+    }
+
+    #[test]
+    fn climate_options_serializes_externally_tagged() {
+        let w = OptionsWrapper {
+            options: WidgetOptions::Climate {
+                min_temp: 16.0,
+                max_temp: 30.0,
+                step: 0.5,
+                hvac_modes: vec!["heat".to_string(), "cool".to_string()],
+            },
+        };
+        let yaml = serde_yaml_ng::to_string(&w).expect("serialize");
+        assert!(
+            yaml.contains("climate:"),
+            "must use externally-tagged form: {yaml}"
+        );
+        assert!(
+            yaml.contains("min_temp:"),
+            "min_temp must serialize: {yaml}"
+        );
+        assert!(
+            yaml.contains("max_temp:"),
+            "max_temp must serialize: {yaml}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6: PowerFlow options round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn power_flow_options_round_trip() {
+        let yaml = r#"options:
+  power_flow:
+    grid_entity: sensor.grid_power
+    solar_entity: sensor.solar_power
+    battery_entity: sensor.battery_power
+    battery_soc_entity: sensor.battery_soc
+    home_entity: sensor.home_power
+"#;
+        let w: OptionsWrapper = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(
+            w.options,
+            WidgetOptions::PowerFlow {
+                grid_entity: "sensor.grid_power".to_string(),
+                solar_entity: Some("sensor.solar_power".to_string()),
+                battery_entity: Some("sensor.battery_power".to_string()),
+                battery_soc_entity: Some("sensor.battery_soc".to_string()),
+                home_entity: Some("sensor.home_power".to_string()),
+            }
+        );
+        let back = serde_yaml_ng::to_string(&w).unwrap();
+        let w2: OptionsWrapper = serde_yaml_ng::from_str(&back).unwrap();
+        assert_eq!(w, w2);
+    }
+
+    #[test]
+    fn power_flow_options_optional_fields_absent() {
+        let yaml = r#"options:
+  power_flow:
+    grid_entity: sensor.grid_power
+"#;
+        let w: OptionsWrapper = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(
+            w.options,
+            WidgetOptions::PowerFlow {
+                grid_entity: "sensor.grid_power".to_string(),
+                solar_entity: None,
+                battery_entity: None,
+                battery_soc_entity: None,
+                home_entity: None,
+            }
+        );
+    }
+
+    #[test]
+    fn power_flow_options_serializes_externally_tagged() {
+        let w = OptionsWrapper {
+            options: WidgetOptions::PowerFlow {
+                grid_entity: "sensor.grid".to_string(),
+                solar_entity: None,
+                battery_entity: None,
+                battery_soc_entity: None,
+                home_entity: None,
+            },
+        };
+        let yaml = serde_yaml_ng::to_string(&w).expect("serialize");
+        assert!(
+            yaml.contains("power_flow:"),
+            "must use externally-tagged form: {yaml}"
+        );
+        assert!(
+            yaml.contains("grid_entity:"),
+            "grid_entity must serialize: {yaml}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6: Lock options with require_confirmation_on_unlock
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lock_options_require_confirmation_round_trip() {
+        let yaml = r#"options:
+  lock:
+    pin_policy: none
+    require_confirmation_on_unlock: true
+"#;
+        let w: LockWrapper = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(
+            w.options,
+            WidgetOptions::Lock {
+                pin_policy: PinPolicy::None,
+                require_confirmation_on_unlock: true,
+            }
+        );
+        let back = serde_yaml_ng::to_string(&w).unwrap();
+        let w2: LockWrapper = serde_yaml_ng::from_str(&back).unwrap();
+        assert_eq!(w, w2);
+    }
+
+    #[test]
+    fn lock_options_require_confirmation_defaults_false() {
+        let yaml = r#"options:
+  lock:
+    pin_policy: none
+"#;
+        let w: LockWrapper = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(
+            w.options,
+            WidgetOptions::Lock {
+                pin_policy: PinPolicy::None,
+                require_confirmation_on_unlock: false,
+            },
+            "require_confirmation_on_unlock must default to false"
+        );
     }
 }

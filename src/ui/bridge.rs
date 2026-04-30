@@ -300,16 +300,21 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                                 pending: false,
                             }),
                             // Phase 4 schema adds Camera, History, Fan, Lock, Alarm
-                            // variants. Until dedicated Slint tile components exist
-                            // (TASK-085+), these are rendered as EntityTileVM — the
-                            // generic entity tile covers the state display until
+                            // variants. Phase 6 adds Cover, MediaPlayer, Climate,
+                            // PowerFlow. Until dedicated Slint tile components exist
+                            // (TASK-102..TASK-109), these are rendered as EntityTileVM —
+                            // the generic entity tile covers the state display until
                             // per-kind tiles ship.
                             WidgetKind::EntityTile
                             | WidgetKind::Camera
                             | WidgetKind::History
                             | WidgetKind::Fan
                             | WidgetKind::Lock
-                            | WidgetKind::Alarm => TileVM::Entity(EntityTileVM {
+                            | WidgetKind::Alarm
+                            | WidgetKind::Cover
+                            | WidgetKind::MediaPlayer
+                            | WidgetKind::Climate
+                            | WidgetKind::PowerFlow => TileVM::Entity(EntityTileVM {
                                 name,
                                 state,
                                 icon_id,
