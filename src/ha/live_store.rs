@@ -8,10 +8,27 @@
 //!
 //! # Snapshot model
 //!
-//! The entity map is stored as `Arc<HashMap<EntityId, Entity>>` wrapped in an
-//! outer `RwLock`.  `apply_snapshot` performs an atomic Arc swap — no per-entity
-//! churn during reconnect.  `snapshot()` returns an `Arc` clone in O(1) without
-//! copying the map.
+//! The entity map is stored as a plain `HashMap<EntityId, Entity>` wrapped in
+//! an outer `RwLock` (TASK-117 / F1).  `apply_event` mutates the map in place
+//! under the write-lock — there is no per-event clone of the map (the
+//! pre-TASK-117 `Arc<HashMap>` design cloned the full map on every event,
+//! making each incremental update O(total_entity_count)).  `apply_snapshot`
+//! replaces the map wholesale.  `snapshot()` clones the inner `HashMap` into
+//! a fresh `Arc` and is O(N); it is only called from the WS reconnect diff
+//! path (rare) and from tests, so the clone cost is amortized across many
+//! incremental events that NO longer pay for it.
+//!
+//! ## RwLock poison recovery (Risk #8)
+//!
+//! All read and write paths use `lock.unwrap_or_else(|e| e.into_inner())` so a
+//! writer panic in one method does not permanently break entity reads in
+//! every other method.  The recovered guard exposes the same `HashMap` —
+//! callers must accept that the map's logical invariants might have been
+//! mid-update at the moment of panic, but the map itself is structurally
+//! intact (no UB).  This trades "lose all data on a single writer panic" for
+//! "best-effort continued operation" — the right call for a long-running UI
+//! daemon where a transient panic in `apply_event` should not blank the
+//! dashboard.
 //!
 //! # Per-entity broadcast channels
 //!
@@ -154,13 +171,16 @@ pub enum OptimisticInsertError {
 /// See module-level documentation for the snapshot, broadcast, and
 /// Phase 3 command-channel contracts.
 pub struct LiveStore {
-    /// Atomic-swap snapshot.
+    /// In-place mutated entity map (TASK-117 / F1).
     ///
-    /// The inner `Arc<HashMap>` is swapped atomically by `apply_snapshot` so
-    /// that no per-entity churn occurs during reconnect.  `snapshot()` clones
-    /// only the outer `Arc` — O(1) and lock-free after the read-guard is
-    /// acquired.
-    snapshot: RwLock<Arc<HashMap<EntityId, Entity>>>,
+    /// Pre-TASK-117 this was `RwLock<Arc<HashMap<EntityId, Entity>>>` and
+    /// `apply_event` cloned the inner `HashMap` on every event so it could
+    /// produce a new Arc for the swap — making each incremental event
+    /// O(total_entity_count).  The `Arc` indirection has been removed:
+    /// `apply_event` now `insert`s / `remove`s into the map under the
+    /// write-lock in O(1).  `snapshot()` clones the map into a fresh `Arc`
+    /// when callers ask for one (only the WS reconnect diff path and tests).
+    snapshot: RwLock<HashMap<EntityId, Entity>>,
 
     /// Per-entity broadcast senders, created on first `subscribe` call.
     ///
@@ -250,7 +270,7 @@ impl LiveStore {
     /// `get_states` reply arrives.
     pub fn new() -> Self {
         LiveStore {
-            snapshot: RwLock::new(Arc::new(HashMap::new())),
+            snapshot: RwLock::new(HashMap::new()),
             senders: RwLock::new(HashMap::new()),
             command_tx: RwLock::new(None),
             services_handle: ServiceRegistry::new_handle(),
@@ -583,14 +603,18 @@ impl LiveStore {
     /// resync).  The new map is built from the provided `entities` slice and
     /// swapped into place under a write-lock.  No per-entity broadcast is fired
     /// — the bridge performs a full `for_each` resync after `apply_snapshot`.
+    ///
+    /// **Poison recovery (Risk #8):** the write-lock is recovered via
+    /// `unwrap_or_else(|e| e.into_inner())` so a prior writer panic in
+    /// `apply_event` does not block the next reconnect from re-seeding the
+    /// store.  See module-level docs.
     pub fn apply_snapshot(&self, entities: Vec<Entity>) {
         let new_map: HashMap<EntityId, Entity> =
             entities.into_iter().map(|e| (e.id.clone(), e)).collect();
-        let mut guard = self
-            .snapshot
-            .write()
-            .expect("LiveStore snapshot RwLock poisoned");
-        *guard = Arc::new(new_map);
+        // Poison recovery: a prior writer panic must not permanently block
+        // reconnect repopulation.
+        let mut guard = self.snapshot.write().unwrap_or_else(|e| e.into_inner());
+        *guard = new_map;
     }
 
     /// Apply a single incremental entity update.
@@ -603,6 +627,15 @@ impl LiveStore {
     /// per-entity subscriber.  If no subscriber exists for this entity, the
     /// broadcast is silently discarded.
     ///
+    /// # F1 (TASK-117): in-place mutation, returns `EntityId` diff signal
+    ///
+    /// The map is mutated in place under the write-lock — no per-event
+    /// `HashMap` clone (the pre-TASK-117 implementation cloned the entire
+    /// entity map on every event, multiplying allocation cost by total entity
+    /// count).  Returns the `EntityId` of the changed entity so callers
+    /// (especially F2's incremental UI flush in TASK-119) have a precise
+    /// per-event diff signal without re-walking the snapshot.
+    ///
     /// # Optimistic UI reconciliation (TASK-064)
     ///
     /// Per `locked_decisions.optimistic_reconciliation_key`, any optimistic
@@ -614,25 +647,20 @@ impl LiveStore {
     /// path is taken when HA reports the entity disappeared, which is not
     /// the optimistic-reconciliation seam (the entry will time out via
     /// rule 5).
-    pub fn apply_event(&self, update: EntityUpdate) {
-        // Update the snapshot under a write-lock.
+    pub fn apply_event(&self, update: EntityUpdate) -> EntityId {
+        // In-place mutation under the write-lock.  Poison recovery: a writer
+        // panic in a prior call must not permanently break ingest — the
+        // recovered guard exposes the same `HashMap`, structurally intact.
         {
-            let mut guard = self
-                .snapshot
-                .write()
-                .expect("LiveStore snapshot RwLock poisoned");
-
-            // Clone the current map, apply the change, then Arc-swap.
-            let mut new_map: HashMap<EntityId, Entity> = (**guard).clone();
+            let mut guard = self.snapshot.write().unwrap_or_else(|e| e.into_inner());
             match &update.entity {
                 Some(entity) => {
-                    new_map.insert(update.id.clone(), entity.clone());
+                    guard.insert(update.id.clone(), entity.clone());
                 }
                 None => {
-                    new_map.remove(&update.id);
+                    guard.remove(&update.id);
                 }
             }
-            *guard = Arc::new(new_map);
         }
 
         // Reconciliation rule 1 (ack-success WITH state_changed): drop any
@@ -642,10 +670,8 @@ impl LiveStore {
         // carries the SAME `last_changed`, so no entries are dropped.
         if let Some(ref entity) = update.entity {
             let new_last_changed = entity.last_changed;
-            let mut guard = self
-                .optimistic
-                .write()
-                .expect("LiveStore optimistic RwLock poisoned");
+            // Poison recovery — same rationale as the snapshot lock above.
+            let mut guard = self.optimistic.write().unwrap_or_else(|e| e.into_inner());
             if let Some(bucket) = guard.get_mut(&update.id) {
                 bucket.retain(|entry| entry.dispatched_at >= new_last_changed);
                 if bucket.is_empty() {
@@ -654,31 +680,67 @@ impl LiveStore {
             }
         }
 
+        let id = update.id.clone();
         // Broadcast to any active per-entity subscriber.  Holding the senders
         // read-lock while sending is safe because broadcast::Sender::send does
         // not block and does not re-acquire any internal lock on this store.
-        let senders_guard = self
-            .senders
-            .read()
-            .expect("LiveStore senders RwLock poisoned");
+        // Poison recovery on the senders lock — a panicked writer must not
+        // permanently block per-entity broadcasts.
+        let senders_guard = self.senders.read().unwrap_or_else(|e| e.into_inner());
         if let Some(tx) = senders_guard.get(&update.id) {
             // Discard send errors: no receivers is expected when no subscriber
             // is currently watching this entity.
             let _ = tx.send(update);
         }
+        id
     }
 
-    /// Return an O(1) clone of the current snapshot arc.
+    /// Broadcast an entity update to per-entity subscribers WITHOUT mutating
+    /// the snapshot (TASK-117 / F1 reconnect diff path).
     ///
-    /// The returned `Arc<HashMap>` is a stable snapshot at the instant of the
-    /// call.  Subsequent `apply_event` calls do not mutate the returned map —
-    /// they produce a new `Arc` and swap it in.
+    /// Used by the WS reconnect diff loop in `src/ha/client.rs::diff_and_broadcast`
+    /// after `apply_snapshot` has already installed the authoritative entity
+    /// map in a single batch mutation.  Per-entity calls into this method
+    /// only fire the broadcast — they do NOT re-insert into the map (which
+    /// would be wasted work post-snapshot-swap).
+    ///
+    /// Returns the `EntityId` for symmetry with `apply_event` so reconnect
+    /// callers can collect changed-id signals without an extra clone of the
+    /// update payload.
+    ///
+    /// # Why not call `apply_event`?
+    ///
+    /// Pre-TASK-117 the reconnect diff path went through `apply_event` per
+    /// changed entity.  Even with F1's in-place mutation in
+    /// place, that would re-`insert` an entity that `apply_snapshot` already
+    /// installed — a wasted lock acquisition and `HashMap::insert` per
+    /// changed entity.  This method is the explicit "broadcast only" seam
+    /// that the reconnect diff path takes instead.
+    pub fn broadcast_event(&self, update: EntityUpdate) -> EntityId {
+        let id = update.id.clone();
+        let senders_guard = self.senders.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(tx) = senders_guard.get(&update.id) {
+            let _ = tx.send(update);
+        }
+        id
+    }
+
+    /// Return an `Arc<HashMap<...>>` clone of the current snapshot.
+    ///
+    /// Post-TASK-117 the inner storage is a plain `HashMap<EntityId, Entity>`
+    /// — there is no preserved Arc to clone in O(1).  This method clones the
+    /// HashMap into a fresh `Arc` (O(N) in entity count) so callers that
+    /// need a stable snapshot view (the WS reconnect diff path captures
+    /// `old_snap` here, then walks it after `apply_snapshot` swaps in the new
+    /// map) get the same API as before.
+    ///
+    /// **Cost:** O(N) per call.  Call frequency is rare (once per WS
+    /// reconnect; never on the steady-state event hot path) so the per-event
+    /// improvement from in-place mutation dominates.
     pub fn snapshot(&self) -> Arc<HashMap<EntityId, Entity>> {
-        let guard = self
-            .snapshot
-            .read()
-            .expect("LiveStore snapshot RwLock poisoned");
-        Arc::clone(&*guard)
+        // Poison recovery — same rationale as in `apply_event`.
+        let guard = self.snapshot.read().unwrap_or_else(|e| e.into_inner());
+        Arc::new(guard.clone())
     }
 }
 
@@ -695,14 +757,13 @@ impl Default for LiveStore {
 impl EntityStore for LiveStore {
     /// Look up a single entity by id.
     ///
-    /// Acquires a read-lock, clones the `Arc` snapshot, then looks up the id.
-    /// The lock is released before the clone is returned so callers are never
-    /// blocked on a write-lock.
+    /// Acquires a read-lock on the in-place HashMap, clones the entity (cheap
+    /// — `Entity`'s heavy fields are `Arc`-wrapped), and releases the lock.
+    ///
+    /// **Poison recovery (Risk #8):** `unwrap_or_else(|e| e.into_inner())`
+    /// recovers from a writer panic in `apply_event` so reads keep working.
     fn get(&self, id: &EntityId) -> Option<Entity> {
-        let guard = self
-            .snapshot
-            .read()
-            .expect("LiveStore snapshot RwLock poisoned");
+        let guard = self.snapshot.read().unwrap_or_else(|e| e.into_inner());
         guard.get(id).cloned()
     }
 
@@ -711,11 +772,10 @@ impl EntityStore for LiveStore {
     /// The entire walk runs while the read-lock is held.  Callers must not
     /// perform any action inside the visitor that would attempt to acquire a
     /// write-lock on this store (deadlock).
+    ///
+    /// **Poison recovery (Risk #8):** see [`Self::get`].
     fn for_each(&self, f: &mut dyn FnMut(&EntityId, &Entity)) {
-        let guard = self
-            .snapshot
-            .read()
-            .expect("LiveStore snapshot RwLock poisoned");
+        let guard = self.snapshot.read().unwrap_or_else(|e| e.into_inner());
         for (id, entity) in guard.iter() {
             f(id, entity);
         }
@@ -733,6 +793,10 @@ impl EntityStore for LiveStore {
     /// Only the first element of `ids` is used; passing an empty slice returns
     /// a receiver that will never yield an event.  See module documentation
     /// for the single-id subscribe contract.
+    ///
+    /// **Poison recovery (Risk #8):** both the read-side fast path and the
+    /// write-side slow path recover from a poisoned `senders` lock so a
+    /// writer panic does not freeze new subscriptions.
     fn subscribe(&self, ids: &[EntityId]) -> broadcast::Receiver<EntityUpdate> {
         let Some(id) = ids.first() else {
             // No id requested — return a receiver from a throw-away channel.
@@ -743,20 +807,14 @@ impl EntityStore for LiveStore {
 
         // Fast path: check under read-lock first.
         {
-            let guard = self
-                .senders
-                .read()
-                .expect("LiveStore senders RwLock poisoned");
+            let guard = self.senders.read().unwrap_or_else(|e| e.into_inner());
             if let Some(tx) = guard.get(id) {
                 return tx.subscribe();
             }
         }
 
         // Slow path: create a new sender under write-lock.
-        let mut guard = self
-            .senders
-            .write()
-            .expect("LiveStore senders RwLock poisoned");
+        let mut guard = self.senders.write().unwrap_or_else(|e| e.into_inner());
         // Re-check after acquiring write-lock (another thread may have inserted
         // between the read-lock release and this write-lock acquisition).
         let tx = guard
