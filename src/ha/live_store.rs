@@ -2033,4 +2033,236 @@ mod tests {
             "pending_for_widget must return false after optimistic entry is dropped"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // snapshot() — additional branch coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn snapshot_on_empty_store_returns_empty_arc() {
+        // snapshot() on a store that has never had apply_snapshot called must
+        // return an Arc wrapping an empty HashMap (not panic or return stale data).
+        let store = LiveStore::new();
+        let snap = store.snapshot();
+        assert!(
+            snap.is_empty(),
+            "snapshot() on an empty store must return an empty HashMap"
+        );
+    }
+
+    #[test]
+    fn snapshot_is_independent_clone_of_current_map() {
+        // A snapshot taken before a mutation must not reflect the mutation —
+        // it is a cloned copy, not a live view.
+        let store = LiveStore::new();
+        store.apply_snapshot(vec![make_entity("light.a", "off")]);
+
+        // Capture snapshot before mutation.
+        let snap_before = store.snapshot();
+        assert_eq!(&*snap_before[&EntityId::from("light.a")].state, "off");
+
+        // Mutate the store.
+        store.apply_event(EntityUpdate {
+            id: EntityId::from("light.a"),
+            entity: Some(make_entity("light.a", "on")),
+        });
+
+        // The old snapshot must still reflect the pre-mutation state.
+        assert_eq!(
+            &*snap_before[&EntityId::from("light.a")].state,
+            "off",
+            "snapshot taken before mutation must not change after apply_event"
+        );
+        // The store's current state reflects the mutation.
+        assert_eq!(&*store.get(&EntityId::from("light.a")).unwrap().state, "on");
+    }
+
+    // -----------------------------------------------------------------------
+    // get() — explicit absent-entity test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_returns_none_for_absent_entity() {
+        // get() must return None for an id that was never inserted, even when
+        // other entities are present in the snapshot.
+        let store = LiveStore::new();
+        store.apply_snapshot(vec![make_entity("light.present", "on")]);
+
+        assert!(
+            store.get(&EntityId::from("sensor.absent")).is_none(),
+            "get(id) must return None for an entity that has never been inserted"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // for_each() — state value verification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn for_each_visits_entity_state_values() {
+        // for_each must expose the actual entity state value, not just the id.
+        let store = LiveStore::new();
+        store.apply_snapshot(vec![
+            make_entity("light.alpha", "on"),
+            make_entity("sensor.beta", "42"),
+        ]);
+
+        let mut collected: Vec<(String, String)> = Vec::new();
+        store.for_each(&mut |id, entity| {
+            collected.push((id.as_str().to_owned(), entity.state.to_string()));
+        });
+        collected.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(
+            collected,
+            vec![
+                ("light.alpha".to_owned(), "on".to_owned()),
+                ("sensor.beta".to_owned(), "42".to_owned()),
+            ]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // subscribe() — fast path delivers events
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn subscribe_fast_path_delivers_events() {
+        // The first subscribe creates the sender (slow path / write-lock).
+        // The second subscribe re-uses the existing sender (fast path /
+        // read-lock only).  Both receivers must receive the subsequent event.
+        let store = LiveStore::new();
+        store.apply_snapshot(vec![make_entity("light.fp", "off")]);
+
+        // First subscription — creates the broadcast sender (slow path).
+        let _rx1 = store.subscribe(&[EntityId::from("light.fp")]);
+        // Second subscription — hits the fast path (read-lock, sender exists).
+        let mut rx2 = store.subscribe(&[EntityId::from("light.fp")]);
+
+        store.apply_event(EntityUpdate {
+            id: EntityId::from("light.fp"),
+            entity: Some(make_entity("light.fp", "on")),
+        });
+
+        // rx2 was created via the fast path; it must receive the event.
+        let update = rx2
+            .recv()
+            .await
+            .expect("fast-path receiver must yield update");
+        assert_eq!(update.id.as_str(), "light.fp");
+        assert_eq!(&*update.entity.unwrap().state, "on");
+    }
+
+    // -----------------------------------------------------------------------
+    // drop_optimistic_entry — entity present but request_id missing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn drop_optimistic_entry_returns_none_when_entity_exists_but_request_id_missing() {
+        // When the entity bucket exists but the specific request_id is not in
+        // it, drop_optimistic_entry must return None without removing other
+        // entries.  This covers the `bucket.iter().position(...)` returning
+        // None branch (distinct from the `guard.get_mut(entity_id)?` None branch
+        // covered by drop_optimistic_entry_returns_none_for_missing_entry).
+        let store = LiveStore::new();
+        let ts = Timestamp::UNIX_EPOCH;
+
+        // Insert one entry for the entity so the bucket exists.
+        store
+            .insert_optimistic_entry(OptimisticEntry {
+                entity_id: EntityId::from("light.bucket_exists"),
+                request_id: 11,
+                dispatched_at: ts,
+                tentative_state: Arc::from("on"),
+                prior_state: Arc::from("off"),
+            })
+            .expect("insert must succeed");
+
+        // Attempt to remove a request_id that does NOT exist in the bucket.
+        let result = store.drop_optimistic_entry(&EntityId::from("light.bucket_exists"), 99);
+        assert!(
+            result.is_none(),
+            "drop_optimistic_entry must return None when request_id is absent from the bucket"
+        );
+
+        // The existing entry must be unaffected.
+        assert!(store.has_optimistic_entry(&EntityId::from("light.bucket_exists"), 11));
+        assert_eq!(store.optimistic_total(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_event reconciliation — partial bucket drain (mixed dispatched_at)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_event_partial_reconciliation_leaves_newer_entries() {
+        // When a bucket has entries with mixed dispatched_at times, only entries
+        // strictly older than the inbound last_changed are dropped; entries
+        // with dispatched_at >= last_changed are retained.
+        let store = LiveStore::new().with_per_entity_optimistic_cap(5);
+        store.apply_snapshot(vec![make_entity("light.mix", "off")]);
+
+        let t0 = Timestamp::UNIX_EPOCH;
+        let t1 = t0.checked_add(jiff::Span::new().seconds(1)).unwrap();
+        let t2 = t0.checked_add(jiff::Span::new().seconds(2)).unwrap();
+
+        // Entry dispatched at t0 — will be dropped (t0 < t1).
+        store
+            .insert_optimistic_entry(OptimisticEntry {
+                entity_id: EntityId::from("light.mix"),
+                request_id: 101,
+                dispatched_at: t0,
+                tentative_state: Arc::from("on"),
+                prior_state: Arc::from("off"),
+            })
+            .expect("insert 101");
+
+        // Entry dispatched at t2 — will be RETAINED (t2 >= t1).
+        store
+            .insert_optimistic_entry(OptimisticEntry {
+                entity_id: EntityId::from("light.mix"),
+                request_id: 102,
+                dispatched_at: t2,
+                tentative_state: Arc::from("on"),
+                prior_state: Arc::from("off"),
+            })
+            .expect("insert 102");
+
+        // Entry dispatched at t1 — will be RETAINED (t1 >= t1, equal).
+        store
+            .insert_optimistic_entry(OptimisticEntry {
+                entity_id: EntityId::from("light.mix"),
+                request_id: 103,
+                dispatched_at: t1,
+                tentative_state: Arc::from("on"),
+                prior_state: Arc::from("off"),
+            })
+            .expect("insert 103");
+
+        // Inbound event with last_changed = t1 — triggers rule 1 partial drain.
+        let mut updated_entity = make_entity("light.mix", "on");
+        updated_entity.last_changed = t1;
+
+        store.apply_event(EntityUpdate {
+            id: EntityId::from("light.mix"),
+            entity: Some(updated_entity),
+        });
+
+        // Entry 101 (dispatched_at < t1) must be gone.
+        assert!(
+            !store.has_optimistic_entry(&EntityId::from("light.mix"), 101),
+            "entry dispatched before last_changed must be dropped"
+        );
+
+        // Entries 102 and 103 must remain (dispatched_at >= t1).
+        assert!(
+            store.has_optimistic_entry(&EntityId::from("light.mix"), 102),
+            "entry dispatched after last_changed must be retained"
+        );
+        assert!(
+            store.has_optimistic_entry(&EntityId::from("light.mix"), 103),
+            "entry dispatched at exactly last_changed must be retained"
+        );
+        assert_eq!(store.optimistic_total(), 2);
+    }
 }
