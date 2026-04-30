@@ -1285,4 +1285,320 @@ mod tests {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // apply_event — returns EntityId (TASK-117 / F1 diff signal)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_event_returns_entity_id_of_changed_entity() {
+        let store = LiveStore::new();
+        store.apply_snapshot(vec![make_entity("light.kitchen", "off")]);
+
+        let returned_id = store.apply_event(EntityUpdate {
+            id: EntityId::from("light.kitchen"),
+            entity: Some(make_entity("light.kitchen", "on")),
+        });
+
+        assert_eq!(
+            returned_id.as_str(),
+            "light.kitchen",
+            "apply_event must return the EntityId of the changed entity"
+        );
+    }
+
+    #[test]
+    fn apply_event_none_returns_entity_id() {
+        let store = LiveStore::new();
+        store.apply_snapshot(vec![make_entity("light.gone", "on")]);
+
+        let returned_id = store.apply_event(EntityUpdate {
+            id: EntityId::from("light.gone"),
+            entity: None,
+        });
+
+        assert_eq!(
+            returned_id.as_str(),
+            "light.gone",
+            "apply_event with entity:None must return the EntityId of the removed entity"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // broadcast_event — TASK-117 reconnect diff path
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn broadcast_event_delivers_to_subscriber_without_mutating_snapshot() {
+        // After apply_snapshot, broadcast_event fires the per-entity channel
+        // but must NOT insert/update the snapshot (the snapshot was already
+        // installed by apply_snapshot).
+        let store = LiveStore::new();
+        store.apply_snapshot(vec![make_entity("light.x", "off")]);
+
+        // Subscribe so the channel sender is created.
+        let mut rx = store.subscribe(&[EntityId::from("light.x")]);
+
+        // broadcast_event delivers to the channel but must not touch the
+        // snapshot map — we pass a "on" entity and then verify the snapshot
+        // still holds "off" (because broadcast_event skips the write-lock).
+        let update = EntityUpdate {
+            id: EntityId::from("light.x"),
+            entity: Some(make_entity("light.x", "on")),
+        };
+        let returned_id = store.broadcast_event(update);
+
+        // Return value is the EntityId, for symmetry with apply_event.
+        assert_eq!(returned_id.as_str(), "light.x");
+
+        // The channel must have received the update.
+        let received = rx
+            .recv()
+            .await
+            .expect("broadcast_event must fire the channel");
+        assert_eq!(received.id.as_str(), "light.x");
+        assert_eq!(
+            &*received.entity.unwrap().state,
+            "on",
+            "channel must carry the entity passed to broadcast_event"
+        );
+
+        // The snapshot must NOT have been mutated — still "off".
+        let snap_entity = store
+            .get(&EntityId::from("light.x"))
+            .expect("snapshot must still contain the entity");
+        assert_eq!(
+            &*snap_entity.state, "off",
+            "broadcast_event must not mutate the snapshot"
+        );
+    }
+
+    #[test]
+    fn broadcast_event_no_subscriber_is_silent_noop() {
+        // broadcast_event with no active receiver must not panic and must
+        // still return the EntityId.
+        let store = LiveStore::new();
+        store.apply_snapshot(vec![make_entity("light.x", "off")]);
+
+        // No subscribe call — no sender in the senders map.
+        let returned_id = store.broadcast_event(EntityUpdate {
+            id: EntityId::from("light.x"),
+            entity: Some(make_entity("light.x", "on")),
+        });
+
+        assert_eq!(returned_id.as_str(), "light.x");
+        // Snapshot must be untouched.
+        let snap = store.get(&EntityId::from("light.x")).unwrap();
+        assert_eq!(&*snap.state, "off");
+    }
+
+    #[tokio::test]
+    async fn broadcast_event_entity_not_in_senders_map_returns_id() {
+        // broadcast_event for an entity that has never been subscribed
+        // (sender map has no entry) must silently return the id.
+        let store = LiveStore::new();
+        // Subscribe a DIFFERENT entity to populate the senders map with
+        // at least one entry — broadcast_event's lookup must miss gracefully.
+        store.apply_snapshot(vec![
+            make_entity("light.other", "on"),
+            make_entity("sensor.target", "22"),
+        ]);
+        let _rx = store.subscribe(&[EntityId::from("light.other")]);
+
+        let returned_id = store.broadcast_event(EntityUpdate {
+            id: EntityId::from("sensor.target"),
+            entity: Some(make_entity("sensor.target", "23")),
+        });
+
+        assert_eq!(returned_id.as_str(), "sensor.target");
+        // sensor.target snapshot must still be "22" — broadcast_event never
+        // touches the map.
+        let snap = store.get(&EntityId::from("sensor.target")).unwrap();
+        assert_eq!(&*snap.state, "22");
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_event — optimistic reconciliation (TASK-064 / rule 1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_event_drops_optimistic_entries_predating_last_changed() {
+        // Rule 1: any optimistic entry whose `dispatched_at` is strictly
+        // LESS THAN the inbound entity's `last_changed` must be dropped.
+        use jiff::Timestamp;
+
+        let store = LiveStore::new();
+        store.apply_snapshot(vec![make_entity("light.kitchen", "off")]);
+
+        let t0 = Timestamp::UNIX_EPOCH;
+        let t1 = t0.checked_add(jiff::Span::new().seconds(1)).unwrap();
+
+        // Insert an optimistic entry dispatched at t0.
+        store
+            .insert_optimistic_entry(OptimisticEntry {
+                entity_id: EntityId::from("light.kitchen"),
+                request_id: 1,
+                dispatched_at: t0,
+                tentative_state: Arc::from("on"),
+                prior_state: Arc::from("off"),
+            })
+            .expect("insert must succeed within cap");
+
+        assert!(
+            store.has_optimistic_entry(&EntityId::from("light.kitchen"), 1),
+            "entry must be present before the confirming event"
+        );
+
+        // Inbound event with last_changed = t1 (> t0) — rule 1 triggers.
+        let mut confirming_entity = make_entity("light.kitchen", "on");
+        confirming_entity.last_changed = t1;
+
+        store.apply_event(EntityUpdate {
+            id: EntityId::from("light.kitchen"),
+            entity: Some(confirming_entity),
+        });
+
+        assert!(
+            !store.has_optimistic_entry(&EntityId::from("light.kitchen"), 1),
+            "rule 1: entry must be dropped when entity.last_changed > entry.dispatched_at"
+        );
+        assert_eq!(store.optimistic_total(), 0);
+    }
+
+    #[test]
+    fn apply_event_retains_optimistic_entries_with_same_last_changed() {
+        // Rule 3 (attribute-only update): the inbound last_changed equals
+        // the entry's dispatched_at, so retain(|e| e.dispatched_at >=
+        // new_last_changed) keeps the entry.
+        use jiff::Timestamp;
+
+        let store = LiveStore::new();
+        store.apply_snapshot(vec![make_entity("light.kitchen", "off")]);
+
+        let t0 = Timestamp::UNIX_EPOCH;
+
+        store
+            .insert_optimistic_entry(OptimisticEntry {
+                entity_id: EntityId::from("light.kitchen"),
+                request_id: 2,
+                dispatched_at: t0,
+                tentative_state: Arc::from("on"),
+                prior_state: Arc::from("off"),
+            })
+            .expect("insert must succeed within cap");
+
+        // Attribute-only event: last_changed == dispatched_at.
+        let mut attr_entity = make_entity("light.kitchen", "off");
+        attr_entity.last_changed = t0;
+
+        store.apply_event(EntityUpdate {
+            id: EntityId::from("light.kitchen"),
+            entity: Some(attr_entity),
+        });
+
+        assert!(
+            store.has_optimistic_entry(&EntityId::from("light.kitchen"), 2),
+            "rule 3: attribute-only event (same last_changed) must NOT drop the entry"
+        );
+    }
+
+    #[test]
+    fn apply_event_none_does_not_drop_optimistic_entries() {
+        // Removal events (entity: None) must not trigger optimistic
+        // reconciliation — the entry will timeout via rule 5.
+        use jiff::Timestamp;
+
+        let store = LiveStore::new();
+        store.apply_snapshot(vec![make_entity("light.gone", "on")]);
+
+        let t0 = Timestamp::UNIX_EPOCH;
+
+        store
+            .insert_optimistic_entry(OptimisticEntry {
+                entity_id: EntityId::from("light.gone"),
+                request_id: 3,
+                dispatched_at: t0,
+                tentative_state: Arc::from("off"),
+                prior_state: Arc::from("on"),
+            })
+            .expect("insert must succeed within cap");
+
+        // Removal event — entity: None.
+        store.apply_event(EntityUpdate {
+            id: EntityId::from("light.gone"),
+            entity: None,
+        });
+
+        assert!(
+            store.has_optimistic_entry(&EntityId::from("light.gone"), 3),
+            "removal event must NOT drop optimistic entries (rule 5 handles timeout)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_snapshot — batch path (multiple entities in one call)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_snapshot_batch_replaces_all_existing_entities() {
+        // Covers the batch-collect path inside apply_snapshot when multiple
+        // entities are passed in a single call (the reconnect resync case).
+        let store = LiveStore::new();
+
+        // Seed with an initial state.
+        store.apply_snapshot(vec![
+            make_entity("light.a", "on"),
+            make_entity("light.b", "off"),
+            make_entity("sensor.c", "20"),
+        ]);
+
+        // Batch resync: completely new set of entities.
+        store.apply_snapshot(vec![
+            make_entity("light.a", "off"),  // state changed
+            make_entity("sensor.c", "21"),  // state changed
+            make_entity("light.new", "on"), // new entity
+        ]);
+
+        // light.b must be gone — not in the new batch.
+        assert!(
+            store.get(&EntityId::from("light.b")).is_none(),
+            "apply_snapshot must replace the entire map; light.b must be absent"
+        );
+
+        // light.a state must reflect the new batch.
+        let a = store.get(&EntityId::from("light.a")).unwrap();
+        assert_eq!(&*a.state, "off");
+
+        // sensor.c state must reflect the new batch.
+        let c = store.get(&EntityId::from("sensor.c")).unwrap();
+        assert_eq!(&*c.state, "21");
+
+        // light.new must be present.
+        let new = store.get(&EntityId::from("light.new")).unwrap();
+        assert_eq!(&*new.state, "on");
+
+        let snap = store.snapshot();
+        assert_eq!(snap.len(), 3, "snapshot must contain exactly the new batch");
+    }
+
+    // -----------------------------------------------------------------------
+    // subscribe — slow path (write-lock creation) re-check
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn subscribe_slow_path_creates_sender_for_new_entity() {
+        // Exercises the write-lock slow path in subscribe: subscribing to an
+        // entity that has no existing sender forces creation of a new sender.
+        let store = LiveStore::new();
+        store.apply_snapshot(vec![make_entity("sensor.new", "5")]);
+
+        // First subscription for this id — must go through the slow path.
+        let rx = store.subscribe(&[EntityId::from("sensor.new")]);
+        // The receiver is valid (capacity-1 broadcast channel).
+        // We can verify by checking resubscribe works too.
+        let _rx2 = store.subscribe(&[EntityId::from("sensor.new")]);
+        drop(rx);
+        drop(_rx2);
+        // No panic = slow path and fast path both succeed.
+    }
 }
