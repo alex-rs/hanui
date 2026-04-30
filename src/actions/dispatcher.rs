@@ -980,6 +980,53 @@ impl Dispatcher {
                     optimistic_ctx,
                 )
             }
+
+            // Phase 6 typed variants (TASK-099): the types are landed here so
+            // downstream tickets (TASK-102..TASK-105, TASK-108, TASK-109) can
+            // wire dispatcher invocations without a separate type-only PR.
+            // Each returns NotImplementedYet until the per-tile dispatch wiring
+            // is added. Keep exhaustive — no wildcard — so future variant
+            // additions remain compile errors.
+            Action::SetTemperature { .. } => Err(DispatchError::NotImplementedYet {
+                what: "SetTemperature",
+                ticket: "TASK-103",
+            }),
+            Action::SetHvacMode { .. } => Err(DispatchError::NotImplementedYet {
+                what: "SetHvacMode",
+                ticket: "TASK-103",
+            }),
+            Action::SetMediaVolume { .. } => Err(DispatchError::NotImplementedYet {
+                what: "SetMediaVolume",
+                ticket: "TASK-104",
+            }),
+            Action::MediaTransport { .. } => Err(DispatchError::NotImplementedYet {
+                what: "MediaTransport",
+                ticket: "TASK-104",
+            }),
+            Action::SetCoverPosition { .. } => Err(DispatchError::NotImplementedYet {
+                what: "SetCoverPosition",
+                ticket: "TASK-105",
+            }),
+            Action::SetFanSpeed { .. } => Err(DispatchError::NotImplementedYet {
+                what: "SetFanSpeed",
+                ticket: "TASK-108",
+            }),
+            Action::Lock { .. } => Err(DispatchError::NotImplementedYet {
+                what: "Lock",
+                ticket: "TASK-102",
+            }),
+            Action::Unlock { .. } => Err(DispatchError::NotImplementedYet {
+                what: "Unlock",
+                ticket: "TASK-102",
+            }),
+            Action::AlarmArm { .. } => Err(DispatchError::NotImplementedYet {
+                what: "AlarmArm",
+                ticket: "TASK-109",
+            }),
+            Action::AlarmDisarm { .. } => Err(DispatchError::NotImplementedYet {
+                what: "AlarmDisarm",
+                ticket: "TASK-109",
+            }),
         }
     }
 
@@ -1207,6 +1254,24 @@ impl Dispatcher {
                     entity_id: entry.entity_id.clone(),
                 }))
             }
+
+            // Phase 6 typed variants (TASK-099): dispatcher wiring is deferred
+            // to TASK-102..TASK-105, TASK-108, TASK-109. Until those tickets
+            // wire the per-variant dispatch paths, returning `None` here lets
+            // the main `dispatch` match return `DispatchError::NotImplementedYet`
+            // regardless of connection state. No offline-queued toast fires,
+            // no phantom entry is enqueued. Kept exhaustive — no wildcard —
+            // so a future variant addition remains a compile error.
+            Action::SetTemperature { .. }
+            | Action::SetHvacMode { .. }
+            | Action::SetMediaVolume { .. }
+            | Action::MediaTransport { .. }
+            | Action::SetCoverPosition { .. }
+            | Action::SetFanSpeed { .. }
+            | Action::Lock { .. }
+            | Action::Unlock { .. }
+            | Action::AlarmArm { .. }
+            | Action::AlarmDisarm { .. } => None,
 
             // Idempotent WS-bound — try to enqueue. The queue's own
             // [`OfflineQueue::enqueue`] runs the runtime allowlist check
@@ -2509,6 +2574,40 @@ mod tests {
                 },
                 "xdg-open spawn failed",
             ),
+            (
+                DispatchError::BackpressureRejected {
+                    entity_id: EntityId::from("light.kitchen"),
+                    scope: BackpressureScope::PerEntity,
+                },
+                "per-entity backpressure",
+            ),
+            (
+                DispatchError::BackpressureRejected {
+                    entity_id: EntityId::from("light.kitchen"),
+                    scope: BackpressureScope::Global,
+                },
+                "global backpressure",
+            ),
+            (
+                DispatchError::OfflineNonIdempotent {
+                    entity_id: EntityId::from("light.kitchen"),
+                },
+                "non-idempotent",
+            ),
+            (
+                DispatchError::OfflineQueueRejected {
+                    entity_id: EntityId::from("light.kitchen"),
+                    reason: QueueRejectReason::ServiceNotAllowlisted,
+                },
+                "runtime allowlist",
+            ),
+            (
+                DispatchError::OfflineQueueRejected {
+                    entity_id: EntityId::from("light.kitchen"),
+                    reason: QueueRejectReason::UnsupportedVariant,
+                },
+                "unsupported variant",
+            ),
         ];
         for (err, expected_substr) in cases {
             let s = format!("{err}");
@@ -3640,5 +3739,571 @@ mod tests {
             assert_eq!(cmd.frame.data, Some(json!({ "marker": i })));
         }
         assert!(flush_rx.try_recv().is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6 typed variants (TASK-099) — dispatch returns NotImplementedYet
+    //
+    // Each of the 10 new Action variants added in TASK-099 has a match arm in
+    // `dispatch` that returns `Err(DispatchError::NotImplementedYet { .. })`.
+    // These tests cover those arms so the per-file coverage ratchet for
+    // `src/actions/dispatcher.rs` does not regress.  The tests also cover the
+    // `maybe_route_offline` arm that returns `None` for each variant, letting
+    // the main match produce `NotImplementedYet` even when the connection is
+    // offline.
+    // -----------------------------------------------------------------------
+
+    // ------ online path (dispatch match arms) ------
+
+    #[test]
+    fn phase6_set_temperature_dispatch_returns_not_implemented_yet() {
+        let services = handle_from(ServiceRegistry::new());
+        let (dispatcher, _rx) = make_dispatcher_with_recorder(services);
+        let action = Action::SetTemperature {
+            entity_id: "climate.living_room".to_owned(),
+            temperature: 21.5,
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("climate.living_room", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("SetTemperature must return NotImplementedYet");
+        match err {
+            DispatchError::NotImplementedYet { what, ticket } => {
+                assert_eq!(what, "SetTemperature");
+                assert_eq!(ticket, "TASK-103");
+            }
+            other => panic!("expected NotImplementedYet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase6_set_hvac_mode_dispatch_returns_not_implemented_yet() {
+        let services = handle_from(ServiceRegistry::new());
+        let (dispatcher, _rx) = make_dispatcher_with_recorder(services);
+        let action = Action::SetHvacMode {
+            entity_id: "climate.living_room".to_owned(),
+            mode: "heat".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("climate.living_room", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("SetHvacMode must return NotImplementedYet");
+        match err {
+            DispatchError::NotImplementedYet { what, ticket } => {
+                assert_eq!(what, "SetHvacMode");
+                assert_eq!(ticket, "TASK-103");
+            }
+            other => panic!("expected NotImplementedYet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase6_set_media_volume_dispatch_returns_not_implemented_yet() {
+        let services = handle_from(ServiceRegistry::new());
+        let (dispatcher, _rx) = make_dispatcher_with_recorder(services);
+        let action = Action::SetMediaVolume {
+            entity_id: "media_player.tv".to_owned(),
+            volume_level: 0.5,
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("media_player.tv", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("SetMediaVolume must return NotImplementedYet");
+        match err {
+            DispatchError::NotImplementedYet { what, ticket } => {
+                assert_eq!(what, "SetMediaVolume");
+                assert_eq!(ticket, "TASK-104");
+            }
+            other => panic!("expected NotImplementedYet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase6_media_transport_dispatch_returns_not_implemented_yet() {
+        use crate::actions::schema::MediaTransportOp;
+        let services = handle_from(ServiceRegistry::new());
+        let (dispatcher, _rx) = make_dispatcher_with_recorder(services);
+        let action = Action::MediaTransport {
+            entity_id: "media_player.tv".to_owned(),
+            transport: MediaTransportOp::Play,
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("media_player.tv", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("MediaTransport must return NotImplementedYet");
+        match err {
+            DispatchError::NotImplementedYet { what, ticket } => {
+                assert_eq!(what, "MediaTransport");
+                assert_eq!(ticket, "TASK-104");
+            }
+            other => panic!("expected NotImplementedYet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase6_set_cover_position_dispatch_returns_not_implemented_yet() {
+        let services = handle_from(ServiceRegistry::new());
+        let (dispatcher, _rx) = make_dispatcher_with_recorder(services);
+        let action = Action::SetCoverPosition {
+            entity_id: "cover.garage".to_owned(),
+            position: 50,
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("cover.garage", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("SetCoverPosition must return NotImplementedYet");
+        match err {
+            DispatchError::NotImplementedYet { what, ticket } => {
+                assert_eq!(what, "SetCoverPosition");
+                assert_eq!(ticket, "TASK-105");
+            }
+            other => panic!("expected NotImplementedYet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase6_set_fan_speed_dispatch_returns_not_implemented_yet() {
+        let services = handle_from(ServiceRegistry::new());
+        let (dispatcher, _rx) = make_dispatcher_with_recorder(services);
+        let action = Action::SetFanSpeed {
+            entity_id: "fan.bedroom".to_owned(),
+            speed: "high".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("fan.bedroom", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("SetFanSpeed must return NotImplementedYet");
+        match err {
+            DispatchError::NotImplementedYet { what, ticket } => {
+                assert_eq!(what, "SetFanSpeed");
+                assert_eq!(ticket, "TASK-108");
+            }
+            other => panic!("expected NotImplementedYet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase6_lock_dispatch_returns_not_implemented_yet() {
+        let services = handle_from(ServiceRegistry::new());
+        let (dispatcher, _rx) = make_dispatcher_with_recorder(services);
+        let action = Action::Lock {
+            entity_id: "lock.front_door".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("lock.front_door", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("Lock must return NotImplementedYet");
+        match err {
+            DispatchError::NotImplementedYet { what, ticket } => {
+                assert_eq!(what, "Lock");
+                assert_eq!(ticket, "TASK-102");
+            }
+            other => panic!("expected NotImplementedYet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase6_unlock_dispatch_returns_not_implemented_yet() {
+        let services = handle_from(ServiceRegistry::new());
+        let (dispatcher, _rx) = make_dispatcher_with_recorder(services);
+        let action = Action::Unlock {
+            entity_id: "lock.front_door".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("lock.front_door", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("Unlock must return NotImplementedYet");
+        match err {
+            DispatchError::NotImplementedYet { what, ticket } => {
+                assert_eq!(what, "Unlock");
+                assert_eq!(ticket, "TASK-102");
+            }
+            other => panic!("expected NotImplementedYet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase6_alarm_arm_dispatch_returns_not_implemented_yet() {
+        let services = handle_from(ServiceRegistry::new());
+        let (dispatcher, _rx) = make_dispatcher_with_recorder(services);
+        let action = Action::AlarmArm {
+            entity_id: "alarm_control_panel.home".to_owned(),
+            mode: "home".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with(
+                "alarm_control_panel.home",
+                action,
+                Action::None,
+                Action::None,
+            ),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("AlarmArm must return NotImplementedYet");
+        match err {
+            DispatchError::NotImplementedYet { what, ticket } => {
+                assert_eq!(what, "AlarmArm");
+                assert_eq!(ticket, "TASK-109");
+            }
+            other => panic!("expected NotImplementedYet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase6_alarm_disarm_dispatch_returns_not_implemented_yet() {
+        let services = handle_from(ServiceRegistry::new());
+        let (dispatcher, _rx) = make_dispatcher_with_recorder(services);
+        let action = Action::AlarmDisarm {
+            entity_id: "alarm_control_panel.home".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with(
+                "alarm_control_panel.home",
+                action,
+                Action::None,
+                Action::None,
+            ),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("AlarmDisarm must return NotImplementedYet");
+        match err {
+            DispatchError::NotImplementedYet { what, ticket } => {
+                assert_eq!(what, "AlarmDisarm");
+                assert_eq!(ticket, "TASK-109");
+            }
+            other => panic!("expected NotImplementedYet, got {other:?}"),
+        }
+    }
+
+    // ------ offline path (maybe_route_offline returns None → dispatch arm) ------
+    //
+    // When connection is not Live, `maybe_route_offline` is called first. For
+    // Phase 6 variants it returns `None` (no offline toast, no queue entry),
+    // letting the main `dispatch` match fall through to `NotImplementedYet`.
+    // These tests hit both the `maybe_route_offline` Phase 6 arm AND the
+    // corresponding `dispatch` arm, ensuring both code paths are covered.
+
+    #[test]
+    fn phase6_set_temperature_offline_returns_not_implemented_yet() {
+        let (dispatcher, _cmd_rx, _toast_rx, _queue, _state_tx) = make_offline_fixture();
+        let action = Action::SetTemperature {
+            entity_id: "climate.living_room".to_owned(),
+            temperature: 22.0,
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("climate.living_room", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("SetTemperature offline must return NotImplementedYet");
+        assert!(
+            matches!(
+                err,
+                DispatchError::NotImplementedYet {
+                    what: "SetTemperature",
+                    ..
+                }
+            ),
+            "expected NotImplementedYet for SetTemperature, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn phase6_set_hvac_mode_offline_returns_not_implemented_yet() {
+        let (dispatcher, _cmd_rx, _toast_rx, _queue, _state_tx) = make_offline_fixture();
+        let action = Action::SetHvacMode {
+            entity_id: "climate.living_room".to_owned(),
+            mode: "cool".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("climate.living_room", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("SetHvacMode offline must return NotImplementedYet");
+        assert!(
+            matches!(
+                err,
+                DispatchError::NotImplementedYet {
+                    what: "SetHvacMode",
+                    ..
+                }
+            ),
+            "expected NotImplementedYet for SetHvacMode, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn phase6_set_media_volume_offline_returns_not_implemented_yet() {
+        let (dispatcher, _cmd_rx, _toast_rx, _queue, _state_tx) = make_offline_fixture();
+        let action = Action::SetMediaVolume {
+            entity_id: "media_player.tv".to_owned(),
+            volume_level: 0.3,
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("media_player.tv", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("SetMediaVolume offline must return NotImplementedYet");
+        assert!(
+            matches!(
+                err,
+                DispatchError::NotImplementedYet {
+                    what: "SetMediaVolume",
+                    ..
+                }
+            ),
+            "expected NotImplementedYet for SetMediaVolume, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn phase6_media_transport_offline_returns_not_implemented_yet() {
+        use crate::actions::schema::MediaTransportOp;
+        let (dispatcher, _cmd_rx, _toast_rx, _queue, _state_tx) = make_offline_fixture();
+        let action = Action::MediaTransport {
+            entity_id: "media_player.tv".to_owned(),
+            transport: MediaTransportOp::Pause,
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("media_player.tv", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("MediaTransport offline must return NotImplementedYet");
+        assert!(
+            matches!(
+                err,
+                DispatchError::NotImplementedYet {
+                    what: "MediaTransport",
+                    ..
+                }
+            ),
+            "expected NotImplementedYet for MediaTransport, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn phase6_set_cover_position_offline_returns_not_implemented_yet() {
+        let (dispatcher, _cmd_rx, _toast_rx, _queue, _state_tx) = make_offline_fixture();
+        let action = Action::SetCoverPosition {
+            entity_id: "cover.garage".to_owned(),
+            position: 75,
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("cover.garage", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("SetCoverPosition offline must return NotImplementedYet");
+        assert!(
+            matches!(
+                err,
+                DispatchError::NotImplementedYet {
+                    what: "SetCoverPosition",
+                    ..
+                }
+            ),
+            "expected NotImplementedYet for SetCoverPosition, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn phase6_set_fan_speed_offline_returns_not_implemented_yet() {
+        let (dispatcher, _cmd_rx, _toast_rx, _queue, _state_tx) = make_offline_fixture();
+        let action = Action::SetFanSpeed {
+            entity_id: "fan.bedroom".to_owned(),
+            speed: "low".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("fan.bedroom", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("SetFanSpeed offline must return NotImplementedYet");
+        assert!(
+            matches!(
+                err,
+                DispatchError::NotImplementedYet {
+                    what: "SetFanSpeed",
+                    ..
+                }
+            ),
+            "expected NotImplementedYet for SetFanSpeed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn phase6_lock_offline_returns_not_implemented_yet() {
+        let (dispatcher, _cmd_rx, _toast_rx, _queue, _state_tx) = make_offline_fixture();
+        let action = Action::Lock {
+            entity_id: "lock.front_door".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("lock.front_door", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("Lock offline must return NotImplementedYet");
+        assert!(
+            matches!(err, DispatchError::NotImplementedYet { what: "Lock", .. }),
+            "expected NotImplementedYet for Lock, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn phase6_unlock_offline_returns_not_implemented_yet() {
+        let (dispatcher, _cmd_rx, _toast_rx, _queue, _state_tx) = make_offline_fixture();
+        let action = Action::Unlock {
+            entity_id: "lock.front_door".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("lock.front_door", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("Unlock offline must return NotImplementedYet");
+        assert!(
+            matches!(err, DispatchError::NotImplementedYet { what: "Unlock", .. }),
+            "expected NotImplementedYet for Unlock, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn phase6_alarm_arm_offline_returns_not_implemented_yet() {
+        let (dispatcher, _cmd_rx, _toast_rx, _queue, _state_tx) = make_offline_fixture();
+        let action = Action::AlarmArm {
+            entity_id: "alarm_control_panel.home".to_owned(),
+            mode: "away".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with(
+                "alarm_control_panel.home",
+                action,
+                Action::None,
+                Action::None,
+            ),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("AlarmArm offline must return NotImplementedYet");
+        assert!(
+            matches!(
+                err,
+                DispatchError::NotImplementedYet {
+                    what: "AlarmArm",
+                    ..
+                }
+            ),
+            "expected NotImplementedYet for AlarmArm, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn phase6_alarm_disarm_offline_returns_not_implemented_yet() {
+        let (dispatcher, _cmd_rx, _toast_rx, _queue, _state_tx) = make_offline_fixture();
+        let action = Action::AlarmDisarm {
+            entity_id: "alarm_control_panel.home".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with(
+                "alarm_control_panel.home",
+                action,
+                Action::None,
+                Action::None,
+            ),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("AlarmDisarm offline must return NotImplementedYet");
+        assert!(
+            matches!(
+                err,
+                DispatchError::NotImplementedYet {
+                    what: "AlarmDisarm",
+                    ..
+                }
+            ),
+            "expected NotImplementedYet for AlarmDisarm, got {err:?}"
+        );
     }
 }

@@ -412,6 +412,25 @@ impl OfflineQueue {
             Action::MoreInfo | Action::Navigate { .. } | Action::None => {
                 return Err(QueueError::UnsupportedVariant);
             }
+            // Phase 6 typed variants (TASK-099): dispatcher wiring is deferred
+            // to TASK-102..TASK-105, TASK-108, TASK-109. Until those tickets
+            // wire the per-variant dispatch paths, the offline queue treats
+            // them as UnsupportedVariant — the dispatcher returns
+            // NotImplementedYet before routing them here, so this branch is
+            // unreachable in practice. Kept exhaustive so a future variant
+            // addition remains a compile error.
+            Action::SetTemperature { .. }
+            | Action::SetHvacMode { .. }
+            | Action::SetMediaVolume { .. }
+            | Action::MediaTransport { .. }
+            | Action::SetCoverPosition { .. }
+            | Action::SetFanSpeed { .. }
+            | Action::Lock { .. }
+            | Action::Unlock { .. }
+            | Action::AlarmArm { .. }
+            | Action::AlarmDisarm { .. } => {
+                return Err(QueueError::UnsupportedVariant);
+            }
             // Toggle / Url already rejected by gate 1 — match exhaustively
             // so a future Action variant addition is a compile error
             // surfacing this exact decision.

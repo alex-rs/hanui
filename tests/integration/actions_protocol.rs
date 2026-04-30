@@ -50,6 +50,8 @@ use hanui::actions::dispatcher::{
 };
 use hanui::actions::map::{WidgetActionEntry, WidgetActionMap, WidgetId};
 use hanui::actions::queue::OfflineQueue;
+use hanui::actions::schema::MediaTransportOp;
+use hanui::actions::service_map::action_to_service_call;
 use hanui::actions::timing::{ActionOverlapStrategy, ActionTiming};
 use hanui::actions::url::{TOAST_ASK_PHASE_6, TOAST_BLOCKED_BY_PROFILE};
 use hanui::actions::Action;
@@ -1568,4 +1570,199 @@ async fn backpressure_rejected_at_per_entity_cap_emits_typed_err_and_toast() {
         0,
         "no OutboundCommand on rejected dispatch"
     );
+}
+
+// ===========================================================================
+// SECTION 9 — Phase 6 wire-format encoder (TASK-099)
+// ===========================================================================
+//
+// Verifies that `service_map::action_to_service_call` produces the correct
+// `(domain, service, data)` triple for every new Phase 6 Action variant per
+// `locked_decisions.idempotency_marker_phase6_variants`.
+//
+// These tests exercise the wire-format encoder path that TASK-102..TASK-109
+// dispatcher wiring will invoke. The dispatcher returns `NotImplementedYet`
+// for these variants until those tickets land — so the integration boundary
+// tested here is `action_to_service_call` itself, not the full dispatcher.
+
+// 23. Every new Phase 6 variant produces the correct call_service frame fields.
+#[test]
+fn phase6_variants_emit_correct_call_service_frame() {
+    // SetTemperature → climate.set_temperature with temperature data.
+    {
+        let action = Action::SetTemperature {
+            entity_id: "climate.living_room".to_string(),
+            temperature: 21.5,
+        };
+        let call = action_to_service_call(&action)
+            .expect("SetTemperature must not error")
+            .expect("SetTemperature must return Some(ServiceCall)");
+        assert_eq!(call.domain, "climate", "SetTemperature domain");
+        assert_eq!(call.service, "set_temperature", "SetTemperature service");
+        let data = call.data.expect("SetTemperature must have data");
+        assert_eq!(
+            data["temperature"].as_f64().unwrap(),
+            21.5,
+            "SetTemperature temperature field"
+        );
+    }
+
+    // SetHvacMode → climate.set_hvac_mode with hvac_mode data.
+    {
+        let action = Action::SetHvacMode {
+            entity_id: "climate.living_room".to_string(),
+            mode: "heat".to_string(),
+        };
+        let call = action_to_service_call(&action)
+            .expect("SetHvacMode must not error")
+            .expect("SetHvacMode must return Some(ServiceCall)");
+        assert_eq!(call.domain, "climate", "SetHvacMode domain");
+        assert_eq!(call.service, "set_hvac_mode", "SetHvacMode service");
+        let data = call.data.expect("SetHvacMode must have data");
+        assert_eq!(data["hvac_mode"], "heat", "SetHvacMode hvac_mode field");
+    }
+
+    // SetMediaVolume → media_player.volume_set with volume_level data.
+    {
+        let action = Action::SetMediaVolume {
+            entity_id: "media_player.tv".to_string(),
+            volume_level: 0.5,
+        };
+        let call = action_to_service_call(&action)
+            .expect("SetMediaVolume must not error")
+            .expect("SetMediaVolume must return Some(ServiceCall)");
+        assert_eq!(call.domain, "media_player", "SetMediaVolume domain");
+        assert_eq!(call.service, "volume_set", "SetMediaVolume service");
+        let data = call.data.expect("SetMediaVolume must have data");
+        assert!(
+            (data["volume_level"].as_f64().unwrap() - 0.5).abs() < f64::EPSILON,
+            "SetMediaVolume volume_level field"
+        );
+    }
+
+    // MediaTransport variants — each op maps to a distinct service.
+    let transport_cases = [
+        (MediaTransportOp::Play, "media_play"),
+        (MediaTransportOp::Pause, "media_pause"),
+        (MediaTransportOp::Stop, "media_stop"),
+        (MediaTransportOp::Next, "media_next_track"),
+        (MediaTransportOp::Prev, "media_previous_track"),
+    ];
+    for (op, expected_service) in &transport_cases {
+        let action = Action::MediaTransport {
+            entity_id: "media_player.tv".to_string(),
+            transport: *op,
+        };
+        let call = action_to_service_call(&action)
+            .unwrap_or_else(|e| panic!("MediaTransport({op:?}) must not error: {e}"))
+            .unwrap_or_else(|| panic!("MediaTransport({op:?}) must return Some(ServiceCall)"));
+        assert_eq!(call.domain, "media_player", "MediaTransport({op:?}) domain");
+        assert_eq!(
+            call.service, *expected_service,
+            "MediaTransport({op:?}) service"
+        );
+        // Transport commands carry no data (entity target only).
+        assert!(
+            call.data.is_none(),
+            "MediaTransport({op:?}) must have no data"
+        );
+    }
+
+    // SetCoverPosition → cover.set_cover_position with position data.
+    {
+        let action = Action::SetCoverPosition {
+            entity_id: "cover.garage".to_string(),
+            position: 75,
+        };
+        let call = action_to_service_call(&action)
+            .expect("SetCoverPosition must not error")
+            .expect("SetCoverPosition must return Some(ServiceCall)");
+        assert_eq!(call.domain, "cover", "SetCoverPosition domain");
+        assert_eq!(
+            call.service, "set_cover_position",
+            "SetCoverPosition service"
+        );
+        let data = call.data.expect("SetCoverPosition must have data");
+        assert_eq!(data["position"], 75, "SetCoverPosition position field");
+    }
+
+    // SetFanSpeed → fan.turn_on with preset_mode data (non-empty speed).
+    {
+        let action = Action::SetFanSpeed {
+            entity_id: "fan.bedroom".to_string(),
+            speed: "high".to_string(),
+        };
+        let call = action_to_service_call(&action)
+            .expect("SetFanSpeed must not error for known speed")
+            .expect("SetFanSpeed must return Some(ServiceCall)");
+        assert_eq!(call.domain, "fan", "SetFanSpeed domain");
+        assert_eq!(call.service, "turn_on", "SetFanSpeed service");
+        let data = call.data.expect("SetFanSpeed must have data");
+        assert_eq!(data["preset_mode"], "high", "SetFanSpeed preset_mode field");
+    }
+
+    // Lock → lock.lock, no data.
+    {
+        let action = Action::Lock {
+            entity_id: "lock.front_door".to_string(),
+        };
+        let call = action_to_service_call(&action)
+            .expect("Lock must not error")
+            .expect("Lock must return Some(ServiceCall)");
+        assert_eq!(call.domain, "lock", "Lock domain");
+        assert_eq!(call.service, "lock", "Lock service");
+        assert!(call.data.is_none(), "Lock must have no data");
+    }
+
+    // Unlock → lock.unlock, no data.
+    {
+        let action = Action::Unlock {
+            entity_id: "lock.front_door".to_string(),
+        };
+        let call = action_to_service_call(&action)
+            .expect("Unlock must not error")
+            .expect("Unlock must return Some(ServiceCall)");
+        assert_eq!(call.domain, "lock", "Unlock domain");
+        assert_eq!(call.service, "unlock", "Unlock service");
+        assert!(call.data.is_none(), "Unlock must have no data");
+    }
+
+    // AlarmArm — all five standard modes must map to correct HA services.
+    let alarm_arm_cases = [
+        ("home", "alarm_arm_home"),
+        ("away", "alarm_arm_away"),
+        ("night", "alarm_arm_night"),
+        ("vacation", "alarm_arm_vacation"),
+        ("custom_bypass", "alarm_arm_custom_bypass"),
+    ];
+    for (mode, expected_service) in &alarm_arm_cases {
+        let action = Action::AlarmArm {
+            entity_id: "alarm_control_panel.home".to_string(),
+            mode: mode.to_string(),
+        };
+        let call = action_to_service_call(&action)
+            .unwrap_or_else(|e| panic!("AlarmArm(mode={mode}) must not error: {e}"))
+            .unwrap_or_else(|| panic!("AlarmArm(mode={mode}) must return Some(ServiceCall)"));
+        assert_eq!(
+            call.domain, "alarm_control_panel",
+            "AlarmArm(mode={mode}) domain"
+        );
+        assert_eq!(
+            call.service, *expected_service,
+            "AlarmArm(mode={mode}) service"
+        );
+    }
+
+    // AlarmDisarm → alarm_control_panel.alarm_disarm, no data.
+    {
+        let action = Action::AlarmDisarm {
+            entity_id: "alarm_control_panel.home".to_string(),
+        };
+        let call = action_to_service_call(&action)
+            .expect("AlarmDisarm must not error")
+            .expect("AlarmDisarm must return Some(ServiceCall)");
+        assert_eq!(call.domain, "alarm_control_panel", "AlarmDisarm domain");
+        assert_eq!(call.service, "alarm_disarm", "AlarmDisarm service");
+        assert!(call.data.is_none(), "AlarmDisarm must have no data");
+    }
 }

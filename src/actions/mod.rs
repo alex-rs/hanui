@@ -16,6 +16,7 @@ pub mod dispatcher;
 pub mod map;
 pub mod queue;
 pub mod schema;
+pub mod service_map;
 pub mod timing;
 pub mod url;
 
