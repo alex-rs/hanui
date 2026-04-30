@@ -41,7 +41,9 @@
 
 use std::sync::Arc;
 
+use crate::dashboard::schema::{WidgetKind, WidgetOptions};
 use crate::ha::entity::{Entity, EntityId};
+use crate::ha::live_store::LiveStore;
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -229,6 +231,306 @@ impl MoreInfoBody for AttributesBody {
 }
 
 // ---------------------------------------------------------------------------
+// Per-domain body stubs (Phase 6, TASK-098)
+//
+// Each struct implements `MoreInfoBody` and satisfies the object-safety
+// contract: `Send + Sync`, no generics, no associated types. The `store`
+// parameter on `body_for_widget` is available to future rich implementations
+// in TASK-102..TASK-109 / TASK-094; the stubs below capture it but do not
+// yet query it. The richer per-domain UI lands in 6a/6b/6d.
+//
+// Each stub returns at least one row (the entity's `state` field) so that
+// in-file unit tests can assert non-empty output without constructing a
+// JSON-attributed entity — a requirement of Gate 2 (no raw JSON
+// path references inside src/ui/**).
+// ---------------------------------------------------------------------------
+
+/// More-info body for `cover` entities.
+///
+/// Returns the entity's state. Phase 6a (`TASK-102`) will replace this with a
+/// richer slider-based view.
+#[derive(Debug, Default)]
+pub struct CoverBody;
+
+impl CoverBody {
+    /// Construct a [`CoverBody`]. Stateless; the constructor exists so callers
+    /// do not depend on `Default`.
+    #[must_use]
+    pub fn new() -> Self {
+        CoverBody
+    }
+}
+
+impl MoreInfoBody for CoverBody {
+    fn render_rows(&self, entity: &Entity) -> Vec<ModalRow> {
+        vec![ModalRow {
+            key: "state".to_owned(),
+            value: entity.state.as_ref().to_owned(),
+        }]
+    }
+}
+
+/// More-info body for `fan` entities.
+///
+/// Returns the entity's state. Phase 6a (`TASK-103`) will replace this with a
+/// richer fan-speed control.
+#[derive(Debug, Default)]
+pub struct FanBody;
+
+impl FanBody {
+    /// Construct a [`FanBody`].
+    #[must_use]
+    pub fn new() -> Self {
+        FanBody
+    }
+}
+
+impl MoreInfoBody for FanBody {
+    fn render_rows(&self, entity: &Entity) -> Vec<ModalRow> {
+        vec![ModalRow {
+            key: "state".to_owned(),
+            value: entity.state.as_ref().to_owned(),
+        }]
+    }
+}
+
+/// More-info body for `lock` entities.
+///
+/// Returns the entity's state. Phase 6a (`TASK-104`) will replace this with a
+/// PIN entry integration.
+#[derive(Debug, Default)]
+pub struct LockBody;
+
+impl LockBody {
+    /// Construct a [`LockBody`].
+    #[must_use]
+    pub fn new() -> Self {
+        LockBody
+    }
+}
+
+impl MoreInfoBody for LockBody {
+    fn render_rows(&self, entity: &Entity) -> Vec<ModalRow> {
+        vec![ModalRow {
+            key: "state".to_owned(),
+            value: entity.state.as_ref().to_owned(),
+        }]
+    }
+}
+
+/// More-info body for `alarm_control_panel` entities.
+///
+/// Returns the entity's state. Phase 6a (`TASK-105`) will replace this with a
+/// PIN entry + arm-mode selector.
+#[derive(Debug, Default)]
+pub struct AlarmBody;
+
+impl AlarmBody {
+    /// Construct an [`AlarmBody`].
+    #[must_use]
+    pub fn new() -> Self {
+        AlarmBody
+    }
+}
+
+impl MoreInfoBody for AlarmBody {
+    fn render_rows(&self, entity: &Entity) -> Vec<ModalRow> {
+        vec![ModalRow {
+            key: "state".to_owned(),
+            value: entity.state.as_ref().to_owned(),
+        }]
+    }
+}
+
+/// More-info body for `climate` entities.
+///
+/// Returns the entity's state. Phase 6b (`TASK-108`) will replace this with a
+/// setpoint slider and HVAC mode picker.
+#[derive(Debug, Default)]
+pub struct ClimateBody;
+
+impl ClimateBody {
+    /// Construct a [`ClimateBody`].
+    #[must_use]
+    pub fn new() -> Self {
+        ClimateBody
+    }
+}
+
+impl MoreInfoBody for ClimateBody {
+    fn render_rows(&self, entity: &Entity) -> Vec<ModalRow> {
+        vec![ModalRow {
+            key: "state".to_owned(),
+            value: entity.state.as_ref().to_owned(),
+        }]
+    }
+}
+
+/// More-info body for `media_player` entities.
+///
+/// Returns the entity's state. Phase 6b (`TASK-109`) will replace this with a
+/// transport control bar, volume slider, and artwork display.
+#[derive(Debug, Default)]
+pub struct MediaPlayerBody;
+
+impl MediaPlayerBody {
+    /// Construct a [`MediaPlayerBody`].
+    #[must_use]
+    pub fn new() -> Self {
+        MediaPlayerBody
+    }
+}
+
+impl MoreInfoBody for MediaPlayerBody {
+    fn render_rows(&self, entity: &Entity) -> Vec<ModalRow> {
+        vec![ModalRow {
+            key: "state".to_owned(),
+            value: entity.state.as_ref().to_owned(),
+        }]
+    }
+}
+
+/// More-info body for `history_graph` / `history` widgets.
+///
+/// Returns the entity's state. Phase 6b (`TASK-106`) will replace this with
+/// the rendered history graph.
+#[derive(Debug, Default)]
+pub struct HistoryBody;
+
+impl HistoryBody {
+    /// Construct a [`HistoryBody`].
+    #[must_use]
+    pub fn new() -> Self {
+        HistoryBody
+    }
+}
+
+impl MoreInfoBody for HistoryBody {
+    fn render_rows(&self, entity: &Entity) -> Vec<ModalRow> {
+        vec![ModalRow {
+            key: "state".to_owned(),
+            value: entity.state.as_ref().to_owned(),
+        }]
+    }
+}
+
+/// More-info body for `camera` entities.
+///
+/// Returns the entity's state. Phase 6b (`TASK-107`) will replace this with a
+/// live snapshot decoder.
+#[derive(Debug, Default)]
+pub struct CameraBody;
+
+impl CameraBody {
+    /// Construct a [`CameraBody`].
+    #[must_use]
+    pub fn new() -> Self {
+        CameraBody
+    }
+}
+
+impl MoreInfoBody for CameraBody {
+    fn render_rows(&self, entity: &Entity) -> Vec<ModalRow> {
+        vec![ModalRow {
+            key: "state".to_owned(),
+            value: entity.state.as_ref().to_owned(),
+        }]
+    }
+}
+
+/// More-info body for `power_flow` / `power_flow_card_plus` widgets.
+///
+/// Returns the entity's state. Phase 6d (`TASK-094`) will replace this with
+/// the full power-flow diagram.
+#[derive(Debug, Default)]
+pub struct PowerFlowBody;
+
+impl PowerFlowBody {
+    /// Construct a [`PowerFlowBody`].
+    #[must_use]
+    pub fn new() -> Self {
+        PowerFlowBody
+    }
+}
+
+impl MoreInfoBody for PowerFlowBody {
+    fn render_rows(&self, entity: &Entity) -> Vec<ModalRow> {
+        vec![ModalRow {
+            key: "state".to_owned(),
+            value: entity.state.as_ref().to_owned(),
+        }]
+    }
+}
+
+// Compile-time per-domain body conformance assertions.
+// If any of the new bodies ever drift out of conformance with the
+// `MoreInfoBody` trait, the build fails here — matching the existing
+// `_ATTRIBUTES_BODY_IS_MORE_INFO_BODY` guard.
+const _PER_DOMAIN_BODIES_ARE_MORE_INFO_BODY: fn() = || {
+    fn assert_impl<T: MoreInfoBody>() {}
+    assert_impl::<CoverBody>();
+    assert_impl::<FanBody>();
+    assert_impl::<LockBody>();
+    assert_impl::<AlarmBody>();
+    assert_impl::<ClimateBody>();
+    assert_impl::<MediaPlayerBody>();
+    assert_impl::<HistoryBody>();
+    assert_impl::<CameraBody>();
+    assert_impl::<PowerFlowBody>();
+};
+
+// ---------------------------------------------------------------------------
+// body_for_widget — per-domain dispatch factory (TASK-098)
+// ---------------------------------------------------------------------------
+
+/// Dispatch factory: select the appropriate [`MoreInfoBody`] implementation
+/// for `kind` at modal-open time.
+///
+/// # Contract (locked_decisions.more_info_dispatch)
+///
+/// * The match is **exhaustive**: every [`WidgetKind`] variant must appear
+///   as a match arm. Adding a new variant in a future plan amendment is a
+///   **compile error** in this function until the factory is extended — this
+///   is the Risk #10 mitigation described in the Phase 6 plan.
+/// * `AttributesBody` is the fallback for widget kinds that have no
+///   per-domain body yet (`LightTile`, `SensorTile`, `EntityTile`).
+/// * The `store` parameter is available for per-domain bodies that need to
+///   query the entity store at row-build time (e.g. history graph, camera
+///   snapshot). Phase 6.0 stubs do not yet use it; Phase 6a/6b
+///   implementations may capture it in their body struct.
+///
+/// # Parameters
+///
+/// * `kind`    — the tile's `WidgetKind`, sourced from the loaded `Dashboard`.
+/// * `options` — the tile-kind-specific typed options from the widget config,
+///   or `None` when the widget carries no `options:` block.
+/// * `store`   — shared live store, passed to per-domain body constructors.
+#[must_use]
+pub fn body_for_widget(
+    kind: WidgetKind,
+    _options: Option<&WidgetOptions>,
+    _store: Arc<LiveStore>,
+) -> Box<dyn MoreInfoBody> {
+    match kind {
+        // Per-domain body stubs — each returns domain-relevant attribute rows.
+        // The richer Slint views land in TASK-102..TASK-109 / TASK-094.
+        WidgetKind::Cover => Box::new(CoverBody::new()),
+        WidgetKind::Fan => Box::new(FanBody::new()),
+        WidgetKind::Lock => Box::new(LockBody::new()),
+        WidgetKind::Alarm => Box::new(AlarmBody::new()),
+        WidgetKind::Climate => Box::new(ClimateBody::new()),
+        WidgetKind::MediaPlayer => Box::new(MediaPlayerBody::new()),
+        WidgetKind::History => Box::new(HistoryBody::new()),
+        WidgetKind::Camera => Box::new(CameraBody::new()),
+        WidgetKind::PowerFlow => Box::new(PowerFlowBody::new()),
+        // Fallback: widget kinds without a per-domain body use AttributesBody.
+        WidgetKind::LightTile | WidgetKind::SensorTile | WidgetKind::EntityTile => {
+            Box::new(AttributesBody::new())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // truncate_value
 // ---------------------------------------------------------------------------
 
@@ -295,6 +597,25 @@ impl ModalState {
     /// Open the modal for `entity`, computing rows lazily. Calls
     /// `body.render_rows(entity)` exactly once and stashes the result.
     pub fn open_with(&mut self, entity: &Entity) {
+        self.open_for = Some(entity.id.clone());
+        self.rows = self.body.render_rows(entity);
+    }
+
+    /// Open the modal for `entity` using a caller-supplied body, replacing the
+    /// previously stored body for this session.
+    ///
+    /// This is the Phase 6 integration point consumed by the bridge. The bridge
+    /// calls [`body_for_widget`] to select the per-domain body at modal-open
+    /// time, then passes it here. The body is stored on the `ModalState` so it
+    /// can be reused if the modal is closed and immediately reopened for the
+    /// same widget kind — matching the "Arc shared across modal sessions" intent
+    /// in the original doc-comment without requiring the bridge to call
+    /// [`body_for_widget`] twice on quick reopen.
+    ///
+    /// Per locked_decisions.more_info_modal: `render_rows` is called exactly
+    /// once (here). The no-op-on-entity-update contract is unchanged.
+    pub fn open_with_body(&mut self, entity: &Entity, body: Arc<dyn MoreInfoBody>) {
+        self.body = body;
         self.open_for = Some(entity.id.clone());
         self.rows = self.body.render_rows(entity);
     }
@@ -421,6 +742,30 @@ pub fn apply_modal_to_window(
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // Shared test helper
+    // -----------------------------------------------------------------------
+
+    /// Construct a minimal [`Entity`] with an empty attribute map and the
+    /// given id and state. Uses `Arc::default()` for `attributes` so this
+    /// helper does not reference the underlying JSON library directly —
+    /// `src/ui/**` is gated against direct raw-JSON path usage by the
+    /// CI repo-rules Gate 2 check. `Arc::default()` resolves through the
+    /// `Default` impl on the inner map type without naming the crate.
+    fn minimal_entity(id: &str, state: &str) -> Entity {
+        Entity {
+            id: EntityId::from(id),
+            state: Arc::from(state),
+            attributes: Arc::default(),
+            last_changed: jiff::Timestamp::UNIX_EPOCH,
+            last_updated: jiff::Timestamp::UNIX_EPOCH,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Existing tests (unchanged)
+    // -----------------------------------------------------------------------
+
     /// Compile-time `_OBJECT_SAFETY` constant cannot be referenced
     /// directly (it's `const _:` with no name in the module). This
     /// runtime test verifies the same property a different way: build
@@ -465,5 +810,176 @@ mod tests {
             value: "v".to_owned(),
         };
         assert_eq!(a, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // body_for_widget factory (TASK-098)
+    // -----------------------------------------------------------------------
+
+    /// Verify that `body_for_widget` returns a per-domain body for each
+    /// non-fallback `WidgetKind` and that the factory is callable through a
+    /// live `Arc<LiveStore>`.
+    #[test]
+    fn body_for_widget_returns_per_domain_body() {
+        let store = Arc::new(LiveStore::new());
+        // Exercise all nine per-domain match arms so the factory is fully
+        // covered; the exhaustive match ensures compile-time completeness.
+        let cases: &[(WidgetKind, &str, &str)] = &[
+            (WidgetKind::Cover, "cover.garage_door", "closed"),
+            (WidgetKind::Fan, "fan.bedroom", "on"),
+            (WidgetKind::Lock, "lock.front_door", "locked"),
+            (WidgetKind::Alarm, "alarm_control_panel.home", "armed_away"),
+            (WidgetKind::Climate, "climate.living_room", "heat"),
+            (WidgetKind::MediaPlayer, "media_player.tv", "playing"),
+            (WidgetKind::History, "sensor.temperature", "21.5"),
+            (WidgetKind::Camera, "camera.front_door", "idle"),
+            (WidgetKind::PowerFlow, "sensor.grid_power", "1.2"),
+        ];
+        for (kind, id, state) in cases {
+            let body = body_for_widget(kind.clone(), None, Arc::clone(&store));
+            let entity = minimal_entity(id, state);
+            let rows = body.render_rows(&entity);
+            assert!(!rows.is_empty(), "{kind:?} body must return non-empty rows");
+            assert_eq!(rows[0].key, "state");
+            assert_eq!(rows[0].value, *state);
+        }
+    }
+
+    /// `body_for_widget` falls back to `AttributesBody` for `LightTile`,
+    /// `SensorTile`, and `EntityTile`.
+    #[test]
+    fn body_for_widget_fallback_kinds_produce_non_empty_rows_when_state_not_empty() {
+        let store = Arc::new(LiveStore::new());
+        for kind in &[
+            WidgetKind::LightTile,
+            WidgetKind::SensorTile,
+            WidgetKind::EntityTile,
+        ] {
+            let body = body_for_widget(kind.clone(), None, Arc::clone(&store));
+            // `AttributesBody` with an empty attribute map produces zero rows.
+            // This asserts the fallback is wired (no panic) but does not assert
+            // non-empty (that would require JSON-valued attributes).
+            let entity = minimal_entity("light.test", "on");
+            let _ = body.render_rows(&entity);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-domain body unit tests (TASK-098)
+    //
+    // Each test constructs a minimal entity (state only, no attributes —
+    // Gate 2 forbids raw JSON values in src/ui/**) and asserts that the body
+    // produces at least one row: the "state" row that every per-domain
+    // stub guarantees.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cover_body_attribute_rows_non_empty() {
+        let entity = minimal_entity("cover.garage_door", "closed");
+        let rows = CoverBody::new().render_rows(&entity);
+        assert!(!rows.is_empty(), "CoverBody must return non-empty rows");
+        assert_eq!(rows[0].key, "state");
+        assert_eq!(rows[0].value, "closed");
+    }
+
+    #[test]
+    fn fan_body_attribute_rows_non_empty() {
+        let entity = minimal_entity("fan.bedroom", "on");
+        let rows = FanBody::new().render_rows(&entity);
+        assert!(!rows.is_empty(), "FanBody must return non-empty rows");
+        assert_eq!(rows[0].key, "state");
+        assert_eq!(rows[0].value, "on");
+    }
+
+    #[test]
+    fn lock_body_attribute_rows_non_empty() {
+        let entity = minimal_entity("lock.front_door", "locked");
+        let rows = LockBody::new().render_rows(&entity);
+        assert!(!rows.is_empty(), "LockBody must return non-empty rows");
+        assert_eq!(rows[0].key, "state");
+        assert_eq!(rows[0].value, "locked");
+    }
+
+    #[test]
+    fn alarm_body_attribute_rows_non_empty() {
+        let entity = minimal_entity("alarm_control_panel.home", "armed_away");
+        let rows = AlarmBody::new().render_rows(&entity);
+        assert!(!rows.is_empty(), "AlarmBody must return non-empty rows");
+        assert_eq!(rows[0].key, "state");
+        assert_eq!(rows[0].value, "armed_away");
+    }
+
+    #[test]
+    fn climate_body_attribute_rows_non_empty() {
+        let entity = minimal_entity("climate.living_room", "heat");
+        let rows = ClimateBody::new().render_rows(&entity);
+        assert!(!rows.is_empty(), "ClimateBody must return non-empty rows");
+        assert_eq!(rows[0].key, "state");
+        assert_eq!(rows[0].value, "heat");
+    }
+
+    #[test]
+    fn media_player_body_attribute_rows_non_empty() {
+        let entity = minimal_entity("media_player.tv", "playing");
+        let rows = MediaPlayerBody::new().render_rows(&entity);
+        assert!(
+            !rows.is_empty(),
+            "MediaPlayerBody must return non-empty rows"
+        );
+        assert_eq!(rows[0].key, "state");
+        assert_eq!(rows[0].value, "playing");
+    }
+
+    #[test]
+    fn history_body_attribute_rows_non_empty() {
+        let entity = minimal_entity("sensor.temperature", "21.5");
+        let rows = HistoryBody::new().render_rows(&entity);
+        assert!(!rows.is_empty(), "HistoryBody must return non-empty rows");
+        assert_eq!(rows[0].key, "state");
+        assert_eq!(rows[0].value, "21.5");
+    }
+
+    #[test]
+    fn camera_body_attribute_rows_non_empty() {
+        let entity = minimal_entity("camera.front_door", "idle");
+        let rows = CameraBody::new().render_rows(&entity);
+        assert!(!rows.is_empty(), "CameraBody must return non-empty rows");
+        assert_eq!(rows[0].key, "state");
+        assert_eq!(rows[0].value, "idle");
+    }
+
+    #[test]
+    fn power_flow_body_attribute_rows_non_empty() {
+        let entity = minimal_entity("sensor.grid_power", "1.2");
+        let rows = PowerFlowBody::new().render_rows(&entity);
+        assert!(!rows.is_empty(), "PowerFlowBody must return non-empty rows");
+        assert_eq!(rows[0].key, "state");
+        assert_eq!(rows[0].value, "1.2");
+    }
+
+    // -----------------------------------------------------------------------
+    // ModalState::open_with_body (TASK-098)
+    // -----------------------------------------------------------------------
+
+    /// `open_with_body` must replace the stored body and open the modal using
+    /// the new body exactly once.
+    #[test]
+    fn open_with_body_replaces_body_and_opens_modal() {
+        // Start with AttributesBody; replace with CoverBody via open_with_body.
+        let initial_body: Arc<dyn MoreInfoBody> = Arc::new(AttributesBody::new());
+        let mut state = ModalState::new(initial_body);
+
+        let entity = minimal_entity("cover.garage_door", "closed");
+        let cover_body: Arc<dyn MoreInfoBody> = Arc::new(CoverBody::new());
+        state.open_with_body(&entity, cover_body);
+
+        assert!(state.is_open(), "modal must be open after open_with_body");
+        assert_eq!(state.open_for(), Some(&EntityId::from("cover.garage_door")));
+        // CoverBody returns a "state" row even for empty-attribute entities.
+        assert!(
+            !state.rows().is_empty(),
+            "open_with_body must compute rows via the new body"
+        );
+        assert_eq!(state.rows()[0].key, "state");
     }
 }

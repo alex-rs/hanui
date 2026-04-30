@@ -1138,6 +1138,66 @@ async fn run_state_watcher<S: BridgeSink>(
 }
 
 // ---------------------------------------------------------------------------
+// More-info dispatch bridge helper (TASK-098)
+// ---------------------------------------------------------------------------
+
+/// Select the [`crate::ui::more_info::MoreInfoBody`] for the widget bound to
+/// `entity_id` in `dashboard`, using the per-domain dispatch factory.
+///
+/// # Contract (locked_decisions.more_info_dispatch)
+///
+/// When the bridge receives a [`crate::actions::dispatcher::DispatchOutcome::MoreInfo`]
+/// event, it calls this function to resolve the per-domain body. The function
+/// walks the dashboard in document order (views → sections → widgets) and
+/// returns the first widget whose `entity` field matches `entity_id`. It then
+/// calls [`crate::ui::more_info::body_for_widget`] with the widget's kind and
+/// options.
+///
+/// If no widget in the dashboard is bound to `entity_id` (which should not
+/// happen under normal operation — the `WidgetActionMap` is built from the
+/// same dashboard), the function falls back to `AttributesBody` to avoid
+/// panicking.
+///
+/// The bridge then calls [`crate::ui::more_info::ModalState::open_with_body`]
+/// with the returned body and the current entity snapshot. No new state is
+/// added to the bridge: `entity_id` and `Dashboard` are already available
+/// at the modal-open call site.
+///
+/// # Parameters
+///
+/// * `entity_id` — the entity to open the modal for, from `DispatchOutcome::MoreInfo`.
+/// * `dashboard` — the loaded `Dashboard`, already held by the bridge.
+/// * `store`     — shared live store, forwarded to `body_for_widget` so
+///   per-domain bodies can query the store at row-build time.
+pub fn select_more_info_body(
+    entity_id: &EntityId,
+    dashboard: &Dashboard,
+    store: Arc<crate::ha::live_store::LiveStore>,
+) -> Box<dyn crate::ui::more_info::MoreInfoBody> {
+    for view in &dashboard.views {
+        for section in &view.sections {
+            for widget in &section.widgets {
+                if widget.entity.as_deref() == Some(entity_id.as_str()) {
+                    return crate::ui::more_info::body_for_widget(
+                        widget.widget_type.clone(),
+                        widget.options.as_ref(),
+                        store,
+                    );
+                }
+            }
+        }
+    }
+    // Fallback: entity_id not found in dashboard — use AttributesBody.
+    // This path is reachable only if the bridge is called with an entity_id
+    // that was never registered in the dashboard (defensive branch).
+    tracing::warn!(
+        entity_id = %entity_id.as_str(),
+        "select_more_info_body: no widget found for entity_id in dashboard; falling back to AttributesBody"
+    );
+    Box::new(crate::ui::more_info::AttributesBody::new())
+}
+
+// ---------------------------------------------------------------------------
 // ViewSwitcher Slint module (TASK-086)
 // ---------------------------------------------------------------------------
 //
@@ -4150,5 +4210,86 @@ mod tests {
             "cross-tab drag with touch_input=false must NOT emit view_changed: \
              no tab clicked (cross-element drag) and swipe handler not in Slint tree"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // select_more_info_body (TASK-098)
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal single-widget dashboard of the given `WidgetKind`.
+    fn dashboard_with_kind(entity_id: &str, kind: WidgetKind) -> Dashboard {
+        use crate::dashboard::schema::{
+            Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetLayout,
+        };
+        Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            version: 1,
+            device_profile: ProfileKey::Rpi4,
+            home_assistant: None,
+            theme: None,
+            default_view: "home".to_string(),
+            views: vec![View {
+                id: "home".to_string(),
+                title: "Home".to_string(),
+                layout: Layout::Sections,
+                sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
+                    id: "s1".to_string(),
+                    title: "Test".to_string(),
+                    widgets: vec![Widget {
+                        id: "w1".to_string(),
+                        widget_type: kind,
+                        entity: Some(entity_id.to_string()),
+                        entities: vec![],
+                        name: None,
+                        icon: None,
+                        visibility: "always".to_string(),
+                        tap_action: None,
+                        hold_action: None,
+                        double_tap_action: None,
+                        layout: WidgetLayout {
+                            preferred_columns: 2,
+                            preferred_rows: 2,
+                        },
+                        options: None,
+                        placement: None,
+                    }],
+                }],
+            }],
+        }
+    }
+
+    /// `select_more_info_body` returns a body for a widget in the dashboard.
+    /// The body must produce non-empty rows for minimal entities (state only).
+    #[test]
+    fn select_more_info_body_cover_returns_non_empty_rows() {
+        use crate::ha::live_store::LiveStore;
+        let store = Arc::new(LiveStore::new());
+        let entity_id = EntityId::from("cover.garage_door");
+        let dashboard = dashboard_with_kind("cover.garage_door", WidgetKind::Cover);
+        let body = select_more_info_body(&entity_id, &dashboard, store);
+        let entity = make_test_entity("cover.garage_door", "closed");
+        let rows = body.render_rows(&entity);
+        assert!(
+            !rows.is_empty(),
+            "select_more_info_body for Cover must return non-empty rows"
+        );
+    }
+
+    /// `select_more_info_body` falls back to `AttributesBody` when the
+    /// entity_id is not found in the dashboard.
+    #[test]
+    fn select_more_info_body_falls_back_for_unknown_entity() {
+        use crate::ha::live_store::LiveStore;
+        let store = Arc::new(LiveStore::new());
+        // Dashboard has no widget for this entity id.
+        let dashboard = dashboard_with_kind("cover.garage_door", WidgetKind::Cover);
+        let unknown_id = EntityId::from("unknown.entity");
+        // Must not panic — returns AttributesBody fallback.
+        let body = select_more_info_body(&unknown_id, &dashboard, store);
+        let entity = make_test_entity("unknown.entity", "off");
+        // AttributesBody with empty attributes returns zero rows.
+        let rows = body.render_rows(&entity);
+        let _ = rows; // value is checked for no-panic; row count is 0 for empty attrs.
     }
 }
