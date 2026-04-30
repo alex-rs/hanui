@@ -82,6 +82,7 @@ use std::process::Command;
 
 use tracing::{debug, warn};
 
+use crate::audit::{self, AuditEvent, AuditScheme};
 use crate::dashboard::profiles::UrlActionMode;
 
 // ---------------------------------------------------------------------------
@@ -284,26 +285,115 @@ pub fn handle_url_action_with_spawner(
     // suddenly start passing unsanitised input to xdg-open.
     let scheme = validate_href(href)?;
 
+    let audit_scheme = audit_scheme_from_validated(scheme);
+
     match mode {
         UrlActionMode::Always => {
-            // Trace line records ONLY the scheme; the full href is never
-            // logged. CLAUDE.md security rule: never log full request bodies.
-            debug!(scheme, "url action: shelling out to xdg-open");
-            spawner(href).map_err(|e| {
-                // Log the underlying io::Error category but do NOT log href.
-                warn!(scheme, error = %e, "url action: xdg-open spawn failed");
-                UrlError::Spawn(e)
-            })?;
-            Ok(UrlOutcome::Opened)
+            // TASK-076 / TASK-101: every xdg-open shell-out emits an audit
+            // row via the dedicated `audit` tracing target. The row carries
+            // only the validated scheme + outcome + error_kind — never the
+            // href (CLAUDE.md security rule, enforced structurally by the
+            // `&'static str` field types on `AuditEvent`).
+            match spawner(href) {
+                Ok(()) => {
+                    audit::emit(AuditEvent {
+                        event: "url.xdg_open.spawn",
+                        outcome: "spawned",
+                        error_kind: None,
+                        scheme: Some(audit_scheme),
+                    });
+                    Ok(UrlOutcome::Opened)
+                }
+                Err(e) => {
+                    let error_kind = static_io_error_kind(e.kind());
+                    audit::emit(AuditEvent {
+                        event: "url.xdg_open.spawn",
+                        outcome: "spawn_failed",
+                        error_kind: Some(error_kind),
+                        scheme: Some(audit_scheme),
+                    });
+                    // Operator-facing real-time signal; complements the
+                    // audit row above. The warn line carries the validated
+                    // scheme + io::Error Display only (never the href).
+                    warn!(scheme, error = %e, "url action: xdg-open spawn failed");
+                    Err(UrlError::Spawn(e))
+                }
+            }
         }
         UrlActionMode::Never => {
+            audit::emit(AuditEvent {
+                event: "url.blocked_by_profile",
+                outcome: "blocked_by_profile",
+                error_kind: None,
+                scheme: Some(audit_scheme),
+            });
             debug!(scheme, "url action: blocked by Never profile");
             Ok(UrlOutcome::BlockedShowToast(TOAST_BLOCKED_BY_PROFILE))
         }
         UrlActionMode::Ask => {
+            audit::emit(AuditEvent {
+                event: "url.deferred_ask",
+                outcome: "deferred_ask",
+                error_kind: None,
+                scheme: Some(audit_scheme),
+            });
             debug!(scheme, "url action: deferred to Phase 6 (Ask)");
             Ok(UrlOutcome::AskShowToast(TOAST_ASK_PHASE_6))
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audit-row field helpers (TASK-076 / TASK-101)
+// ---------------------------------------------------------------------------
+
+/// Map a validated scheme literal to an [`AuditScheme`] variant.
+///
+/// `validate_href` already enforces the scheme is one of `http`, `https`,
+/// or `file` (it returns `&'static str` from `ALLOWED_SCHEMES`). The
+/// `unreachable!` arm is defensive: it can only fire if `ALLOWED_SCHEMES`
+/// gains a fourth scheme without a matching `AuditScheme` variant — which
+/// is the exact compile-forced explicit-decision behaviour the closed
+/// `AuditScheme` enum is designed to surface.
+fn audit_scheme_from_validated(scheme: &'static str) -> AuditScheme {
+    match scheme {
+        "http" => AuditScheme::Http,
+        "https" => AuditScheme::Https,
+        "file" => AuditScheme::File,
+        // Unreachable as long as ALLOWED_SCHEMES and AuditScheme stay in
+        // lockstep. The two-line `match` above makes any drift loud.
+        other => unreachable!(
+            "validate_href returned an unknown scheme `{other}`; \
+             ALLOWED_SCHEMES and crate::audit::AuditScheme drifted"
+        ),
+    }
+}
+
+/// Map an [`io::ErrorKind`] to a `&'static str` for the audit row's
+/// `error_kind` field.
+///
+/// The audit invariant requires every field be a static literal — we
+/// cannot pass `format!("{kind:?}")` (allocates an owned `String`, would
+/// fail the `AuditField` gate). The set of variants exercised here is
+/// the subset realistically reachable from `Command::spawn` failure on
+/// Linux; any other kind falls back to the catch-all `"other"`.
+fn static_io_error_kind(kind: io::ErrorKind) -> &'static str {
+    match kind {
+        io::ErrorKind::NotFound => "NotFound",
+        io::ErrorKind::PermissionDenied => "PermissionDenied",
+        io::ErrorKind::ConnectionRefused => "ConnectionRefused",
+        io::ErrorKind::Interrupted => "Interrupted",
+        io::ErrorKind::InvalidInput => "InvalidInput",
+        io::ErrorKind::InvalidData => "InvalidData",
+        io::ErrorKind::TimedOut => "TimedOut",
+        io::ErrorKind::WriteZero => "WriteZero",
+        io::ErrorKind::Unsupported => "Unsupported",
+        io::ErrorKind::OutOfMemory => "OutOfMemory",
+        io::ErrorKind::UnexpectedEof => "UnexpectedEof",
+        // io::ErrorKind is `#[non_exhaustive]`; everything we have not
+        // enumerated explicitly buckets to "other" so the audit row
+        // still records the failure (just with coarser granularity).
+        _ => "other",
     }
 }
 
@@ -1149,4 +1239,127 @@ mod tests {
     // -----------------------------------------------------------------------
 
     static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // -----------------------------------------------------------------------
+    // static_io_error_kind — one assert per named variant + catch-all
+    //
+    // The existing spawn-failure test only exercises NotFound. The other ten
+    // named variants and the `_` catch-all in static_io_error_kind are
+    // otherwise unreachable from the higher-level test fixtures, so we
+    // exercise them directly here. Each assert locks both the return value
+    // and the fact that the function returns a `&'static str` (no
+    // allocation). If a future PR renames or removes a variant arm, the
+    // matching string literal here fails and forces an explicit update.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn static_io_error_kind_maps_all_named_variants() {
+        use io::ErrorKind;
+
+        assert_eq!(static_io_error_kind(ErrorKind::NotFound), "NotFound");
+        assert_eq!(
+            static_io_error_kind(ErrorKind::PermissionDenied),
+            "PermissionDenied"
+        );
+        assert_eq!(
+            static_io_error_kind(ErrorKind::ConnectionRefused),
+            "ConnectionRefused"
+        );
+        assert_eq!(static_io_error_kind(ErrorKind::Interrupted), "Interrupted");
+        assert_eq!(
+            static_io_error_kind(ErrorKind::InvalidInput),
+            "InvalidInput"
+        );
+        assert_eq!(static_io_error_kind(ErrorKind::InvalidData), "InvalidData");
+        assert_eq!(static_io_error_kind(ErrorKind::TimedOut), "TimedOut");
+        assert_eq!(static_io_error_kind(ErrorKind::WriteZero), "WriteZero");
+        assert_eq!(static_io_error_kind(ErrorKind::Unsupported), "Unsupported");
+        assert_eq!(static_io_error_kind(ErrorKind::OutOfMemory), "OutOfMemory");
+        assert_eq!(
+            static_io_error_kind(ErrorKind::UnexpectedEof),
+            "UnexpectedEof"
+        );
+    }
+
+    #[test]
+    fn static_io_error_kind_catch_all_returns_other() {
+        // io::ErrorKind is #[non_exhaustive]; use a variant not listed in
+        // the match arms to exercise the `_ => "other"` branch.
+        // WouldBlock is present in stable Rust and is not listed in
+        // static_io_error_kind's named arms.
+        assert_eq!(static_io_error_kind(io::ErrorKind::WouldBlock), "other");
+    }
+
+    // -----------------------------------------------------------------------
+    // audit_scheme_from_validated — one test per variant
+    //
+    // The higher-level flow tests exercise these paths indirectly, but a
+    // direct unit test locks the exact `AuditScheme` mapping without
+    // depending on the URL-parsing plumbing. If a future PR changes the
+    // ALLOWED_SCHEMES / AuditScheme pairing, this test fails at the
+    // assertion rather than as a silent coverage regression.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn audit_scheme_from_validated_maps_all_schemes() {
+        use crate::audit::AuditScheme;
+
+        assert_eq!(
+            audit_scheme_from_validated("http"),
+            AuditScheme::Http,
+            "http must map to AuditScheme::Http"
+        );
+        assert_eq!(
+            audit_scheme_from_validated("https"),
+            AuditScheme::Https,
+            "https must map to AuditScheme::Https"
+        );
+        assert_eq!(
+            audit_scheme_from_validated("file"),
+            AuditScheme::File,
+            "file must map to AuditScheme::File"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Spawn-failure error_kind path — PermissionDenied variant
+    //
+    // The existing `always_mode_spawn_failure_returns_url_error_spawn` test
+    // forces a NotFound error. Exercise PermissionDenied here to cover the
+    // `static_io_error_kind` call-site on the Err branch with a second
+    // variant (the audit emit line needs a real call through the full path,
+    // not just the helper unit test above).
+    // -----------------------------------------------------------------------
+
+    static SPAWN_ERROR_KIND: std::sync::Mutex<io::ErrorKind> =
+        std::sync::Mutex::new(io::ErrorKind::NotFound);
+
+    fn configurable_kind_spawner(_href: &str) -> io::Result<()> {
+        let kind = *SPAWN_ERROR_KIND.lock().unwrap_or_else(|p| p.into_inner());
+        Err(io::Error::new(kind, "forced error for kind coverage"))
+    }
+
+    #[test]
+    fn always_mode_spawn_failure_permission_denied_returns_spawn_error() {
+        // Serialise with the other static-state tests.
+        let _guard = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        {
+            let mut k = SPAWN_ERROR_KIND.lock().unwrap_or_else(|p| p.into_inner());
+            *k = io::ErrorKind::PermissionDenied;
+        }
+        let err = handle_url_action_with_spawner(
+            "https://example.org/",
+            UrlActionMode::Always,
+            configurable_kind_spawner,
+        )
+        .expect_err("PermissionDenied spawn must surface as UrlError::Spawn");
+        match err {
+            UrlError::Spawn(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("expected UrlError::Spawn, got {other:?}"),
+        }
+        // restore default
+        *SPAWN_ERROR_KIND.lock().unwrap_or_else(|p| p.into_inner()) = io::ErrorKind::NotFound;
+    }
 }

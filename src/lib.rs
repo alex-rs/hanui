@@ -29,6 +29,7 @@
 
 pub mod actions;
 pub mod assets;
+pub mod audit;
 pub mod dashboard;
 pub mod ha;
 pub mod platform;
