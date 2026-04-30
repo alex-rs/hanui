@@ -132,6 +132,22 @@ rand = { version = "0.8", features = ["small_rng"] }
 resvg = "0.47"
 usvg = "0.47"
 tiny-skia = "0.12"
+# LRU cache for src/ha/http.rs (TASK-097). Locked at 0.13 per
+# locked_decisions.lru_crate_choice in docs/plans/2026-04-30-phase-6-advanced-widgets.md.
+# SBOM review required before merge (security-engineer).
+lru = "0.13"
+# Async HTTP client for src/ha/http.rs (TASK-097). reqwest is chosen for
+# its rustls integration (consistent with tokio-tungstenite) and native
+# async/await support. Disables default-features (avoids openssl dep).
+# Deferred construction via OnceLock keeps HaHttpClient::new allocation-free.
+# SBOM review required before merge (security-engineer).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
+# Image decoding for src/ha/http.rs CacheEntry::ImageBuffer (TASK-097).
+# Provides RGBA8 decode-on-insert for camera snapshots and media artwork.
+# Only JPEG and PNG are required for HA camera snapshots and media artwork;
+# GIF and BMP are excluded to minimise linked code size.
+# SBOM review required before merge (security-engineer).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 # Build-time compilation of `ui/slint/main_window.slint` (and its transitive
 # imports) into Rust code that `slint::include_modules!()` picks up at compile
