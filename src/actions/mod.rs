@@ -11,9 +11,11 @@
 //! | [`dispatcher`] | TASK-062 | `Dispatcher`, `DispatchOutcome`, `DispatchError`, `Gesture` |
 //! | [`url`]    | TASK-063 | `Url` action handler with `UrlActionMode` gate |
 //! | `queue`    | TASK-065 | offline FIFO queue |
+//! | [`pin`]    | TASK-100 | `PinEntryHost` trait + `CodeFormat` re-export |
 
 pub mod dispatcher;
 pub mod map;
+pub mod pin;
 pub mod queue;
 pub mod schema;
 pub mod service_map;
