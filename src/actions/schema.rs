@@ -1,4 +1,4 @@
-//! Canonical [`Action`] schema for Phase 3 (write/command path).
+//! Canonical [`Action`] schema for Phase 3 + Phase 6 (write/command path).
 //!
 //! This module is the **single source of truth** for the typed user-interaction
 //! action surface. It supersedes the placeholder enum that previously lived in
@@ -37,6 +37,15 @@
 //! `locked_decisions.idempotency_marker`, `CallService` is **context-dependent**
 //! and is shipped here as `Idempotent` placeholder; the runtime allowlist
 //! (`turn_on`, `turn_off`, `set_*`) check is TASK-065's responsibility.
+//!
+//! # Phase 6 variants (TASK-099)
+//!
+//! Phase 6 adds typed setpoint/position/transport/lock/alarm variants. Each
+//! has an explicit idempotency marker per
+//! `locked_decisions.idempotency_marker_phase6_variants`. The dispatcher wiring
+//! for these variants lives in TASK-102..TASK-105, TASK-108, TASK-109; this
+//! module lands the types and the service map (`service_map.rs`) lands the
+//! `(domain, service, body)` mappings.
 
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +69,83 @@ pub enum Idempotency {
 }
 
 // ---------------------------------------------------------------------------
+// MediaTransport enum
+// ---------------------------------------------------------------------------
+
+/// Media transport operation for [`Action::MediaTransport`].
+///
+/// `Play`, `Pause`, `Stop` are **idempotent** — calling play on an already-
+/// playing player is a no-op in HA.
+///
+/// `Next` and `Prev` are **non-idempotent** — each invocation advances or
+/// reverses the track index; replaying on reconnect would skip a track.
+///
+/// Wire values are lowercase per `locked_decisions.idempotency_marker_phase6_variants`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaTransportOp {
+    Play,
+    Pause,
+    Stop,
+    Next,
+    Prev,
+}
+
+// ---------------------------------------------------------------------------
+// ActionError
+// ---------------------------------------------------------------------------
+
+/// Errors produced at action-dispatch time for Phase 6 service variants.
+///
+/// These are returned by `service_map::action_to_service_call` when the
+/// caller supplies an unknown mode/speed string. The dispatcher (TASK-103,
+/// TASK-104, TASK-105, TASK-108, TASK-109) surfaces these as toast events.
+///
+/// `UnknownAlarmArmMode` and `UnknownFanSpeed` are landed here in TASK-099
+/// so the type is available for wiring in the consumer tickets without
+/// requiring a separate type-only PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionError {
+    /// `AlarmArm.mode` was not one of the HA-standard arm modes
+    /// (`home`, `away`, `night`, `vacation`, `custom_bypass`).
+    ///
+    /// The invalid mode string is carried for diagnostic surfacing in a toast.
+    /// Per `locked_decisions.alarm_arm_service_vocabulary`, the set of valid
+    /// modes is the HA vocabulary; unknown values are rejected rather than
+    /// forwarded to avoid silently mis-arming.
+    UnknownAlarmArmMode(String),
+
+    /// `SetFanSpeed.speed` was not found in the available preset/speed
+    /// vocabulary. The dispatcher reads `FanOptions.preset_modes` at dispatch
+    /// time (TASK-108) to determine the data field; an unrecognised speed
+    /// surfaces this error as a toast per
+    /// `locked_decisions.fan_speed_set_vocabulary`.
+    UnknownFanSpeed(String),
+}
+
+impl std::fmt::Display for ActionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ActionError::UnknownAlarmArmMode(mode) => {
+                write!(
+                    f,
+                    "unknown alarm arm mode `{mode}`; expected one of: \
+                     home, away, night, vacation, custom_bypass"
+                )
+            }
+            ActionError::UnknownFanSpeed(speed) => {
+                write!(
+                    f,
+                    "unknown fan speed `{speed}`; not found in preset_modes vocabulary"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ActionError {}
+
+// ---------------------------------------------------------------------------
 // Action enum
 // ---------------------------------------------------------------------------
 
@@ -68,6 +154,11 @@ pub enum Idempotency {
 /// See module-level docs for the wire shape and the
 /// `locked_decisions.phase4_forward_compat` discussion of why every variant
 /// carries an explicit `#[serde(rename = "...")]`.
+///
+/// Phase 6 variants (TASK-099) add typed setpoint/position/transport/lock/
+/// alarm actions. Each has an explicit idempotency marker and an HA service
+/// mapping in `service_map.rs`. Dispatcher wiring is deferred to
+/// TASK-102..TASK-105, TASK-108, TASK-109.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action")]
 pub enum Action {
@@ -128,6 +219,163 @@ pub enum Action {
     /// Idempotent: no side-effects at all.
     #[serde(rename = "none")]
     None,
+
+    // -----------------------------------------------------------------------
+    // Phase 6 variants (TASK-099) — typed setpoint / position / transport /
+    // lock / alarm actions with explicit idempotency markers and HA service
+    // mappings in `service_map.rs`. Dispatcher wiring is TASK-102..TASK-109.
+    // -----------------------------------------------------------------------
+    /// Set a climate entity's target temperature.
+    ///
+    /// Maps to `climate.set_temperature`. Idempotent: setting the same
+    /// temperature twice leaves the entity in the same state.
+    ///
+    /// Wire: `{"action":"set-temperature","entity-id":"...","temperature":21.5}`
+    #[serde(rename = "set-temperature")]
+    #[serde(rename_all = "kebab-case")]
+    SetTemperature {
+        entity_id: String,
+        /// Target temperature in degrees Celsius.
+        temperature: f32,
+    },
+
+    /// Set a climate entity's HVAC operating mode.
+    ///
+    /// Maps to `climate.set_hvac_mode`. Idempotent: setting the same mode
+    /// twice is a no-op. `mode` is a free `String` per
+    /// `locked_decisions.hvac_mode_vocabulary`; standard HA values are
+    /// documented in `service_map.rs::STANDARD_HVAC_MODES`.
+    ///
+    /// Wire: `{"action":"set-hvac-mode","entity-id":"...","mode":"heat"}`
+    #[serde(rename = "set-hvac-mode")]
+    #[serde(rename_all = "kebab-case")]
+    SetHvacMode {
+        entity_id: String,
+        /// HVAC mode string (free, HA-validated). See `STANDARD_HVAC_MODES`
+        /// in `service_map.rs` for the standard vocabulary.
+        mode: String,
+    },
+
+    /// Set a media player's volume level.
+    ///
+    /// Maps to `media_player.volume_set`. Idempotent: setting the same volume
+    /// twice leaves the entity at the same level.
+    ///
+    /// Wire: `{"action":"set-media-volume","entity-id":"...","volume-level":0.5}`
+    #[serde(rename = "set-media-volume")]
+    #[serde(rename_all = "kebab-case")]
+    SetMediaVolume {
+        entity_id: String,
+        /// Volume level in range [0.0, 1.0].
+        volume_level: f32,
+    },
+
+    /// Issue a media transport command (play/pause/stop/next/prev).
+    ///
+    /// Service mapping is variant-specific (see `service_map.rs`):
+    /// - `Play` → `media_player.media_play`
+    /// - `Pause` → `media_player.media_pause`
+    /// - `Stop` → `media_player.media_stop`
+    /// - `Next` → `media_player.media_next_track`
+    /// - `Prev` → `media_player.media_previous_track`
+    ///
+    /// Idempotency per `locked_decisions.idempotency_marker_phase6_variants`:
+    /// `Play`, `Pause`, `Stop` are idempotent; `Next` and `Prev` are
+    /// non-idempotent (each invocation advances/reverses the track).
+    ///
+    /// Wire: `{"action":"media-transport","entity-id":"...","transport":"play"}`
+    #[serde(rename = "media-transport")]
+    #[serde(rename_all = "kebab-case")]
+    MediaTransport {
+        entity_id: String,
+        transport: MediaTransportOp,
+    },
+
+    /// Set a cover entity's position.
+    ///
+    /// Maps to `cover.set_cover_position`. Idempotent: setting the same
+    /// position twice is a no-op. `position` is bounded 0..=100 per
+    /// `locked_decisions.cover_position_bounds`; the slider UI enforces
+    /// this at render time — HA rejects out-of-range values via service
+    /// error without dispatcher pre-validation.
+    ///
+    /// Wire: `{"action":"set-cover-position","entity-id":"...","position":50}`
+    #[serde(rename = "set-cover-position")]
+    #[serde(rename_all = "kebab-case")]
+    SetCoverPosition {
+        entity_id: String,
+        /// Cover position in range 0..=100 (0 = closed, 100 = open).
+        position: u8,
+    },
+
+    /// Set a fan entity's speed/preset.
+    ///
+    /// Maps to `fan.turn_on` with either `preset_mode` or `speed_step` data
+    /// per `locked_decisions.fan_speed_set_vocabulary`. `speed` is a free
+    /// `String`; the dispatcher reads `FanOptions.preset_modes` at dispatch
+    /// time (TASK-108) to choose the data field. Unknown speeds return
+    /// [`ActionError::UnknownFanSpeed`].
+    ///
+    /// Wire: `{"action":"set-fan-speed","entity-id":"...","speed":"high"}`
+    #[serde(rename = "set-fan-speed")]
+    #[serde(rename_all = "kebab-case")]
+    SetFanSpeed {
+        entity_id: String,
+        /// Fan speed or preset mode string (free, HA-validated at dispatch).
+        speed: String,
+    },
+
+    /// Lock a lock entity.
+    ///
+    /// Maps to `lock.lock`. Idempotent: locking an already-locked entity is
+    /// a no-op. Per `locked_decisions.confirmation_on_lock_unlock`, the
+    /// confirmation flag lives on `WidgetOptions::Lock.require_confirmation_on_unlock`,
+    /// NOT on this action variant — offline replay does not show a confirm
+    /// modal.
+    ///
+    /// Wire: `{"action":"lock","entity-id":"..."}`
+    #[serde(rename = "lock")]
+    #[serde(rename_all = "kebab-case")]
+    Lock { entity_id: String },
+
+    /// Unlock a lock entity.
+    ///
+    /// Maps to `lock.unlock`. Idempotent: unlocking an already-unlocked
+    /// entity is a no-op. Per `locked_decisions.confirmation_on_lock_unlock`,
+    /// confirmation is a widget-options concern, not an action-wire concern.
+    ///
+    /// Wire: `{"action":"unlock","entity-id":"..."}`
+    #[serde(rename = "unlock")]
+    #[serde(rename_all = "kebab-case")]
+    Unlock { entity_id: String },
+
+    /// Arm an alarm control panel in the specified mode.
+    ///
+    /// Service varies per `mode` per `locked_decisions.alarm_arm_service_vocabulary`:
+    /// `home` → `alarm_control_panel.alarm_arm_home`, etc. Unknown `mode`
+    /// returns [`ActionError::UnknownAlarmArmMode`]. Idempotent: arming an
+    /// already-armed panel in the same mode is a no-op.
+    ///
+    /// Wire: `{"action":"alarm-arm","entity-id":"...","mode":"home"}`
+    #[serde(rename = "alarm-arm")]
+    #[serde(rename_all = "kebab-case")]
+    AlarmArm {
+        entity_id: String,
+        /// Arm mode: `home`, `away`, `night`, `vacation`, `custom_bypass`.
+        mode: String,
+    },
+
+    /// Disarm an alarm control panel.
+    ///
+    /// Maps to `alarm_control_panel.alarm_disarm`. Idempotent: disarming an
+    /// already-disarmed panel is a no-op. The disarm code (PIN) is supplied
+    /// at dispatch time from the PIN entry widget (TASK-100), not on the
+    /// action wire.
+    ///
+    /// Wire: `{"action":"alarm-disarm","entity-id":"..."}`
+    #[serde(rename = "alarm-disarm")]
+    #[serde(rename_all = "kebab-case")]
+    AlarmDisarm { entity_id: String },
 }
 
 impl Action {
@@ -137,6 +385,13 @@ impl Action {
     /// non-idempotent actions. `CallService` returns `Idempotent` as a
     /// placeholder; TASK-065 layers a runtime allowlist (`turn_on`, `turn_off`,
     /// `set_*`) on top — the placeholder alone is **not** the security gate.
+    ///
+    /// Phase 6 markers per `locked_decisions.idempotency_marker_phase6_variants`:
+    /// - `SetTemperature`, `SetHvacMode`, `SetMediaVolume`, `SetCoverPosition`,
+    ///   `SetFanSpeed`, `Lock`, `Unlock`, `AlarmArm`, `AlarmDisarm` → Idempotent
+    /// - `MediaTransport(Play|Pause|Stop)` → Idempotent
+    /// - `MediaTransport(Next|Prev)` → NonIdempotent (each invocation
+    ///   advances/reverses the track; replaying would skip again)
     #[must_use]
     pub const fn idempotency(&self) -> Idempotency {
         match self {
@@ -154,6 +409,31 @@ impl Action {
             Action::Url { .. } => Idempotency::NonIdempotent,
             // No side-effect.
             Action::None => Idempotency::Idempotent,
+
+            // Phase 6 variants — all idempotent per
+            // locked_decisions.idempotency_marker_phase6_variants, except
+            // MediaTransport(Next|Prev) which advance the track.
+            Action::SetTemperature { .. } => Idempotency::Idempotent,
+            Action::SetHvacMode { .. } => Idempotency::Idempotent,
+            Action::SetMediaVolume { .. } => Idempotency::Idempotent,
+            Action::MediaTransport { transport, .. } => match transport {
+                // Next/Prev each advance or reverse the track; replaying on
+                // reconnect would skip the track a second time.
+                MediaTransportOp::Next | MediaTransportOp::Prev => Idempotency::NonIdempotent,
+                // Play/Pause/Stop are idempotent: toggling a playing player
+                // to Play again is a no-op in HA.
+                MediaTransportOp::Play | MediaTransportOp::Pause | MediaTransportOp::Stop => {
+                    Idempotency::Idempotent
+                }
+            },
+            Action::SetCoverPosition { .. } => Idempotency::Idempotent,
+            Action::SetFanSpeed { .. } => Idempotency::Idempotent,
+            // Locking/unlocking twice is a no-op. Confirmation lives on
+            // WidgetOptions per locked_decisions.confirmation_on_lock_unlock.
+            Action::Lock { .. } => Idempotency::Idempotent,
+            Action::Unlock { .. } => Idempotency::Idempotent,
+            Action::AlarmArm { .. } => Idempotency::Idempotent,
+            Action::AlarmDisarm { .. } => Idempotency::Idempotent,
         }
     }
 }
@@ -225,6 +505,112 @@ mod tests {
     #[test]
     fn none_is_idempotent() {
         assert_eq!(Action::None.idempotency(), Idempotency::Idempotent);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6 idempotency markers (TASK-099)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn idempotency_markers_per_variant() {
+        // All idempotent variants.
+        assert_eq!(
+            Action::SetTemperature {
+                entity_id: "climate.living_room".to_string(),
+                temperature: 21.0,
+            }
+            .idempotency(),
+            Idempotency::Idempotent
+        );
+        assert_eq!(
+            Action::SetHvacMode {
+                entity_id: "climate.living_room".to_string(),
+                mode: "heat".to_string(),
+            }
+            .idempotency(),
+            Idempotency::Idempotent
+        );
+        assert_eq!(
+            Action::SetMediaVolume {
+                entity_id: "media_player.tv".to_string(),
+                volume_level: 0.5,
+            }
+            .idempotency(),
+            Idempotency::Idempotent
+        );
+        // MediaTransport(Play/Pause/Stop) → Idempotent.
+        for op in [
+            MediaTransportOp::Play,
+            MediaTransportOp::Pause,
+            MediaTransportOp::Stop,
+        ] {
+            assert_eq!(
+                Action::MediaTransport {
+                    entity_id: "media_player.tv".to_string(),
+                    transport: op,
+                }
+                .idempotency(),
+                Idempotency::Idempotent,
+                "{op:?} must be Idempotent"
+            );
+        }
+        // MediaTransport(Next/Prev) → NonIdempotent.
+        for op in [MediaTransportOp::Next, MediaTransportOp::Prev] {
+            assert_eq!(
+                Action::MediaTransport {
+                    entity_id: "media_player.tv".to_string(),
+                    transport: op,
+                }
+                .idempotency(),
+                Idempotency::NonIdempotent,
+                "{op:?} must be NonIdempotent"
+            );
+        }
+        assert_eq!(
+            Action::SetCoverPosition {
+                entity_id: "cover.garage".to_string(),
+                position: 50,
+            }
+            .idempotency(),
+            Idempotency::Idempotent
+        );
+        assert_eq!(
+            Action::SetFanSpeed {
+                entity_id: "fan.bedroom".to_string(),
+                speed: "high".to_string(),
+            }
+            .idempotency(),
+            Idempotency::Idempotent
+        );
+        assert_eq!(
+            Action::Lock {
+                entity_id: "lock.front_door".to_string(),
+            }
+            .idempotency(),
+            Idempotency::Idempotent
+        );
+        assert_eq!(
+            Action::Unlock {
+                entity_id: "lock.front_door".to_string(),
+            }
+            .idempotency(),
+            Idempotency::Idempotent
+        );
+        assert_eq!(
+            Action::AlarmArm {
+                entity_id: "alarm_control_panel.home".to_string(),
+                mode: "home".to_string(),
+            }
+            .idempotency(),
+            Idempotency::Idempotent
+        );
+        assert_eq!(
+            Action::AlarmDisarm {
+                entity_id: "alarm_control_panel.home".to_string(),
+            }
+            .idempotency(),
+            Idempotency::Idempotent
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -305,6 +691,157 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Phase 6 round-trip tests (TASK-099)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn set_temperature_round_trip() {
+        let action = Action::SetTemperature {
+            entity_id: "climate.living_room".to_string(),
+            temperature: 21.5,
+        };
+        assert_round_trip(action.clone(), "set-temperature");
+        // Field rename: entity_id → entity-id on wire.
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(
+            json.contains("\"entity-id\":"),
+            "entity_id must serialize as kebab `entity-id`, got: {json}"
+        );
+        assert!(
+            json.contains("\"temperature\":"),
+            "temperature field must be present, got: {json}"
+        );
+    }
+
+    #[test]
+    fn set_hvac_mode_round_trip() {
+        assert_round_trip(
+            Action::SetHvacMode {
+                entity_id: "climate.living_room".to_string(),
+                mode: "heat".to_string(),
+            },
+            "set-hvac-mode",
+        );
+    }
+
+    #[test]
+    fn set_media_volume_round_trip() {
+        assert_round_trip(
+            Action::SetMediaVolume {
+                entity_id: "media_player.tv".to_string(),
+                volume_level: 0.5,
+            },
+            "set-media-volume",
+        );
+    }
+
+    #[test]
+    fn media_transport_round_trip() {
+        // All five operations must round-trip.
+        for op in [
+            MediaTransportOp::Play,
+            MediaTransportOp::Pause,
+            MediaTransportOp::Stop,
+            MediaTransportOp::Next,
+            MediaTransportOp::Prev,
+        ] {
+            let action = Action::MediaTransport {
+                entity_id: "media_player.tv".to_string(),
+                transport: op,
+            };
+            assert_round_trip(action.clone(), "media-transport");
+        }
+        // Verify wire field name for transport.
+        let play = Action::MediaTransport {
+            entity_id: "media_player.tv".to_string(),
+            transport: MediaTransportOp::Play,
+        };
+        let json = serde_json::to_string(&play).unwrap();
+        assert!(
+            json.contains("\"transport\":\"play\""),
+            "transport must serialize as lowercase `play`, got: {json}"
+        );
+        let next = Action::MediaTransport {
+            entity_id: "media_player.tv".to_string(),
+            transport: MediaTransportOp::Next,
+        };
+        let json = serde_json::to_string(&next).unwrap();
+        assert!(
+            json.contains("\"transport\":\"next\""),
+            "transport must serialize as lowercase `next`, got: {json}"
+        );
+    }
+
+    #[test]
+    fn set_cover_position_round_trip() {
+        assert_round_trip(
+            Action::SetCoverPosition {
+                entity_id: "cover.garage".to_string(),
+                position: 50,
+            },
+            "set-cover-position",
+        );
+    }
+
+    #[test]
+    fn set_fan_speed_round_trip() {
+        assert_round_trip(
+            Action::SetFanSpeed {
+                entity_id: "fan.bedroom".to_string(),
+                speed: "high".to_string(),
+            },
+            "set-fan-speed",
+        );
+    }
+
+    #[test]
+    fn lock_unlock_no_confirmation_field() {
+        // Per locked_decisions.confirmation_on_lock_unlock: confirmation lives
+        // on WidgetOptions::Lock.require_confirmation_on_unlock, NOT on the
+        // action wire. The JSON must not contain "confirmation".
+        let lock = Action::Lock {
+            entity_id: "lock.front_door".to_string(),
+        };
+        let json = serde_json::to_string(&lock).unwrap();
+        assert!(
+            !json.contains("confirmation"),
+            "Lock action wire must not contain `confirmation` field, got: {json}"
+        );
+        assert_round_trip(lock, "lock");
+
+        let unlock = Action::Unlock {
+            entity_id: "lock.front_door".to_string(),
+        };
+        let json = serde_json::to_string(&unlock).unwrap();
+        assert!(
+            !json.contains("confirmation"),
+            "Unlock action wire must not contain `confirmation` field, got: {json}"
+        );
+        assert_round_trip(unlock, "unlock");
+    }
+
+    #[test]
+    fn alarm_arm_round_trip() {
+        assert_round_trip(
+            Action::AlarmArm {
+                entity_id: "alarm_control_panel.home".to_string(),
+                mode: "home".to_string(),
+            },
+            "alarm-arm",
+        );
+    }
+
+    #[test]
+    fn alarm_disarm_round_trip() {
+        assert_round_trip(
+            Action::AlarmDisarm {
+                entity_id: "alarm_control_panel.home".to_string(),
+            },
+            "alarm-disarm",
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Field renames
     // -----------------------------------------------------------------------
 
@@ -375,5 +912,33 @@ mod tests {
         let spec: ActionSpec = Action::Toggle;
         let action: Action = spec;
         assert_eq!(action, Action::Toggle);
+    }
+
+    // -----------------------------------------------------------------------
+    // ActionError
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn action_error_display_unknown_alarm_arm_mode() {
+        let err = ActionError::UnknownAlarmArmMode("silent".to_string());
+        let msg = err.to_string();
+        assert!(
+            msg.contains("silent"),
+            "Display must include the unknown mode, got: {msg}"
+        );
+        assert!(
+            msg.contains("home"),
+            "Display must include expected modes, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn action_error_display_unknown_fan_speed() {
+        let err = ActionError::UnknownFanSpeed("turbo".to_string());
+        let msg = err.to_string();
+        assert!(
+            msg.contains("turbo"),
+            "Display must include the unknown speed, got: {msg}"
+        );
     }
 }
