@@ -1,6 +1,6 @@
 ---
 name: task-planner
-description: "Drafts plan files for multi-task initiatives. Takes a goal from CTO/lead, loads full project context, writes a plan at docs/plans/YYYY-MM-DD-slug.md with status: draft, then iterates with opencode review. Returns the final plan for verification and task filing. Does NOT create task tickets — the project lead owns that."
+description: "Drafts plan files for multi-task initiatives. Takes a goal from CTO/lead, loads full project context, writes a plan at docs/plans/YYYY-MM-DD-slug.md with status: draft, then iterates with opencode review (MiniMax model). Returns the final plan for verification and task filing. Does NOT create task tickets — the project lead owns that."
 tools: Read, Write, Edit, Bash, Grep, Glob
 model: sonnet
 ---
@@ -55,7 +55,13 @@ The Task breakdown should list intended tasks with one-line summaries and propos
 
 ### 3. Opencode review — up to 3 iterations
 
-After writing the draft, run up to 3 review iterations using the `opencode-review` skill. Each iteration prompt should ask the reviewer to pressure-test the plan under these questions:
+After writing the draft, run up to 3 review iterations using the `opencode-review` skill. **Always invoke opencode with the MiniMax model explicitly** — pass `-m minimax/MiniMax-M2.7` (or the latest available MiniMax via `opencode models | grep -i minimax`). Do NOT rely on the default; pinning the model keeps reviews reproducible and prevents accidental fallback to a same-family model when defaults change. Example invocation shape:
+
+```bash
+opencode run -m minimax/MiniMax-M2.7 "<prompt>" 2>&1 | tail -200
+```
+
+Each iteration prompt should ask the reviewer to pressure-test the plan under these questions:
 1. Are there missing non-goals that will cause scope creep?
 2. Does the task breakdown have the right granularity — too coarse or too fine?
 3. Are there dependency chains that will block parallel work?
