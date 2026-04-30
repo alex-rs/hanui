@@ -7,7 +7,7 @@
     "seeded_at": "2026-04-30T00:00:00Z",
     "seeded_from": "26075c4b630f7ef0b5c20130df3d71256b06405a",
     "regenerated": "2026-04-30",
-    "regenerated_for": "Interim re-seed for Phase 6 Wave 0 (post-TASK-097 main SHA 26075c4). Captures cumulative drift from TASK-095 through TASK-101. Final re-seed will occur after TASK-112 per TASK-113 plan entry."
+    "regenerated_for": "TASK-100 PR #94 \u2014 capture bridge.rs PinEntryHost additions before merge; TASK-113 final re-seed at end of Phase 6 supersedes"
   },
   "files": {
     "src/actions/dispatcher.rs": {
@@ -171,9 +171,9 @@
       "pct": 100.0
     },
     "src/ui/bridge.rs": {
-      "lines_total": 2304,
-      "lines_covered": 2272,
-      "pct": 98.6
+      "lines_total": 2571,
+      "lines_covered": 2533,
+      "pct": 98.52
     },
     "src/ui/mod.rs": {
       "lines_total": 0,
