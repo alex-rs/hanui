@@ -22,7 +22,9 @@
 //! # Severity table (locked — do NOT soften or harden without plan amendment)
 //!
 //! Per `locked_decisions.validation_severity` in
-//! `docs/plans/2026-04-29-phase-4-layout.md`:
+//! `docs/plans/2026-04-29-phase-4-layout.md` and
+//! `locked_decisions.validation_rule_identifiers` in
+//! `docs/plans/2026-04-30-phase-6-advanced-widgets.md`:
 //!
 //! | Rule | Severity |
 //! |---|---|
@@ -33,22 +35,34 @@
 //! | `MaxWidgetsPerViewExceeded` | Error |
 //! | `CameraIntervalBelowMin` | Error |
 //! | `HistoryWindowAboveMax` | Error |
-//! | `PinPolicyInvalidCodeFormat` | Error |
+//! | `PinPolicyRequiredOnDisarmOnLock` | Error |
+//! | `CoverPositionOutOfBounds` | Error |
+//! | `ClimateMinMaxTempInvalid` | Error |
+//! | `MediaTransportNotAllowed` | Error |
+//! | `HistoryMaxPointsExceeded` | Error |
 //! | `ImageOptionExceedsMaxPx` | Warning |
 //! | `CameraIntervalBelowDefault` | Warning |
+//! | `PowerFlowBatteryWithoutSoC` | Warning |
 //!
-//! # Visibility predicate namespace (locked — Phase 6 evaluates, Phase 4 validates)
+//! # Visibility predicate namespace (Phase 4 + Phase 6 widening)
 //!
-//! The known predicate set is a fixed const slice. Predicates not in the list
-//! are an `UnknownVisibilityPredicate` Error so that schemas written for Phase 4
-//! do not silently ignore future predicates on older clients.
+//! The known predicate set is a fixed const slice plus pattern matchers for
+//! parameterised forms. Predicates not in the list are an
+//! `UnknownVisibilityPredicate` Error.
 //!
-//! Known predicates (exact string match, or prefix match for parameterised forms):
+//! Phase 4 predicates (exact or prefix match):
 //! - `always`
 //! - `never`
 //! - `entity_available:` (followed by an entity ID)
 //! - `state_equals:` (followed by `<entity_id>:<value>`)
-//! - `profile:` (followed by a profile key: `rpi4`, `opi-zero3`, `desktop`)
+//! - `profile:` (followed by a profile key)
+//!
+//! Phase 6 widening per `locked_decisions.visibility_predicate_vocabulary`:
+//! - `<id> == <value>`: entity state equality
+//! - `<id> != <value>`: entity state inequality
+//! - `<id> in [<v1>,<v2>,...]`: entity state in list
+//! - `entity_state_numeric:<id>:<op>:<N>`: numeric comparison
+//!   (op: lt/lte/gt/gte/eq/ne; N is f64-parseable)
 //!
 //! # Security note
 //!
@@ -61,7 +75,7 @@
 use crate::actions::Action;
 use crate::dashboard::profiles::DeviceProfile;
 use crate::dashboard::schema::{
-    Dashboard, Issue, Section, Severity, ValidationRule, Widget, WidgetOptions,
+    Dashboard, Issue, PinPolicy, Section, Severity, ValidationRule, Widget, WidgetOptions,
 };
 
 // Re-export `CallServiceAllowlist` from this module so consumers (notably
@@ -87,16 +101,29 @@ const EXACT_PREDICATES: &[&str] = &["always", "never"];
 ///
 /// A predicate is valid if it equals an entry in [`EXACT_PREDICATES`] or
 /// starts with one of these prefixes followed by at least one character.
-const PARAMETERISED_PREFIXES: &[&str] = &["entity_available:", "state_equals:", "profile:"];
+const PARAMETERISED_PREFIXES: &[&str] = &[
+    "entity_available:",
+    "state_equals:",
+    "profile:",
+    "entity_state_numeric:",
+];
 
-/// Returns `true` if `predicate` is a member of the locked Phase 4 predicate
-/// namespace.
+/// The maximum allowed value of `History::max_points` per
+/// `locked_decisions.history_render_path`.
+const HISTORY_MAX_POINTS_LIMIT: u32 = 240;
+
+/// Returns `true` if `predicate` is a member of the locked predicate
+/// namespace (Phase 4 + Phase 6 widening per
+/// `locked_decisions.visibility_predicate_vocabulary`).
 ///
 /// Matching rules:
 /// 1. Exact match against any entry in [`EXACT_PREDICATES`].
 /// 2. Prefix match against any entry in [`PARAMETERISED_PREFIXES`] where at
-///    least one byte follows the prefix (i.e. `"entity_available:"` alone is
-///    not valid — a target entity ID must follow).
+///    least one byte follows the prefix.
+/// 3. Phase 6 free-form patterns:
+///    - `<id> == <value>`: contains ` == `
+///    - `<id> != <value>`: contains ` != `
+///    - `<id> in [...]`: contains ` in [`
 fn is_known_predicate(predicate: &str) -> bool {
     if EXACT_PREDICATES.contains(&predicate) {
         return true;
@@ -108,18 +135,13 @@ fn is_known_predicate(predicate: &str) -> bool {
             }
         }
     }
+    // Phase 6 widening: free-form infix patterns
+    // `<id> == <value>`, `<id> != <value>`, `<id> in [...]`
+    if predicate.contains(" == ") || predicate.contains(" != ") || predicate.contains(" in [") {
+        return true;
+    }
     false
 }
-
-// ---------------------------------------------------------------------------
-// PIN code-format valid values
-// ---------------------------------------------------------------------------
-
-/// Valid `pin_policy.code_format` string values.
-///
-/// Per `locked_decisions.validation_severity`: the format must be one of these
-/// string values; anything else is a `PinPolicyInvalidCodeFormat` Error.
-const VALID_CODE_FORMATS: &[&str] = &["Number", "Any"];
 
 // ---------------------------------------------------------------------------
 // Allowlist construction (pass 1)
@@ -205,9 +227,11 @@ fn check_widget(widget: &Widget, ctx: &WidgetCtx<'_>, issues: &mut Vec<Issue>) {
             severity: Severity::Error,
             path: format!("{widget_path}.visibility"),
             message: format!(
-                "visibility predicate {:?} is not in the locked Phase 4 predicate namespace; \
+                "visibility predicate {:?} is not in the locked predicate namespace; \
                  known exact predicates: always, never; \
-                 known parameterised prefixes: entity_available:, state_equals:, profile:",
+                 known parameterised prefixes: entity_available:, state_equals:, profile:, \
+                 entity_state_numeric:; \
+                 known Phase 6 infix forms: <id> == <value>, <id> != <value>, <id> in [...]",
                 widget.visibility,
             ),
             yaml_excerpt: String::new(),
@@ -249,7 +273,9 @@ fn check_widget(widget: &Widget, ctx: &WidgetCtx<'_>, issues: &mut Vec<Issue>) {
     // --- WidgetOptions-level checks -----------------------------------------
     if let Some(ref options) = widget.options {
         match options {
-            WidgetOptions::Camera { interval_seconds } => {
+            WidgetOptions::Camera {
+                interval_seconds, ..
+            } => {
                 // CameraIntervalBelowMin → Error
                 if *interval_seconds < profile.camera_interval_min_s {
                     issues.push(Issue {
@@ -282,11 +308,13 @@ fn check_widget(widget: &Widget, ctx: &WidgetCtx<'_>, issues: &mut Vec<Issue>) {
                 // ImageOptionExceedsMaxPx → Warning
                 // The camera widget does not carry an explicit image dimension
                 // field at this schema version; this check is a placeholder for
-                // when the image option is added. Documented as Warning per the
-                // severity table.
+                // when the image option is added.
             }
 
-            WidgetOptions::History { window_seconds } => {
+            WidgetOptions::History {
+                window_seconds,
+                max_points,
+            } => {
                 // HistoryWindowAboveMax → Error
                 if *window_seconds > profile.history_window_max_s {
                     issues.push(Issue {
@@ -301,27 +329,149 @@ fn check_widget(widget: &Widget, ctx: &WidgetCtx<'_>, issues: &mut Vec<Issue>) {
                         yaml_excerpt: String::new(),
                     });
                 }
-            }
-
-            WidgetOptions::Lock { pin_policy } | WidgetOptions::Alarm { pin_policy } => {
-                // PinPolicyInvalidCodeFormat → Error
-                if !VALID_CODE_FORMATS.contains(&pin_policy.code_format.as_str()) {
+                // HistoryMaxPointsExceeded → Error
+                if *max_points > HISTORY_MAX_POINTS_LIMIT {
                     issues.push(Issue {
-                        rule: ValidationRule::PinPolicyInvalidCodeFormat,
+                        rule: ValidationRule::HistoryMaxPointsExceeded,
                         severity: Severity::Error,
-                        path: format!("{widget_path}.options.pin_policy.code_format"),
+                        path: format!("{widget_path}.options.history.max_points"),
                         message: format!(
-                            "pin_policy.code_format {:?} is not a valid format; \
-                             allowed values: Number, Any",
-                            pin_policy.code_format,
+                            "history max_points {max_points} exceeds the validator maximum \
+                             {HISTORY_MAX_POINTS_LIMIT} per locked_decisions.history_render_path",
                         ),
                         yaml_excerpt: String::new(),
                     });
                 }
             }
 
-            // Fan has no validator-relevant options at Phase 4.
+            WidgetOptions::Lock {
+                pin_policy,
+                require_confirmation_on_unlock: _,
+            } => {
+                // PinPolicyRequiredOnDisarmOnLock → Error
+                // RequiredOnDisarm is valid only for Alarm widgets.
+                if matches!(pin_policy, PinPolicy::RequiredOnDisarm { .. }) {
+                    issues.push(Issue {
+                        rule: ValidationRule::PinPolicyRequiredOnDisarmOnLock,
+                        severity: Severity::Error,
+                        path: format!("{widget_path}.options.lock.pin_policy"),
+                        message: "PinPolicy::RequiredOnDisarm is not valid on a lock widget; \
+                                  lock accepts only None or Required. \
+                                  Use RequiredOnDisarm on alarm widgets only."
+                            .to_string(),
+                        yaml_excerpt: String::new(),
+                    });
+                }
+            }
+
+            WidgetOptions::Alarm { .. } => {
+                // All PinPolicy variants are valid on Alarm — no additional checks needed.
+            }
+
+            // Fan has no validator-relevant options at Phase 4/6.0.
             WidgetOptions::Fan { .. } => {}
+
+            // Phase 6: Cover position bounds check
+            WidgetOptions::Cover {
+                position_min,
+                position_max,
+            } => {
+                // CoverPositionOutOfBounds → Error
+                // Bounds must satisfy: position_min <= position_max AND both in 0..=100.
+                let out_of_range = *position_min > 100 || *position_max > 100;
+                let inverted = *position_min > *position_max;
+                if out_of_range || inverted {
+                    issues.push(Issue {
+                        rule: ValidationRule::CoverPositionOutOfBounds,
+                        severity: Severity::Error,
+                        path: format!("{widget_path}.options.cover"),
+                        message: format!(
+                            "cover position bounds are invalid: position_min={position_min}, \
+                             position_max={position_max}; \
+                             both values must be in 0..=100 and position_min must be ≤ position_max",
+                        ),
+                        yaml_excerpt: String::new(),
+                    });
+                }
+            }
+
+            // Phase 6: Climate min/max temp check
+            WidgetOptions::Climate {
+                min_temp,
+                max_temp,
+                step,
+                ..
+            } => {
+                // ClimateMinMaxTempInvalid → Error
+                let min_gte_max = *min_temp >= *max_temp;
+                let step_invalid = *step <= 0.0;
+                if min_gte_max || step_invalid {
+                    issues.push(Issue {
+                        rule: ValidationRule::ClimateMinMaxTempInvalid,
+                        severity: Severity::Error,
+                        path: format!("{widget_path}.options.climate"),
+                        message: format!(
+                            "climate options are invalid: min_temp={min_temp}, max_temp={max_temp}, \
+                             step={step}; min_temp must be < max_temp and step must be > 0.0",
+                        ),
+                        yaml_excerpt: String::new(),
+                    });
+                }
+            }
+
+            // Phase 6: MediaPlayer transport allowlist check
+            WidgetOptions::MediaPlayer {
+                transport_set,
+                volume_step,
+            } => {
+                // MediaTransportNotAllowed → Error
+                // The MediaTransport enum is closed (no free strings), so this check
+                // is a volume_step sanity check — the transport_set is type-safe.
+                // We still check volume_step is positive.
+                if *volume_step <= 0.0 {
+                    issues.push(Issue {
+                        rule: ValidationRule::MediaTransportNotAllowed,
+                        severity: Severity::Error,
+                        path: format!("{widget_path}.options.media_player.volume_step"),
+                        message: format!("media_player volume_step {volume_step} must be > 0.0",),
+                        yaml_excerpt: String::new(),
+                    });
+                }
+                if transport_set.is_empty() {
+                    issues.push(Issue {
+                        rule: ValidationRule::MediaTransportNotAllowed,
+                        severity: Severity::Error,
+                        path: format!("{widget_path}.options.media_player.transport_set"),
+                        message: "media_player transport_set must not be empty; \
+                                  specify at least one transport operation"
+                            .to_string(),
+                        yaml_excerpt: String::new(),
+                    });
+                }
+            }
+
+            // Phase 6: PowerFlow battery/SoC warning
+            WidgetOptions::PowerFlow {
+                battery_entity,
+                battery_soc_entity,
+                ..
+            } => {
+                // PowerFlowBatteryWithoutSoC → Warning
+                // Owned by TASK-094; reserved here per
+                // locked_decisions.validation_rule_identifiers.
+                if battery_entity.is_some() && battery_soc_entity.is_none() {
+                    issues.push(Issue {
+                        rule: ValidationRule::PowerFlowBatteryWithoutSoC,
+                        severity: Severity::Warning,
+                        path: format!("{widget_path}.options.power_flow.battery_soc_entity"),
+                        message:
+                            "power_flow has a battery_entity but no battery_soc_entity; \
+                                  the SoC label cannot be rendered without a state-of-charge entity"
+                                .to_string(),
+                        yaml_excerpt: String::new(),
+                    });
+                }
+            }
         }
     }
 
@@ -329,7 +479,7 @@ fn check_widget(widget: &Widget, ctx: &WidgetCtx<'_>, issues: &mut Vec<Issue>) {
     // The widget `icon` field is a string path/slug; the pixel dimension
     // is only known at decode time (Phase 6). The validator surfaces a Warning
     // when the widget carries an explicit numeric image dimension through
-    // a dedicated option. At Phase 4 there is no such numeric field on the
+    // a dedicated option. At Phase 4/6.0 there is no such numeric field on the
     // widget; this rule fires via the `WidgetOptions`-level path above when
     // that option is present. For icon strings, the rule is deferred to Phase 6.
     let _ = profile.max_image_px; // retained to satisfy the profile-bound enforcement requirement
@@ -412,8 +562,9 @@ mod tests {
     use super::*;
     use crate::dashboard::profiles::{PROFILE_DESKTOP, PROFILE_RPI4};
     use crate::dashboard::schema::{
-        Dashboard, Layout, PinPolicy, Placement, ProfileKey, Section, SectionGrid, Severity,
-        ValidationRule, View, Widget, WidgetKind, WidgetLayout, WidgetOptions,
+        CodeFormat, Dashboard, Layout, MediaTransport, PinPolicy, Placement, ProfileKey, Section,
+        SectionGrid, Severity, ValidationRule, View, Widget, WidgetKind, WidgetLayout,
+        WidgetOptions,
     };
     use std::sync::Arc;
 
@@ -504,9 +655,7 @@ mod tests {
 
         let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
         assert!(
-            issues
-                .iter()
-                .all(|i| i.rule != ValidationRule::SpanOverflow),
+            issues.is_empty(),
             "preferred_columns == grid.columns must not emit SpanOverflow"
         );
     }
@@ -606,10 +755,38 @@ views:
 
             let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
             assert!(
-                issues
-                    .iter()
-                    .all(|i| i.rule != ValidationRule::UnknownVisibilityPredicate),
+                issues.is_empty(),
                 "predicate {predicate:?} must NOT emit UnknownVisibilityPredicate"
+            );
+        }
+    }
+
+    // Phase 6 visibility predicate widening tests
+    #[test]
+    fn visibility_predicate_widening_accepts_new_forms() {
+        // Per locked_decisions.visibility_predicate_vocabulary (B4 resolution).
+        let new_forms = [
+            "light.kitchen == on",
+            "light.kitchen != off",
+            "climate.living_room in [heat, cool]",
+            "entity_state_numeric:sensor.temp:gt:20",
+            "entity_state_numeric:sensor.temp:lte:30",
+            "entity_state_numeric:sensor.temp:gte:18",
+            "entity_state_numeric:sensor.temp:lt:35",
+            "entity_state_numeric:sensor.temp:eq:22",
+            "entity_state_numeric:sensor.temp:ne:0",
+        ];
+        for predicate in new_forms {
+            let mut widget = minimal_widget("w1", 2);
+            widget.visibility = predicate.to_string();
+
+            let section = section_with_columns(4, vec![widget]);
+            let dashboard = dashboard_with_section(section);
+
+            let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
+            assert!(
+                issues.is_empty(),
+                "Phase 6 predicate {predicate:?} must NOT emit UnknownVisibilityPredicate"
             );
         }
     }
@@ -647,9 +824,7 @@ views:
 
         // No NonAllowlistedCallService issue: the allowlist was built from the same actions.
         assert!(
-            issues
-                .iter()
-                .all(|i| i.rule != ValidationRule::NonAllowlistedCallService),
+            issues.is_empty(),
             "declared CallService actions must not emit NonAllowlistedCallService"
         );
         assert!(
@@ -722,9 +897,7 @@ views:
 
         let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
         assert!(
-            issues
-                .iter()
-                .all(|i| i.rule != ValidationRule::MaxWidgetsPerViewExceeded),
+            issues.is_empty(),
             "64 widgets in a 64-limit view must not emit MaxWidgetsPerViewExceeded"
         );
     }
@@ -740,6 +913,7 @@ views:
         widget.widget_type = WidgetKind::Camera;
         widget.options = Some(WidgetOptions::Camera {
             interval_seconds: 4,
+            url: "http://cam.local/snapshot".to_string(),
         });
 
         let section = section_with_columns(4, vec![widget]);
@@ -763,6 +937,7 @@ views:
         widget.widget_type = WidgetKind::Camera;
         widget.options = Some(WidgetOptions::Camera {
             interval_seconds: 5,
+            url: "http://cam.local/snapshot".to_string(),
         });
 
         let section = section_with_columns(4, vec![widget]);
@@ -789,6 +964,7 @@ views:
         widget.widget_type = WidgetKind::History;
         widget.options = Some(WidgetOptions::History {
             window_seconds: max + 1,
+            max_points: 60,
         });
 
         let section = section_with_columns(4, vec![widget]);
@@ -811,6 +987,174 @@ views:
         widget.widget_type = WidgetKind::History;
         widget.options = Some(WidgetOptions::History {
             window_seconds: max,
+            max_points: 60,
+        });
+
+        let section = section_with_columns(4, vec![widget]);
+        let dashboard = dashboard_with_section(section);
+
+        let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
+        assert!(
+            issues.is_empty(),
+            "window_seconds == max must not emit HistoryWindowAboveMax"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // HistoryMaxPointsExceeded — new Phase 6 rule
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_history_max_points_exceeded_is_error() {
+        let mut widget = minimal_widget("hist", 2);
+        widget.widget_type = WidgetKind::History;
+        widget.options = Some(WidgetOptions::History {
+            window_seconds: 3600,
+            max_points: 241, // exceeds validator max of 240
+        });
+
+        let section = section_with_columns(4, vec![widget]);
+        let dashboard = dashboard_with_section(section);
+
+        let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
+        let issue = issues
+            .iter()
+            .find(|i| i.rule == ValidationRule::HistoryMaxPointsExceeded)
+            .expect("HistoryMaxPointsExceeded must be present when max_points=241");
+        assert_eq!(issue.severity, Severity::Error);
+        assert!(issue.message.contains("241"));
+    }
+
+    #[test]
+    fn validate_history_max_points_at_limit_is_clean() {
+        let mut widget = minimal_widget("hist", 2);
+        widget.widget_type = WidgetKind::History;
+        widget.options = Some(WidgetOptions::History {
+            window_seconds: 3600,
+            max_points: 240, // exactly at validator max
+        });
+
+        let section = section_with_columns(4, vec![widget]);
+        let dashboard = dashboard_with_section(section);
+
+        let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
+        assert!(
+            issues.is_empty(),
+            "max_points == 240 must not emit HistoryMaxPointsExceeded"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PinPolicyRequiredOnDisarmOnLock (replaces PinPolicyInvalidCodeFormat)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_pin_policy_required_on_disarm_on_lock_is_error() {
+        let mut widget = minimal_widget("lock", 2);
+        widget.widget_type = WidgetKind::Lock;
+        widget.options = Some(WidgetOptions::Lock {
+            pin_policy: PinPolicy::RequiredOnDisarm {
+                length: 4,
+                code_format: CodeFormat::Number,
+            },
+            require_confirmation_on_unlock: false,
+        });
+
+        let section = section_with_columns(4, vec![widget]);
+        let dashboard = dashboard_with_section(section);
+
+        let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
+
+        let issue = issues
+            .iter()
+            .find(|i| i.rule == ValidationRule::PinPolicyRequiredOnDisarmOnLock)
+            .expect("PinPolicyRequiredOnDisarmOnLock must be present");
+        assert_eq!(issue.severity, Severity::Error);
+        assert!(issue.path.contains("pin_policy"));
+    }
+
+    #[test]
+    fn validate_lock_with_required_pin_policy_is_clean() {
+        for pin_policy in [
+            PinPolicy::None,
+            PinPolicy::Required {
+                length: 4,
+                code_format: CodeFormat::Number,
+            },
+        ] {
+            let mut widget = minimal_widget("lock", 2);
+            widget.widget_type = WidgetKind::Lock;
+            widget.options = Some(WidgetOptions::Lock {
+                pin_policy,
+                require_confirmation_on_unlock: false,
+            });
+
+            let section = section_with_columns(4, vec![widget]);
+            let dashboard = dashboard_with_section(section);
+
+            let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
+            assert!(
+                issues.is_empty(),
+                "Lock with valid PinPolicy must not emit PinPolicyRequiredOnDisarmOnLock"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_alarm_accepts_required_on_disarm() {
+        // RequiredOnDisarm is valid for Alarm widgets — must NOT produce an error.
+        let mut widget = minimal_widget("alarm", 2);
+        widget.widget_type = WidgetKind::Alarm;
+        widget.options = Some(WidgetOptions::Alarm {
+            pin_policy: PinPolicy::RequiredOnDisarm {
+                length: 6,
+                code_format: CodeFormat::Any,
+            },
+        });
+
+        let section = section_with_columns(4, vec![widget]);
+        let dashboard = dashboard_with_section(section);
+
+        let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
+        assert!(
+            issues.is_empty(),
+            "Alarm with RequiredOnDisarm must be accepted (not an error)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CoverPositionOutOfBounds — new Phase 6 rule
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_cover_position_out_of_bounds_is_error() {
+        // position_min > position_max → Error
+        let mut widget = minimal_widget("cover", 2);
+        widget.widget_type = WidgetKind::Cover;
+        widget.options = Some(WidgetOptions::Cover {
+            position_min: 80,
+            position_max: 20, // inverted
+        });
+
+        let section = section_with_columns(4, vec![widget]);
+        let dashboard = dashboard_with_section(section);
+
+        let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
+        let issue = issues
+            .iter()
+            .find(|i| i.rule == ValidationRule::CoverPositionOutOfBounds)
+            .expect("CoverPositionOutOfBounds must be present when min > max");
+        assert_eq!(issue.severity, Severity::Error);
+    }
+
+    #[test]
+    fn validate_cover_position_out_of_range_is_error() {
+        // position_max > 100 → Error
+        let mut widget = minimal_widget("cover", 2);
+        widget.widget_type = WidgetKind::Cover;
+        widget.options = Some(WidgetOptions::Cover {
+            position_min: 0,
+            position_max: 101, // out of 0..=100
         });
 
         let section = section_with_columns(4, vec![widget]);
@@ -820,88 +1164,247 @@ views:
         assert!(
             issues
                 .iter()
-                .all(|i| i.rule != ValidationRule::HistoryWindowAboveMax),
-            "window_seconds == max must not emit HistoryWindowAboveMax"
+                .any(|i| i.rule == ValidationRule::CoverPositionOutOfBounds),
+            "position_max=101 must emit CoverPositionOutOfBounds"
+        );
+    }
+
+    #[test]
+    fn validate_cover_position_valid_is_clean() {
+        let mut widget = minimal_widget("cover", 2);
+        widget.widget_type = WidgetKind::Cover;
+        widget.options = Some(WidgetOptions::Cover {
+            position_min: 0,
+            position_max: 100,
+        });
+
+        let section = section_with_columns(4, vec![widget]);
+        let dashboard = dashboard_with_section(section);
+
+        let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
+        assert!(
+            issues.is_empty(),
+            "valid cover position must not emit CoverPositionOutOfBounds"
         );
     }
 
     // -----------------------------------------------------------------------
-    // PinPolicyInvalidCodeFormat
+    // ClimateMinMaxTempInvalid — new Phase 6 rule
     // -----------------------------------------------------------------------
 
     #[test]
-    fn validate_pin_policy_invalid_code_format_is_error() {
-        let mut widget = minimal_widget("lock", 2);
-        widget.widget_type = WidgetKind::Lock;
-        widget.options = Some(WidgetOptions::Lock {
-            pin_policy: PinPolicy {
-                code_format: "regex:[0-9]{4}".to_string(), // not a valid format
-            },
+    fn validate_climate_min_gte_max_temp_is_error() {
+        let mut widget = minimal_widget("clim", 2);
+        widget.widget_type = WidgetKind::Climate;
+        widget.options = Some(WidgetOptions::Climate {
+            min_temp: 30.0,
+            max_temp: 20.0, // min >= max
+            step: 0.5,
+            hvac_modes: vec![],
         });
 
         let section = section_with_columns(4, vec![widget]);
         let dashboard = dashboard_with_section(section);
 
         let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
-
         let issue = issues
             .iter()
-            .find(|i| i.rule == ValidationRule::PinPolicyInvalidCodeFormat)
-            .expect("PinPolicyInvalidCodeFormat must be present");
+            .find(|i| i.rule == ValidationRule::ClimateMinMaxTempInvalid)
+            .expect("ClimateMinMaxTempInvalid must be present when min >= max");
         assert_eq!(issue.severity, Severity::Error);
     }
 
     #[test]
-    fn validate_pin_policy_valid_formats_are_clean() {
-        for format in ["Number", "Any"] {
-            let mut widget = minimal_widget("lock", 2);
-            widget.widget_type = WidgetKind::Lock;
-            widget.options = Some(WidgetOptions::Lock {
-                pin_policy: PinPolicy {
-                    code_format: format.to_string(),
-                },
-            });
-
-            let section = section_with_columns(4, vec![widget]);
-            let dashboard = dashboard_with_section(section);
-
-            let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
-            assert!(
-                issues
-                    .iter()
-                    .all(|i| i.rule != ValidationRule::PinPolicyInvalidCodeFormat),
-                "code_format {format:?} must not emit PinPolicyInvalidCodeFormat"
-            );
-        }
-    }
-
-    #[test]
-    fn validate_alarm_pin_policy_invalid_code_format_is_error() {
-        let mut widget = minimal_widget("alarm", 2);
-        widget.widget_type = WidgetKind::Alarm;
-        widget.options = Some(WidgetOptions::Alarm {
-            pin_policy: PinPolicy {
-                code_format: "NotAValidFormat".to_string(),
-            },
+    fn validate_climate_step_zero_is_error() {
+        let mut widget = minimal_widget("clim", 2);
+        widget.widget_type = WidgetKind::Climate;
+        widget.options = Some(WidgetOptions::Climate {
+            min_temp: 16.0,
+            max_temp: 30.0,
+            step: 0.0, // must be > 0
+            hvac_modes: vec![],
         });
 
         let section = section_with_columns(4, vec![widget]);
         let dashboard = dashboard_with_section(section);
 
         let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.rule == ValidationRule::ClimateMinMaxTempInvalid),
+            "step=0.0 must emit ClimateMinMaxTempInvalid"
+        );
+    }
 
+    #[test]
+    fn validate_climate_valid_is_clean() {
+        let mut widget = minimal_widget("clim", 2);
+        widget.widget_type = WidgetKind::Climate;
+        widget.options = Some(WidgetOptions::Climate {
+            min_temp: 16.0,
+            max_temp: 30.0,
+            step: 0.5,
+            hvac_modes: vec!["heat".to_string(), "cool".to_string()],
+        });
+
+        let section = section_with_columns(4, vec![widget]);
+        let dashboard = dashboard_with_section(section);
+
+        let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
+        assert!(
+            issues.is_empty(),
+            "valid climate options must not emit ClimateMinMaxTempInvalid"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // MediaTransportNotAllowed — new Phase 6 rule
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_media_player_empty_transport_set_is_error() {
+        let mut widget = minimal_widget("mp", 2);
+        widget.widget_type = WidgetKind::MediaPlayer;
+        widget.options = Some(WidgetOptions::MediaPlayer {
+            transport_set: vec![], // empty
+            volume_step: 0.1,
+        });
+
+        let section = section_with_columns(4, vec![widget]);
+        let dashboard = dashboard_with_section(section);
+
+        let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.rule == ValidationRule::MediaTransportNotAllowed),
+            "empty transport_set must emit MediaTransportNotAllowed"
+        );
+    }
+
+    #[test]
+    fn validate_media_player_volume_step_zero_is_error() {
+        // volume_step <= 0.0 must emit MediaTransportNotAllowed (Error).
+        // Covers production path at validate.rs lines 431-435.
+        let mut widget = minimal_widget("mp", 2);
+        widget.widget_type = WidgetKind::MediaPlayer;
+        widget.options = Some(WidgetOptions::MediaPlayer {
+            transport_set: vec![MediaTransport::Play],
+            volume_step: 0.0, // must be > 0
+        });
+
+        let section = section_with_columns(4, vec![widget]);
+        let dashboard = dashboard_with_section(section);
+
+        let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
         let issue = issues
             .iter()
-            .find(|i| i.rule == ValidationRule::PinPolicyInvalidCodeFormat)
-            .expect("Alarm widget PinPolicyInvalidCodeFormat must be present");
+            .find(|i| i.rule == ValidationRule::MediaTransportNotAllowed)
+            .expect("MediaTransportNotAllowed must be present when volume_step=0.0");
         assert_eq!(issue.severity, Severity::Error);
+        assert!(
+            issue.path.contains("volume_step"),
+            "issue path must reference volume_step: {}",
+            issue.path
+        );
+    }
+
+    #[test]
+    fn validate_media_player_volume_step_negative_is_error() {
+        // Negative volume_step also triggers the rule.
+        let mut widget = minimal_widget("mp", 2);
+        widget.widget_type = WidgetKind::MediaPlayer;
+        widget.options = Some(WidgetOptions::MediaPlayer {
+            transport_set: vec![MediaTransport::Play],
+            volume_step: -0.5,
+        });
+
+        let section = section_with_columns(4, vec![widget]);
+        let dashboard = dashboard_with_section(section);
+
+        let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.rule == ValidationRule::MediaTransportNotAllowed),
+            "negative volume_step must emit MediaTransportNotAllowed"
+        );
+    }
+
+    #[test]
+    fn validate_media_player_valid_is_clean() {
+        let mut widget = minimal_widget("mp", 2);
+        widget.widget_type = WidgetKind::MediaPlayer;
+        widget.options = Some(WidgetOptions::MediaPlayer {
+            transport_set: vec![MediaTransport::Play, MediaTransport::Pause],
+            volume_step: 0.05,
+        });
+
+        let section = section_with_columns(4, vec![widget]);
+        let dashboard = dashboard_with_section(section);
+
+        let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
+        assert!(
+            issues.is_empty(),
+            "valid media player options must not emit MediaTransportNotAllowed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PowerFlowBatteryWithoutSoC — new Phase 6 warning
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_power_flow_battery_without_soc_is_warning() {
+        let mut widget = minimal_widget("pf", 2);
+        widget.widget_type = WidgetKind::PowerFlow;
+        widget.options = Some(WidgetOptions::PowerFlow {
+            grid_entity: "sensor.grid".to_string(),
+            solar_entity: None,
+            battery_entity: Some("sensor.battery".to_string()), // battery without SoC
+            battery_soc_entity: None,
+            home_entity: None,
+        });
+
+        let section = section_with_columns(4, vec![widget]);
+        let dashboard = dashboard_with_section(section);
+
+        let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
+        let issue = issues
+            .iter()
+            .find(|i| i.rule == ValidationRule::PowerFlowBatteryWithoutSoC)
+            .expect("PowerFlowBatteryWithoutSoC must be present");
+        assert_eq!(issue.severity, Severity::Warning);
+    }
+
+    #[test]
+    fn validate_power_flow_battery_with_soc_is_clean() {
+        let mut widget = minimal_widget("pf", 2);
+        widget.widget_type = WidgetKind::PowerFlow;
+        widget.options = Some(WidgetOptions::PowerFlow {
+            grid_entity: "sensor.grid".to_string(),
+            solar_entity: None,
+            battery_entity: Some("sensor.battery".to_string()),
+            battery_soc_entity: Some("sensor.battery_soc".to_string()),
+            home_entity: None,
+        });
+
+        let section = section_with_columns(4, vec![widget]);
+        let dashboard = dashboard_with_section(section);
+
+        let (issues, _) = validate(&dashboard, &PROFILE_DESKTOP);
+        assert!(
+            issues.is_empty(),
+            "power_flow with battery + SoC must not emit PowerFlowBatteryWithoutSoC"
+        );
     }
 
     // -----------------------------------------------------------------------
     // ImageOptionExceedsMaxPx — Warning
     // -----------------------------------------------------------------------
     //
-    // At Phase 4, there is no dedicated numeric image-dimension option on
+    // At Phase 4/6.0, there is no dedicated numeric image-dimension option on
     // widget types (the icon field is a string slug/path). The
     // `ImageOptionExceedsMaxPx` Warning is triggered at decode time in Phase 6
     // when the resolved image exceeds `DeviceProfile.max_image_px`. The
@@ -958,6 +1461,7 @@ views:
         widget.widget_type = WidgetKind::Camera;
         widget.options = Some(WidgetOptions::Camera {
             interval_seconds: 3,
+            url: "http://cam.local/snapshot".to_string(),
         });
 
         let section = section_with_columns(4, vec![widget]);
@@ -981,6 +1485,7 @@ views:
         widget.widget_type = WidgetKind::Camera;
         widget.options = Some(WidgetOptions::Camera {
             interval_seconds: 2,
+            url: "http://cam.local/snapshot".to_string(),
         });
 
         let section = section_with_columns(4, vec![widget]);
@@ -1015,7 +1520,14 @@ views:
             (ValidationRule::MaxWidgetsPerViewExceeded, Severity::Error),
             (ValidationRule::CameraIntervalBelowMin, Severity::Error),
             (ValidationRule::HistoryWindowAboveMax, Severity::Error),
-            (ValidationRule::PinPolicyInvalidCodeFormat, Severity::Error),
+            (
+                ValidationRule::PinPolicyRequiredOnDisarmOnLock,
+                Severity::Error,
+            ),
+            (ValidationRule::CoverPositionOutOfBounds, Severity::Error),
+            (ValidationRule::ClimateMinMaxTempInvalid, Severity::Error),
+            (ValidationRule::MediaTransportNotAllowed, Severity::Error),
+            (ValidationRule::HistoryMaxPointsExceeded, Severity::Error),
         ] {
             let issue = Issue {
                 rule,
@@ -1036,6 +1548,10 @@ views:
             (ValidationRule::ImageOptionExceedsMaxPx, Severity::Warning),
             (
                 ValidationRule::CameraIntervalBelowDefault,
+                Severity::Warning,
+            ),
+            (
+                ValidationRule::PowerFlowBatteryWithoutSoC,
                 Severity::Warning,
             ),
         ] {
@@ -1070,6 +1586,7 @@ views:
         widget.widget_type = WidgetKind::Camera;
         widget.options = Some(WidgetOptions::Camera {
             interval_seconds: 0,
+            url: "http://cam.local/snapshot".to_string(),
         }); // BelowMin
         widget.visibility = "bad_predicate".to_string(); // UnknownVisibilityPredicate
 

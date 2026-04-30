@@ -110,7 +110,7 @@ views:
           gap: 8
         widgets:
           - id: living_room_fan
-            type: entity_tile
+            type: fan
             entity: fan.living_room
             name: "Living Room Fan"
             icon: "mdi:fan"
@@ -126,7 +126,7 @@ views:
               action: none
             layout:
               preferred_columns: 2
-              preferred_rows: 1
+              preferred_rows: 2
             options:
               fan:
                 speed_count: 3
@@ -136,7 +136,7 @@ views:
                   - "high"
 
           - id: bedroom_camera
-            type: entity_tile
+            type: camera
             entity: camera.bedroom
             name: "Bedroom Camera"
             icon: "mdi:camera"
@@ -152,10 +152,11 @@ views:
               preferred_rows: 2
             options:
               camera:
-                interval_seconds: 5
+                interval_seconds: 10
+                url: "http://homeassistant.local:8123/api/camera_proxy/camera.bedroom"
 
           - id: energy_history
-            type: entity_tile
+            type: history
             entity: sensor.energy_consumption
             name: "Energy (24h)"
             icon: "mdi:lightning-bolt"
@@ -167,11 +168,38 @@ views:
             double_tap_action:
               action: none
             layout:
-              preferred_columns: 2
-              preferred_rows: 1
+              preferred_columns: 4
+              preferred_rows: 2
             options:
               history:
                 window_seconds: 86400
+                max_points: 120
+
+          - id: living_room_thermostat
+            type: climate
+            entity: climate.living_room
+            name: "Living Room"
+            icon: "mdi:thermostat"
+            visibility: always
+            tap_action:
+              action: more-info
+            hold_action:
+              action: none
+            double_tap_action:
+              action: none
+            layout:
+              preferred_columns: 2
+              preferred_rows: 2
+            options:
+              climate:
+                min_temp: 16.0
+                max_temp: 30.0
+                step: 0.5
+                hvac_modes:
+                  - heat
+                  - cool
+                  - heat_cool
+                  - off
 
   - id: security
     title: Security
@@ -184,7 +212,7 @@ views:
           gap: 8
         widgets:
           - id: front_door_lock
-            type: entity_tile
+            type: lock
             entity: lock.front_door
             name: "Front Door"
             icon: "mdi:door-closed-lock"
@@ -204,10 +232,13 @@ views:
             options:
               lock:
                 pin_policy:
-                  code_format: "Number"
+                  required:
+                    length: 4
+                    code_format: number
+                require_confirmation_on_unlock: true
 
           - id: garage_door_lock
-            type: entity_tile
+            type: lock
             entity: lock.garage_door
             name: "Garage Door"
             icon: "mdi:garage"
@@ -226,8 +257,27 @@ views:
               preferred_rows: 1
             options:
               lock:
-                pin_policy:
-                  code_format: "Number"
+                pin_policy: none
+
+          - id: patio_cover
+            type: cover
+            entity: cover.patio
+            name: "Patio Cover"
+            icon: "mdi:window-shutter"
+            visibility: always
+            tap_action:
+              action: more-info
+            hold_action:
+              action: none
+            double_tap_action:
+              action: none
+            layout:
+              preferred_columns: 2
+              preferred_rows: 1
+            options:
+              cover:
+                position_min: 0
+                position_max: 100
 
       - id: alarm
         title: Alarm
@@ -236,7 +286,7 @@ views:
           gap: 8
         widgets:
           - id: home_alarm
-            type: entity_tile
+            type: alarm
             entity: alarm_control_panel.home
             name: "Home Alarm"
             icon: "mdi:shield-home"
@@ -256,7 +306,9 @@ views:
             options:
               alarm:
                 pin_policy:
-                  code_format: "Number"
+                  required_on_disarm:
+                    length: 4
+                    code_format: number
 
           - id: motion_sensor_front
             type: sensor_tile
@@ -273,3 +325,70 @@ views:
             layout:
               preferred_columns: 2
               preferred_rows: 1
+
+  - id: media
+    title: Media
+    layout: sections
+    sections:
+      - id: players
+        title: Media Players
+        grid:
+          columns: 4
+          gap: 8
+        widgets:
+          - id: living_room_tv
+            type: media_player
+            entity: media_player.living_room_tv
+            name: "Living Room TV"
+            icon: "mdi:television-play"
+            visibility: always
+            tap_action:
+              action: more-info
+            hold_action:
+              action: none
+            double_tap_action:
+              action: none
+            layout:
+              preferred_columns: 4
+              preferred_rows: 2
+            options:
+              media_player:
+                transport_set:
+                  - play
+                  - pause
+                  - stop
+                  - next
+                  - prev
+                volume_step: 0.05
+
+  - id: energy
+    title: Energy
+    layout: sections
+    sections:
+      - id: power_overview
+        title: Power Overview
+        grid:
+          columns: 4
+          gap: 8
+        widgets:
+          - id: home_power_flow
+            type: power_flow
+            name: "Power Flow"
+            icon: "mdi:lightning-bolt-circle"
+            visibility: always
+            tap_action:
+              action: more-info
+            hold_action:
+              action: none
+            double_tap_action:
+              action: none
+            layout:
+              preferred_columns: 4
+              preferred_rows: 3
+            options:
+              power_flow:
+                grid_entity: sensor.grid_power
+                solar_entity: sensor.solar_power
+                battery_entity: sensor.battery_power
+                battery_soc_entity: sensor.battery_soc
+                home_entity: sensor.home_power
