@@ -45,7 +45,6 @@ use crate::dashboard::loader;
 use crate::dashboard::profiles::PROFILE_DESKTOP;
 use crate::dashboard::schema::Dashboard;
 use crate::ha::client::{full_jitter, ClientError, SnapshotApplier, WsClient};
-use crate::ha::http::HaHttpClient;
 use crate::ha::live_store::LiveStore;
 use crate::ha::store::EntityStore;
 use crate::platform::config::Config;
@@ -331,19 +330,6 @@ fn run_with_live_store(runtime: &tokio::runtime::Runtime, config_path: Option<&s
         views = dashboard.views.len(),
         "dashboard loaded successfully"
     );
-
-    // TASK-097: construct the shared HTTP client singleton once, before any
-    // consumer (history, camera, media artwork) is wired. A second Config is
-    // loaded from the environment so the WsClient path retains ownership of
-    // the first Config by value (WsClient::new takes Config, not Arc<Config>,
-    // and src/ha/client.rs is in must_not_touch). Both Config instances read
-    // the same HA_URL / HA_TOKEN values at startup — no divergence is possible.
-    // The active profile provides cache/rate-limit caps.
-    let http_config = Config::from_env()
-        .context("reload HA config for HaHttpClient (should not fail after first load)")?;
-    let _http_client: Arc<HaHttpClient> =
-        Arc::new(HaHttpClient::new(Arc::new(http_config), &PROFILE_DESKTOP));
-    info!("HaHttpClient singleton constructed");
 
     let (state_tx, state_rx) = status::channel();
 
