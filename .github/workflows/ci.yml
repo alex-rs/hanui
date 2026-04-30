@@ -398,6 +398,142 @@ jobs:
         run: bash ops/checks/waiver-expiry-check.sh
 
   # ────────────────────────────────────────────────────────────────────────────
+  # Job: hot-path-bench
+  #
+  # Wave 1 / TASK-116: runs `cargo test --features bench --test churn` against
+  # the four audit-recommended scenarios (opi_profile_20w_2048e,
+  # rpi_profile_32w_4096e, bursty_one_visible_change, reconnect_diff_full_cap)
+  # on every PR that touches a hot-path file. The bench is the
+  # `performance-engineer` agent's regression guard: from TASK-117 onwards,
+  # every hot-path PR must compile and run this bench, and the agent compares
+  # the per-scenario p50/p95 against `benches/baseline.json` thresholds.
+  #
+  # Trigger paths (matches CLAUDE.md cross-agent escalation matrix
+  # "Hot-path file change" row):
+  #   - src/ha/live_store.rs
+  #   - src/ha/client.rs
+  #   - src/ha/protocol.rs
+  #   - src/ui/bridge.rs
+  #   - benches/churn.rs        (the bench itself)
+  #   - benches/baseline.json   (regenerated baseline must re-pass scenarios)
+  #
+  # We deliberately exclude the 60 s `churn_1000_entities_50_evs_holds_flush_cadence`
+  # mock-WS scenario from the PR-gate run; that scenario is wall-clock-bound
+  # and would push the PR budget past 5 minutes. It still lives in the file
+  # and runs in nightly via cargo test --features bench (no name filter).
+  #
+  # Regression-threshold enforcement is the `performance-engineer` agent's
+  # job (joint gate from TASK-117 onwards). This CI step verifies only that
+  # the bench compiles AND runs to completion AND produces parser-friendly
+  # BENCH-RESULT lines for all four scenarios. The agent reads the lines.
+  #
+  # Blast-radius: PRs touching the hot-path files. FP rate target: <1% — the
+  # explicit warm-up + sample-count constants in churn.rs (Risk #9 mitigation
+  # from docs/plans/2026-04-30-phase-7-performance.md) keep the variance
+  # below the regression thresholds on a typical runner.
+  # ────────────────────────────────────────────────────────────────────────────
+  hot-path-bench:
+    name: hot-path-bench (PR gate; TASK-116 / Wave 1)
+    runs-on: ubuntu-latest
+    needs: [lint, repo-rules]
+    # Only run on pull_request and push events (not on schedule). Nightly
+    # already exercises the bench via the test job's broader scope.
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    env:
+      TZ: UTC
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # We need history so dorny/paths-filter can compare base..head.
+          fetch-depth: 0
+
+      # ── Detect hot-path file changes ─────────────────────────────────────────
+      # dorny/paths-filter@v3 produces an output `hotpath` that is `true` iff
+      # the PR (or push) touches any of the listed files. The whole bench
+      # toolchain install + cargo test step is gated on this output, so PRs
+      # that don't touch hot paths skip the ~5–7 minute Slint-deps build.
+      #
+      # Why a separate job instead of an `if:` on a step in `test`?
+      #   - Keeps the `test` job's runtime budget tight.
+      #   - Surfaces the bench gate as a distinct required check name on PRs.
+      #   - Lets `performance-engineer` cite `hot-path-bench` directly in
+      #     `performance/approved` posts.
+      - name: detect hot-path changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            hotpath:
+              - 'src/ha/live_store.rs'
+              - 'src/ha/client.rs'
+              - 'src/ha/protocol.rs'
+              - 'src/ui/bridge.rs'
+              - 'benches/churn.rs'
+              - 'benches/baseline.json'
+
+      # ── Rust toolchain (pinned to match dev VM per TASK-002) ──────────────────
+      - name: setup Rust 1.95.0
+        if: steps.filter.outputs.hotpath == 'true'
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      # ── System libs required by Slint transitive deps ────────────────────────
+      # Same set as the lint/test jobs. The bench compiles against the full
+      # crate, including the Slint-derived bridge types, so these are required.
+      - name: install Slint system deps
+        if: steps.filter.outputs.hotpath == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-0 \
+            libxkbcommon-x11-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libxinerama-dev \
+            pkg-config \
+            cmake
+
+      # Cache cargo artifacts (separate key — release-mode compile is its own
+      # universe and shouldn't share the lint/test debug-mode cache).
+      - name: cache cargo artifacts (release)
+        if: steps.filter.outputs.hotpath == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: hot-path-bench-release
+
+      # ── Run the four audit-recommended scenarios in release mode ─────────────
+      # We name each scenario explicitly so the 60 s mock-WS scenario
+      # (`churn_1000_entities_50_evs_holds_flush_cadence`) is excluded — that
+      # one is nightly-only and would blow the PR budget.
+      #
+      # `--release` matches the baseline-capture command annotated in
+      # benches/baseline.json. Comparing release-mode samples against
+      # debug-mode baseline (or vice versa) would produce false regressions.
+      - name: cargo test --features bench (hot-path scenarios)
+        if: steps.filter.outputs.hotpath == 'true'
+        run: |
+          cargo test --features bench --release --test churn -- --nocapture \
+            opi_profile_20w_2048e \
+            rpi_profile_32w_4096e \
+            bursty_one_visible_change \
+            reconnect_diff_full_cap
+
+      # ── Skip notice for non-hot-path PRs ─────────────────────────────────────
+      # Emits a single line in the job log so a reader can confirm the gate
+      # decided to skip rather than silently passing. The job still posts a
+      # green status check, which is correct: there is nothing to verify.
+      - name: hot-path bench skipped (no hot-path file changes)
+        if: steps.filter.outputs.hotpath != 'true'
+        run: |
+          echo "hot-path-bench: no changes to src/ha/{live_store,client,protocol}.rs,"
+          echo "src/ui/bridge.rs, benches/churn.rs, or benches/baseline.json — skipping."
+
+  # ────────────────────────────────────────────────────────────────────────────
   # Job: sbc-cpu-smoke
   #
   # Nightly (and manual) aarch64 QEMU CPU smoke for the WS + LiveStore hot path.

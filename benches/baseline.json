@@ -1,0 +1,72 @@
+{
+  "_runner": "dev-workstation (not SBC) — baselines are for regression-delta detection, not absolute SBC budget. Per docs/plans/2026-04-30-phase-7-performance.md Risk #9 mitigation: regenerating this baseline requires devex-engineer + performance-engineer + ci-gatekeeper + human infra-approved: trailer.",
+  "_seeded_by": "TASK-116",
+  "_date": "2026-04-30",
+  "_warm_up_iters": 8,
+  "_sample_count_fast": 256,
+  "_sample_count_slow": 64,
+  "_capture_command": "cargo test --features bench --release --test churn -- --nocapture opi_profile_20w_2048e rpi_profile_32w_4096e bursty_one_visible_change reconnect_diff_full_cap",
+  "_regression_thresholds": {
+    "p50_pct_max": 5,
+    "p95_pct_max": 10,
+    "alloc_per_event_max": "+1",
+    "total_bytes_pct_max": 10,
+    "_note": "Enforced by performance-engineer agent on hot-path PRs from TASK-117 onwards. Bench-broken-blocker clause is exempted for TASK-116 only."
+  },
+  "scenarios": {
+    "opi_profile_20w_2048e": {
+      "_description": "20 widgets / 2048 entities / OPI Zero 3 profile. Tests build_tiles when total HA entities >> visible widgets.",
+      "build_tiles": {
+        "p50_ns": 10426,
+        "p95_ns": 20556,
+        "mean_ns": 11885,
+        "samples": 256
+      }
+    },
+    "rpi_profile_32w_4096e": {
+      "_description": "32 widgets / 4096 entities / RPI4 profile. Steady-state RPI cap.",
+      "build_tiles": {
+        "p50_ns": 24312,
+        "p95_ns": 30412,
+        "mean_ns": 23884,
+        "samples": 256
+      }
+    },
+    "bursty_one_visible_change": {
+      "_description": "Single visible entity flips state inside a 4096-entity store; both apply_event and build_tiles measured.",
+      "apply_event": {
+        "p50_ns": 260607,
+        "p95_ns": 647129,
+        "mean_ns": 322293,
+        "samples": 256
+      },
+      "build_tiles": {
+        "p50_ns": 19748,
+        "p95_ns": 61074,
+        "mean_ns": 25943,
+        "samples": 256
+      }
+    },
+    "reconnect_diff_full_cap": {
+      "_description": "Reconnect-style diff: N=4096 (RPI cap) entity updates applied back-to-back into a fresh store, then one build_tiles. Per-sample populate is the inner loop summing 4096 apply_event calls (so populate p50 ≈ 4096 × per-event apply cost in this captured run).",
+      "populate_4096_events": {
+        "p50_ns": 438888699,
+        "p95_ns": 462500003,
+        "mean_ns": 439326714,
+        "samples": 64
+      },
+      "build_tiles": {
+        "p50_ns": 25272,
+        "p95_ns": 59438,
+        "mean_ns": 28846,
+        "samples": 64
+      }
+    }
+  },
+  "_notes": [
+    "Numbers were captured on the dev workstation in --release mode. They are not SBC absolute budgets; the per-profile budget targets live in docs/dev/PERFORMANCE.md.",
+    "The performance-engineer agent reviews TASK-116 for baseline-sanity only (representative scenarios + appropriate runner annotation). Bench-broken-blocker clause is exempted for this PR because TASK-116 IS the restoration.",
+    "From TASK-117 onwards, hot-path PRs that regress any p50 by >5%, p95 by >10%, allocate >+1 per event, or grow total bytes by >10% will block on performance-engineer review.",
+    "Regenerating this baseline (re-running cargo test against the bench scenarios on a different runner) requires the same approval chain as any other protected-path change: devex-engineer + performance-engineer + ci-gatekeeper + human infra-approved: trailer."
+  ]
+}
