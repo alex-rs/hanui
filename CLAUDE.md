@@ -77,6 +77,7 @@ CTO rules (full list in `docs/cto.md`):
 - Threat modeling / secrets / dependency hygiene → `security-engineer`
 - API routes / database / authentication / background jobs → `backend-engineer`
 - other cloud / Docker / deployment / server provisioning / TLS → `infra-engineer`
+- Hot-path PR review (allocation budgets, bench regressions, profile wiring, animation budgets) → `performance-engineer` (co-gates with `ci-gatekeeper`)
 <!-- END routing -->
 
 ## Cross-agent escalation matrix
@@ -92,6 +93,9 @@ CTO rules (full list in `docs/cto.md`):
 | Retry circuit-breaker freeze | `ci-gatekeeper` | `devex-engineer` or human | `ci-gatekeeper` |
 | Abuse response posture change | `infra-engineer` | `security-engineer` | `security-engineer` |
 | Deployment pipeline change | `infra-engineer` | `devex-engineer` | — |
+| Hot-path file change (`src/ha/live_store.rs`, `src/ha/client.rs`, `src/ha/protocol.rs`, `src/ui/bridge.rs`, `src/lib.rs::run`, `src/dashboard/profiles.rs`, `src/dashboard/loader.rs`, animated `.slint` widgets, `benches/**`, `tests/smoke/**`) | author agent | `performance-engineer` AND `ci-gatekeeper` (joint gate) | `performance-engineer` + `ci-gatekeeper` |
+| `performance/approved` required check posted on PR | `performance-engineer` (sole authority) | — | `performance-engineer` |
+| `benches/baseline.json` regeneration | `devex-engineer` | `performance-engineer` + `ci-gatekeeper` + human `infra-approved:` | `ci-gatekeeper` + human |
 <!-- END escalation -->
 
 ## Agent-driven development guardrails (non-negotiable)
