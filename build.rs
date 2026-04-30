@@ -170,4 +170,38 @@ fn main() {
         "cargo:rustc-env=HANUI_VIEW_SWITCHER_INCLUDE={}",
         view_switcher_output.display()
     );
+
+    // PinEntry modal component (TASK-100) — standalone PIN entry window.
+    //
+    // Compiles `ui/slint/pin_entry.slint` to a separate output file so the
+    // bridge's `pin_entry_slint` submodule can instantiate `PinEntryWindow`
+    // without pulling in the full production `MainWindow` symbol set. This
+    // mirrors the pattern used by `gesture_test_window.slint` (TASK-060) and
+    // `view_switcher.slint` (TASK-086).
+    //
+    // This compile puts `pin_entry.slint` in the build graph:
+    // `cargo build` will fail if the component has a syntax or type error
+    // (satisfying the "Slint component compile gate" acceptance criterion in
+    // TASK-100).
+    //
+    // The generated `PinEntryWindow` type is accessible to `src/ui/bridge.rs`
+    // via `include!(env!("HANUI_PIN_ENTRY_INCLUDE"))` inside the
+    // `pin_entry_slint` submodule.
+    let pin_entry_input = manifest_dir.join("ui/slint/pin_entry.slint");
+    let pin_entry_output = out_dir.join("pin_entry.rs");
+
+    let pin_entry_deps = slint_build::compile_with_output_path(
+        &pin_entry_input,
+        &pin_entry_output,
+        slint_build::CompilerConfiguration::default(),
+    )
+    .expect("compile ui/slint/pin_entry.slint with slint-build");
+
+    for dep in pin_entry_deps {
+        println!("cargo:rerun-if-changed={}", dep.display());
+    }
+    println!(
+        "cargo:rustc-env=HANUI_PIN_ENTRY_INCLUDE={}",
+        pin_entry_output.display()
+    );
 }

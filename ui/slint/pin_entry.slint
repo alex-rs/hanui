@@ -1,0 +1,401 @@
+// pin_entry.slint — Phase 6 PIN entry modal window component.
+//
+// Provides a numeric or alphanumeric keypad modal for use by lock and alarm
+// tiles (TASK-104 / TASK-105) when PinPolicy::Required or
+// PinPolicy::RequiredOnDisarm demands a code before dispatching the action.
+//
+// Build graph:
+//   `build.rs` compiles this file to a separate output via
+//   `slint_build::compile_with_output_path`, exposing `HANUI_PIN_ENTRY_INCLUDE`
+//   to `src/ui/bridge.rs`, which pulls in the generated `PinEntryWindow` via
+//   `include!(env!("HANUI_PIN_ENTRY_INCLUDE"))` inside the `pin_entry_slint`
+//   submodule. This is the same pattern used by `gesture_test_window.slint`
+//   (TASK-060) and `view_switcher.slint` (TASK-086).
+//
+// Design invariants (per locked_decisions.pin_entry_dispatch):
+//   * The component fires `on-submit(code)` exactly once when OK is pressed
+//     or the user completes the configured `length` digits.
+//   * The component fires `on-cancel()` when Cancel is pressed.
+//   * The entered code is NEVER stored outside the Slint property graph.
+//     The Rust bridge receives it via `on-submit`, passes it to `FnOnce`,
+//     and then immediately clears `entered-code = ""` and hides the window.
+//   * The masked echo (`••••`) renders one bullet per entered digit and one
+//     open-circle per remaining slot — the user sees digit count, not code.
+//   * No inline hex color literals — all colors come from Theme tokens
+//     (CI Gate 1, .github/workflows/ci.yml).
+//
+// Performance constraints (per PHASES.md § Performance budgets):
+//   * Press animation duration capped at 150 ms per AnimationBudget
+//     (DEFAULT_PROFILE.animation_framerate_cap = 60 fps desktop).
+//   * Animation capped at DEFAULT_PROFILE.animation_framerate_cap per
+//     PHASES.md:58 — referenced via AnimationBudget.at-capacity.
+//   * No full-screen ripple — only the pressed key animates.
+//
+// Accessibility:
+//   * Keypad buttons have a minimum 44px hit target on all sides.
+//   * The masked echo uses Unicode BULLET (U+2022) and WHITE CIRCLE (U+25CB).
+//
+// Digit storage strategy (no substring in Slint):
+//   Slint strings have neither `substring` nor character indexing, so we
+//   cannot slice `entered-code` to implement backspace. Instead, each of the
+//   9 possible digit slots is stored as a private `string` property
+//   (`d1` … `d9`). The `entered-code` in-out property is computed from them
+//   as a concatenation. Adding a digit sets the next free slot; backspace
+//   clears the highest filled slot. Clearing the bridge resets all slots via
+//   the `reset-digits` callback.
+//
+// Component interface (PinEntryWindow):
+//   * `in property <int> code-length` — digits required (1-9). Default 4.
+//   * `in property <bool> numeric-only` — true: digits 0-9 only.
+//   * `in-out property <string> entered-code` — computed from filled slots.
+//     Reading this gives the current code. The bridge sets it to "" to clear
+//     via set_entered_code(""), which triggers reset of all slots through a
+//     binding changed handler (handled by the Rust bridge calling
+//     `reset_code()` via the `on-submit` / `on-cancel` wiring — the Slint
+//     side never writes entered-code back to the slots; the bridge calls
+//     clear by resetting d1..d9 via the exposed `reset-digits` callback).
+//   * `callback on-submit(string)` — called with the entered code once.
+//   * `callback on-cancel()` — called on Cancel press.
+//   * `callback reset-digits()` — called by the bridge after on-submit to
+//     clear the internal digit slots.
+
+import { Theme } from "theme.slint";
+import { AnimationBudget } from "card_base.slint";
+
+export { AnimationBudget } from "card_base.slint";
+
+// PinKeyButton — individual keypad key (internal component).
+//
+// Inherits Rectangle so that background, border-radius, border-width, and
+// border-color are available as direct properties (not wrapped in a child
+// Rectangle). This matches the pattern used by CardBase.
+//
+// Performance: press animation capped at DEFAULT_PROFILE.animation_framerate_cap
+// per PHASES.md:58 — gated by AnimationBudget.at-capacity.
+component PinKeyButton inherits Rectangle {
+    in property <string> label: "";
+    callback clicked();
+
+    // Minimum 44px hit target in both dimensions (accessibility requirement).
+    min-width: 76px;
+    min-height: 60px;
+    preferred-width: 76px;
+    preferred-height: 60px;
+
+    // Visual chrome — colors from theme tokens, no inline hex literals.
+    background: key-touch.pressed ? Theme.elevated : Theme.surface;
+    border-radius: Theme.radius-md;
+    border-width: 1px;
+    border-color: key-touch.pressed ? Theme.accent : Theme.state-off;
+
+    // Animation capped at DEFAULT_PROFILE.animation_framerate_cap per PHASES.md:58
+    animate background {
+        duration: AnimationBudget.at-capacity ? 0ms : 150ms;
+    }
+    animate border-color {
+        duration: AnimationBudget.at-capacity ? 0ms : 150ms;
+    }
+
+    Text {
+        text: root.label;
+        color: Theme.text-primary;
+        font-size: Theme.font-lg;
+        font-weight: Theme.font-weight-medium;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        width: parent.width;
+        height: parent.height;
+    }
+
+    key-touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// PinEntryWindow — top-level window for the PIN entry modal.
+//
+// Compiled as a standalone entry point by build.rs (separate from
+// main_window.slint) so this file is included by bridge.rs via
+// `include!(env!("HANUI_PIN_ENTRY_INCLUDE"))`.
+export component PinEntryWindow inherits Window {
+    // ── Public properties ───────────────────────────────────────────────────
+
+    /// Number of digits/characters required. Default 4. Range 1..=9.
+    in property <int> code-length: 4;
+
+    /// When true, only digits 0-9 are shown. When false, future phases can
+    /// extend the keypad. Phase 6 always sets this to true.
+    in property <bool> numeric-only: true;
+
+    // ── Internal per-slot digit storage ─────────────────────────────────────
+    //
+    // Each slot holds one character (or "" if not filled). Slots are filled
+    // left-to-right; backspace clears the rightmost non-empty slot. This
+    // avoids any string slicing — Slint has no substring / character-at
+    // primitives. digit-count below counts filled slots.
+    property <string> d1: "";
+    property <string> d2: "";
+    property <string> d3: "";
+    property <string> d4: "";
+    property <string> d5: "";
+    property <string> d6: "";
+    property <string> d7: "";
+    property <string> d8: "";
+    property <string> d9: "";
+
+    // digit-count: number of filled slots (0..=code-length).
+    property <int> digit-count:
+        (d1 != "" ? 1 : 0)
+        + (d2 != "" ? 1 : 0)
+        + (d3 != "" ? 1 : 0)
+        + (d4 != "" ? 1 : 0)
+        + (d5 != "" ? 1 : 0)
+        + (d6 != "" ? 1 : 0)
+        + (d7 != "" ? 1 : 0)
+        + (d8 != "" ? 1 : 0)
+        + (d9 != "" ? 1 : 0);
+
+    /// The currently entered code string — computed from filled digit slots.
+    /// Read by the bridge via `entered_code()`. The bridge does NOT write
+    /// this property; it calls `reset-digits()` to clear the slots instead.
+    out property <string> entered-code:
+        d1 + d2 + d3 + d4 + d5 + d6 + d7 + d8 + d9;
+
+    // ── Callbacks ───────────────────────────────────────────────────────────
+
+    /// Fired when OK is pressed and at least one digit is entered, or when
+    /// the last required digit is pressed (auto-submit). The bridge receives
+    /// the code, passes it to FnOnce, then immediately calls reset-digits().
+    callback on-submit(string);
+
+    /// Fired on Cancel press. The bridge drops the FnOnce (code not delivered)
+    /// and calls reset-digits() to clear internal state.
+    callback on-cancel();
+
+    /// Called by the bridge after on-submit or on-cancel to clear all digit
+    /// slots. This is the canonical way to reset the PIN modal — the bridge
+    /// must call this after consuming the code via on-submit, and on cancel.
+    callback reset-digits();
+    reset-digits() => {
+        root.d1 = "";
+        root.d2 = "";
+        root.d3 = "";
+        root.d4 = "";
+        root.d5 = "";
+        root.d6 = "";
+        root.d7 = "";
+        root.d8 = "";
+        root.d9 = "";
+    }
+
+    // ── Internal: digit append helper ────────────────────────────────────────
+    //
+    // append-digit sets the first empty slot to the given character. Called
+    // by each key's clicked handler.
+    callback append-digit(string);
+    append-digit(ch) => {
+        if (root.digit-count < root.code-length) {
+            if (root.d1 == "") { root.d1 = ch; }
+            else if (root.d2 == "") { root.d2 = ch; }
+            else if (root.d3 == "") { root.d3 = ch; }
+            else if (root.d4 == "") { root.d4 = ch; }
+            else if (root.d5 == "") { root.d5 = ch; }
+            else if (root.d6 == "") { root.d6 = ch; }
+            else if (root.d7 == "") { root.d7 = ch; }
+            else if (root.d8 == "") { root.d8 = ch; }
+            else if (root.d9 == "") { root.d9 = ch; }
+        }
+        if (root.digit-count >= root.code-length) {
+            root.on-submit(root.entered-code);
+        }
+    }
+
+    // ── Internal: backspace helper ───────────────────────────────────────────
+    //
+    // do-backspace clears the rightmost filled slot, shifting the code left
+    // by one character. This is a pure slot-clear operation — no string
+    // slicing needed.
+    callback do-backspace();
+    do-backspace() => {
+        if (root.d9 != "") { root.d9 = ""; }
+        else if (root.d8 != "") { root.d8 = ""; }
+        else if (root.d7 != "") { root.d7 = ""; }
+        else if (root.d6 != "") { root.d6 = ""; }
+        else if (root.d5 != "") { root.d5 = ""; }
+        else if (root.d4 != "") { root.d4 = ""; }
+        else if (root.d3 != "") { root.d3 = ""; }
+        else if (root.d2 != "") { root.d2 = ""; }
+        else if (root.d1 != "") { root.d1 = ""; }
+    }
+
+    // ── Window chrome ───────────────────────────────────────────────────────
+    title: "PIN Entry";
+    background: Theme.background;
+    preferred-width: 320px;
+    preferred-height: 480px;
+
+    // ── Layout ──────────────────────────────────────────────────────────────
+    VerticalLayout {
+        padding: Theme.space-4;
+        spacing: Theme.space-3;
+        alignment: center;
+
+        // ── Title ────────────────────────────────────────────────────────────
+        Text {
+            text: "Enter PIN";
+            color: Theme.text-primary;
+            font-size: Theme.font-xl;
+            font-weight: Theme.font-weight-bold;
+            horizontal-alignment: center;
+        }
+
+        // ── Masked echo ──────────────────────────────────────────────────────
+        // Renders one BULLET (U+2022) per filled slot, padded to code-length
+        // with WHITE CIRCLE (U+25CB). Shows digit count without revealing code.
+        //
+        // Security note: this text contains ONLY Unicode bullet characters —
+        // never the actual entered digits. `entered-code` (the actual string)
+        // is passed once to on-submit then cleared. The tracing-redact layer
+        // provides a runtime safety net.
+        Text {
+            text:
+                (root.code-length >= 1 ? (root.d1 != "" ? "\u{2022}" : "\u{25CB}") : "")
+                + (root.code-length >= 2 ? " " + (root.d2 != "" ? "\u{2022}" : "\u{25CB}") : "")
+                + (root.code-length >= 3 ? " " + (root.d3 != "" ? "\u{2022}" : "\u{25CB}") : "")
+                + (root.code-length >= 4 ? " " + (root.d4 != "" ? "\u{2022}" : "\u{25CB}") : "")
+                + (root.code-length >= 5 ? " " + (root.d5 != "" ? "\u{2022}" : "\u{25CB}") : "")
+                + (root.code-length >= 6 ? " " + (root.d6 != "" ? "\u{2022}" : "\u{25CB}") : "")
+                + (root.code-length >= 7 ? " " + (root.d7 != "" ? "\u{2022}" : "\u{25CB}") : "")
+                + (root.code-length >= 8 ? " " + (root.d8 != "" ? "\u{2022}" : "\u{25CB}") : "")
+                + (root.code-length >= 9 ? " " + (root.d9 != "" ? "\u{2022}" : "\u{25CB}") : "");
+            color: Theme.text-primary;
+            font-size: Theme.font-xxl;
+            font-weight: Theme.font-weight-bold;
+            letter-spacing: 6px;
+            horizontal-alignment: center;
+        }
+
+        // ── Keypad ────────────────────────────────────────────────────────────
+        // 3x3 digit grid + bottom row (backspace, 0, cancel).
+        VerticalLayout {
+            spacing: Theme.space-2;
+
+            // Row 1: 1 2 3
+            HorizontalLayout {
+                spacing: Theme.space-2;
+                alignment: center;
+                PinKeyButton {
+                    label: "1";
+                    clicked => { root.append-digit("1"); }
+                }
+                PinKeyButton {
+                    label: "2";
+                    clicked => { root.append-digit("2"); }
+                }
+                PinKeyButton {
+                    label: "3";
+                    clicked => { root.append-digit("3"); }
+                }
+            }
+
+            // Row 2: 4 5 6
+            HorizontalLayout {
+                spacing: Theme.space-2;
+                alignment: center;
+                PinKeyButton {
+                    label: "4";
+                    clicked => { root.append-digit("4"); }
+                }
+                PinKeyButton {
+                    label: "5";
+                    clicked => { root.append-digit("5"); }
+                }
+                PinKeyButton {
+                    label: "6";
+                    clicked => { root.append-digit("6"); }
+                }
+            }
+
+            // Row 3: 7 8 9
+            HorizontalLayout {
+                spacing: Theme.space-2;
+                alignment: center;
+                PinKeyButton {
+                    label: "7";
+                    clicked => { root.append-digit("7"); }
+                }
+                PinKeyButton {
+                    label: "8";
+                    clicked => { root.append-digit("8"); }
+                }
+                PinKeyButton {
+                    label: "9";
+                    clicked => { root.append-digit("9"); }
+                }
+            }
+
+            // Row 4: backspace, 0, cancel
+            HorizontalLayout {
+                spacing: Theme.space-2;
+                alignment: center;
+
+                // Backspace — removes the last entered character.
+                // Uses do-backspace() which clears the rightmost filled slot.
+                PinKeyButton {
+                    label: "\u{232B}";
+                    clicked => { root.do-backspace(); }
+                }
+
+                // Digit 0
+                PinKeyButton {
+                    label: "0";
+                    clicked => { root.append-digit("0"); }
+                }
+
+                // Cancel — fires on-cancel, bridge hides the window.
+                PinKeyButton {
+                    label: "\u{2715}";
+                    clicked => { root.on-cancel(); }
+                }
+            }
+        }
+
+        // ── OK button ──────────────────────────────────────────────────────────
+        // Explicit submit path (auto-submit fires on last digit above).
+        // Enabled only when at least one digit is entered.
+        //
+        // Animation capped at DEFAULT_PROFILE.animation_framerate_cap per PHASES.md:58
+        Rectangle {
+            height: 48px;
+            border-radius: Theme.radius-md;
+            background: root.digit-count > 0 ? Theme.accent : Theme.elevated;
+            border-width: 1px;
+            border-color: root.digit-count > 0 ? Theme.accent : Theme.state-off;
+
+            animate background {
+                duration: AnimationBudget.at-capacity ? 0ms : 150ms;
+            }
+
+            Text {
+                text: "OK";
+                color: Theme.text-primary;
+                font-size: Theme.font-md;
+                font-weight: Theme.font-weight-bold;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: parent.width;
+                height: parent.height;
+            }
+
+            TouchArea {
+                clicked => {
+                    if (root.digit-count > 0) {
+                        root.on-submit(root.entered-code);
+                    }
+                }
+            }
+        }
+    }
+}
