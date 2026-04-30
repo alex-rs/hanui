@@ -1601,4 +1601,436 @@ mod tests {
         drop(_rx2);
         // No panic = slow path and fast path both succeed.
     }
+
+    // -----------------------------------------------------------------------
+    // Default impl
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_constructs_empty_store() {
+        // Default::default() delegates to LiveStore::new(); verify the result
+        // is an empty, functional store.
+        let store = LiveStore::default();
+        assert!(store.get(&EntityId::from("light.any")).is_none());
+        let mut count = 0usize;
+        store.for_each(&mut |_, _| count += 1);
+        assert_eq!(count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // services_handle / with_services_handle / services_lookup
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn services_handle_returns_cloned_arc() {
+        // services_handle() must return an Arc clone of the registry handle,
+        // cheap and independently usable.
+        let store = LiveStore::new();
+        let h1 = store.services_handle();
+        let h2 = store.services_handle();
+        // Both handles point to the same underlying lock (pointer equality).
+        assert!(Arc::ptr_eq(&h1, &h2));
+    }
+
+    #[test]
+    fn with_services_handle_replaces_registry() {
+        // with_services_handle replaces the default handle; services_handle()
+        // must return the new one.
+        use crate::ha::services::ServiceRegistry;
+
+        let custom_handle = ServiceRegistry::new_handle();
+        let store = LiveStore::new().with_services_handle(custom_handle.clone());
+        assert!(Arc::ptr_eq(&store.services_handle(), &custom_handle));
+    }
+
+    #[test]
+    fn services_lookup_returns_none_for_unknown_service() {
+        // An empty registry returns None for any domain/service lookup.
+        let store = LiveStore::new();
+        assert!(store.services_lookup("light", "turn_on").is_none());
+    }
+
+    #[test]
+    fn services_lookup_returns_meta_after_population() {
+        // Populate the registry via the handle and verify services_lookup
+        // returns the registered meta.
+        use crate::ha::services::{ServiceMeta, ServiceRegistry};
+
+        let handle = ServiceRegistry::new_handle();
+        let store = LiveStore::new().with_services_handle(handle.clone());
+
+        // Populate directly via the shared lock.
+        {
+            let mut reg = handle.write().expect("registry write lock");
+            reg.add_service(
+                "switch",
+                "toggle",
+                ServiceMeta {
+                    name: "Toggle".to_owned(),
+                    description: None,
+                    fields: Default::default(),
+                },
+            );
+        }
+
+        let meta = store.services_lookup("switch", "toggle");
+        assert!(meta.is_some());
+        assert_eq!(meta.unwrap().name, "Toggle");
+        // Non-existent service still returns None.
+        assert!(store.services_lookup("switch", "nonexistent").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Optimistic cap builder methods and getters
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn per_entity_optimistic_cap_builder_and_getter() {
+        // with_per_entity_optimistic_cap sets the cap; getter reflects it.
+        let store = LiveStore::new().with_per_entity_optimistic_cap(7);
+        assert_eq!(store.per_entity_optimistic_cap(), 7);
+    }
+
+    #[test]
+    fn global_optimistic_cap_builder_and_getter() {
+        // with_global_optimistic_cap sets the cap; getter reflects it.
+        let store = LiveStore::new().with_global_optimistic_cap(32);
+        assert_eq!(store.global_optimistic_cap(), 32);
+    }
+
+    #[test]
+    fn default_caps_match_named_constants() {
+        // Verify that a default LiveStore exposes the published constant values.
+        let store = LiveStore::new();
+        assert_eq!(
+            store.per_entity_optimistic_cap(),
+            DEFAULT_PER_ENTITY_OPTIMISTIC_CAP
+        );
+        assert_eq!(store.global_optimistic_cap(), DEFAULT_GLOBAL_OPTIMISTIC_CAP);
+    }
+
+    // -----------------------------------------------------------------------
+    // drop_optimistic_entry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn drop_optimistic_entry_removes_matching_entry() {
+        let store = LiveStore::new();
+        let ts = Timestamp::UNIX_EPOCH;
+
+        store
+            .insert_optimistic_entry(OptimisticEntry {
+                entity_id: EntityId::from("light.a"),
+                request_id: 10,
+                dispatched_at: ts,
+                tentative_state: Arc::from("on"),
+                prior_state: Arc::from("off"),
+            })
+            .expect("insert must succeed");
+
+        let removed = store.drop_optimistic_entry(&EntityId::from("light.a"), 10);
+        assert!(removed.is_some(), "drop_optimistic_entry must return Some");
+        assert_eq!(removed.unwrap().request_id, 10);
+        // Bucket is now empty — the entity key must be cleaned up.
+        assert_eq!(store.optimistic_total(), 0);
+        assert!(!store.has_optimistic_entry(&EntityId::from("light.a"), 10));
+    }
+
+    #[test]
+    fn drop_optimistic_entry_returns_none_for_missing_entry() {
+        // Removing a request_id that was never inserted must return None.
+        let store = LiveStore::new();
+        let result = store.drop_optimistic_entry(&EntityId::from("light.ghost"), 99);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn drop_optimistic_entry_leaves_other_entries_intact() {
+        // When multiple entries share an entity_id, removing one must leave
+        // the others in place.
+        let store = LiveStore::new().with_per_entity_optimistic_cap(5);
+        let ts = Timestamp::UNIX_EPOCH;
+
+        for id in [1u32, 2, 3] {
+            store
+                .insert_optimistic_entry(OptimisticEntry {
+                    entity_id: EntityId::from("light.multi"),
+                    request_id: id,
+                    dispatched_at: ts,
+                    tentative_state: Arc::from("on"),
+                    prior_state: Arc::from("off"),
+                })
+                .expect("insert must succeed");
+        }
+
+        // Remove the middle entry.
+        let removed = store.drop_optimistic_entry(&EntityId::from("light.multi"), 2);
+        assert!(removed.is_some());
+
+        // Remaining entries: 1 and 3.
+        assert_eq!(store.optimistic_total(), 2);
+        assert!(store.has_optimistic_entry(&EntityId::from("light.multi"), 1));
+        assert!(!store.has_optimistic_entry(&EntityId::from("light.multi"), 2));
+        assert!(store.has_optimistic_entry(&EntityId::from("light.multi"), 3));
+    }
+
+    // -----------------------------------------------------------------------
+    // drop_all_optimistic_entries
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn drop_all_optimistic_entries_clears_entity_bucket() {
+        let store = LiveStore::new().with_per_entity_optimistic_cap(5);
+        let ts = Timestamp::UNIX_EPOCH;
+
+        for id in [1u32, 2, 3] {
+            store
+                .insert_optimistic_entry(OptimisticEntry {
+                    entity_id: EntityId::from("light.burst"),
+                    request_id: id,
+                    dispatched_at: ts,
+                    tentative_state: Arc::from("on"),
+                    prior_state: Arc::from("off"),
+                })
+                .expect("insert");
+        }
+
+        let drained = store.drop_all_optimistic_entries(&EntityId::from("light.burst"));
+        assert_eq!(drained.len(), 3);
+        assert_eq!(store.optimistic_total(), 0);
+    }
+
+    #[test]
+    fn drop_all_optimistic_entries_returns_empty_vec_for_unknown_entity() {
+        let store = LiveStore::new();
+        let result = store.drop_all_optimistic_entries(&EntityId::from("light.nobody"));
+        assert!(result.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // optimistic_entries_for
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn optimistic_entries_for_returns_snapshot_of_bucket() {
+        let store = LiveStore::new().with_per_entity_optimistic_cap(5);
+        let ts = Timestamp::UNIX_EPOCH;
+
+        for id in [7u32, 8] {
+            store
+                .insert_optimistic_entry(OptimisticEntry {
+                    entity_id: EntityId::from("light.snap"),
+                    request_id: id,
+                    dispatched_at: ts,
+                    tentative_state: Arc::from("on"),
+                    prior_state: Arc::from("off"),
+                })
+                .expect("insert");
+        }
+
+        let entries = store.optimistic_entries_for(&EntityId::from("light.snap"));
+        assert_eq!(entries.len(), 2);
+        let ids: Vec<u32> = entries.iter().map(|e| e.request_id).collect();
+        assert!(ids.contains(&7));
+        assert!(ids.contains(&8));
+    }
+
+    #[test]
+    fn optimistic_entries_for_returns_empty_vec_for_unknown_entity() {
+        let store = LiveStore::new();
+        let entries = store.optimistic_entries_for(&EntityId::from("light.missing"));
+        assert!(entries.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // insert_optimistic_entry — cap error paths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn insert_optimistic_entry_rejects_at_global_cap() {
+        // With global cap = 2, the third insert must return GlobalCap error.
+        let store = LiveStore::new().with_global_optimistic_cap(2);
+        let ts = Timestamp::UNIX_EPOCH;
+
+        for id in [1u32, 2] {
+            store
+                .insert_optimistic_entry(OptimisticEntry {
+                    entity_id: EntityId::from(format!("light.e{id}").as_str()),
+                    request_id: id,
+                    dispatched_at: ts,
+                    tentative_state: Arc::from("on"),
+                    prior_state: Arc::from("off"),
+                })
+                .expect("insert within cap");
+        }
+
+        let result = store.insert_optimistic_entry(OptimisticEntry {
+            entity_id: EntityId::from("light.overflow"),
+            request_id: 3,
+            dispatched_at: ts,
+            tentative_state: Arc::from("on"),
+            prior_state: Arc::from("off"),
+        });
+        assert_eq!(result, Err(OptimisticInsertError::GlobalCap));
+    }
+
+    #[test]
+    fn insert_optimistic_entry_rejects_at_per_entity_cap() {
+        // With per-entity cap = 1 and global cap large enough, the second
+        // insert for the same entity must return PerEntityCap.
+        let store = LiveStore::new()
+            .with_per_entity_optimistic_cap(1)
+            .with_global_optimistic_cap(64);
+        let ts = Timestamp::UNIX_EPOCH;
+
+        store
+            .insert_optimistic_entry(OptimisticEntry {
+                entity_id: EntityId::from("light.capped"),
+                request_id: 1,
+                dispatched_at: ts,
+                tentative_state: Arc::from("on"),
+                prior_state: Arc::from("off"),
+            })
+            .expect("first insert must succeed");
+
+        let result = store.insert_optimistic_entry(OptimisticEntry {
+            entity_id: EntityId::from("light.capped"),
+            request_id: 2,
+            dispatched_at: ts,
+            tentative_state: Arc::from("off"),
+            prior_state: Arc::from("on"),
+        });
+        assert_eq!(result, Err(OptimisticInsertError::PerEntityCap));
+    }
+
+    // -----------------------------------------------------------------------
+    // set_widget_action_map / pending_for_widget (TASK-064 / TASK-067)
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a minimal `WidgetActionMap` with one entry.
+    fn make_widget_action_map(widget_id: &str, entity_id: &str) -> Arc<WidgetActionMap> {
+        use crate::actions::map::{WidgetActionEntry, WidgetActionMap, WidgetId};
+        use crate::actions::schema::Action;
+
+        let mut map = WidgetActionMap::new();
+        map.insert(
+            WidgetId::from(widget_id),
+            WidgetActionEntry {
+                entity_id: EntityId::from(entity_id),
+                tap: Action::None,
+                hold: Action::None,
+                double_tap: Action::None,
+            },
+        );
+        Arc::new(map)
+    }
+
+    #[test]
+    fn pending_for_widget_returns_false_when_no_map_installed() {
+        // When set_widget_action_map has never been called, pending_for_widget
+        // must return false for any widget_id — the None branch.
+        use crate::actions::map::WidgetId;
+
+        let store = LiveStore::new();
+        assert!(
+            !store.pending_for_widget(&WidgetId::from("widget.any")),
+            "pending_for_widget must return false before a map is installed"
+        );
+    }
+
+    #[test]
+    fn set_widget_action_map_installs_map_and_pending_for_widget_resolves() {
+        // set_widget_action_map installs the map; pending_for_widget can then
+        // resolve a known widget. With no optimistic entry the result is false.
+        use crate::actions::map::WidgetId;
+
+        let store = LiveStore::new();
+        let map = make_widget_action_map("widget.light1", "light.kitchen");
+        store.set_widget_action_map(map);
+
+        // Widget is registered but no optimistic entry exists yet.
+        assert!(
+            !store.pending_for_widget(&WidgetId::from("widget.light1")),
+            "pending_for_widget must return false when widget is registered but \
+             no optimistic entry exists"
+        );
+    }
+
+    #[test]
+    fn pending_for_widget_returns_false_for_unknown_widget() {
+        // After a map is installed, querying a widget_id that is NOT in the map
+        // must return false (the lookup-miss branch).
+        use crate::actions::map::WidgetId;
+
+        let store = LiveStore::new();
+        let map = make_widget_action_map("widget.known", "light.known");
+        store.set_widget_action_map(map);
+
+        assert!(
+            !store.pending_for_widget(&WidgetId::from("widget.unknown")),
+            "pending_for_widget must return false for a widget_id not in the map"
+        );
+    }
+
+    #[test]
+    fn pending_for_widget_returns_true_when_optimistic_entry_exists() {
+        // Full happy path: map installed → widget found → optimistic entry present
+        // → pending_for_widget returns true.
+        use crate::actions::map::WidgetId;
+
+        let store = LiveStore::new();
+        let map = make_widget_action_map("widget.switch1", "switch.outlet");
+        store.set_widget_action_map(map);
+
+        // Insert an optimistic entry for the entity bound to widget.switch1.
+        store
+            .insert_optimistic_entry(OptimisticEntry {
+                entity_id: EntityId::from("switch.outlet"),
+                request_id: 42,
+                dispatched_at: Timestamp::UNIX_EPOCH,
+                tentative_state: Arc::from("on"),
+                prior_state: Arc::from("off"),
+            })
+            .expect("insert must succeed within cap");
+
+        assert!(
+            store.pending_for_widget(&WidgetId::from("widget.switch1")),
+            "pending_for_widget must return true when an optimistic entry exists \
+             for the entity bound to the widget"
+        );
+    }
+
+    #[test]
+    fn pending_for_widget_returns_false_after_entry_is_dropped() {
+        // After drop_optimistic_entry empties the bucket, pending_for_widget
+        // must revert to false.
+        use crate::actions::map::WidgetId;
+
+        let store = LiveStore::new();
+        let map = make_widget_action_map("widget.sensor", "sensor.temp");
+        store.set_widget_action_map(map);
+
+        store
+            .insert_optimistic_entry(OptimisticEntry {
+                entity_id: EntityId::from("sensor.temp"),
+                request_id: 99,
+                dispatched_at: Timestamp::UNIX_EPOCH,
+                tentative_state: Arc::from("22"),
+                prior_state: Arc::from("21"),
+            })
+            .expect("insert must succeed");
+
+        assert!(
+            store.pending_for_widget(&WidgetId::from("widget.sensor")),
+            "must be true before drop"
+        );
+
+        // Drain the entry.
+        store.drop_optimistic_entry(&EntityId::from("sensor.temp"), 99);
+
+        assert!(
+            !store.pending_for_widget(&WidgetId::from("widget.sensor")),
+            "pending_for_widget must return false after optimistic entry is dropped"
+        );
+    }
 }
