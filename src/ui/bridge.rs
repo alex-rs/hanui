@@ -180,6 +180,50 @@ pub struct EntityTileVM {
 }
 
 // ---------------------------------------------------------------------------
+// CoverTileVM (TASK-102)
+// ---------------------------------------------------------------------------
+
+/// View-model for a `CoverTile` widget, mirroring the Slint `CoverTileVM`
+/// struct in `ui/slint/cover_tile.slint`.
+///
+/// Built by [`compute_cover_tile_vm`], which threads through
+/// [`crate::ui::cover::CoverVM::from_entity`] to derive the `is_open` /
+/// `is_moving` booleans and the position fallback.
+///
+/// The `icon: image` Slint field is absent here; it is written by the
+/// Slint bridge during property wiring (the same pattern used for
+/// `LightTileVM` / `SensorTileVM` / `EntityTileVM`).
+///
+/// Note (TASK-102 scope): the `MainWindow` Slint component does not yet
+/// declare a `cover-tiles` array property — `ui/slint/main_window.slint`
+/// is in this ticket's `must_not_touch` list. `compute_cover_tile_vm` is
+/// invoked indirectly via [`build_tiles`] so cover entities exercise the
+/// `CoverVM::from_entity` path on every state change, and the result
+/// flows into the existing fallback `EntityTileVM` render with a richer
+/// state string. A subsequent ticket will amend `main_window.slint` to
+/// render a per-kind `CoverTile` model directly.
+///
+/// `pending` is the per-tile spinner gate added in TASK-067; see
+/// [`LightTileVM`] for the full contract.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoverTileVM {
+    pub name: String,
+    pub state: String,
+    pub position: i32,
+    pub tilt: i32,
+    pub has_position: bool,
+    pub has_tilt: bool,
+    pub is_open: bool,
+    pub is_moving: bool,
+    pub icon_id: String,
+    pub preferred_columns: i32,
+    pub preferred_rows: i32,
+    pub placement: TilePlacement,
+    /// Per-tile spinner gate (TASK-067). Default `false`.
+    pub pending: bool,
+}
+
+// ---------------------------------------------------------------------------
 // TileVM enum
 // ---------------------------------------------------------------------------
 
@@ -471,10 +515,42 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                                 placement,
                                 pending: false,
                             }),
+                            // TASK-102: cover entities flow through
+                            // `CoverVM::from_entity` so the per-frame derived
+                            // state (is_open / is_moving / position) is
+                            // available to the bridge. Until `main_window.slint`
+                            // grows a `cover-tiles` array property (subsequent
+                            // ticket), the cover tile renders as the generic
+                            // `EntityTileVM` fallback — but the `state` string
+                            // is enriched with the position percentage so the
+                            // user sees "open 75%" / "closed" / "opening" /
+                            // "closing" without losing information. The
+                            // `CoverVM` itself is exposed via
+                            // `compute_cover_tile_vm` for the per-kind
+                            // rendering path that follows in TASK-108.
+                            WidgetKind::Cover => {
+                                let cover_vm = crate::ui::cover::CoverVM::from_entity(&entity);
+                                let has_position =
+                                    entity.attributes.get("current_position").is_some();
+                                let state = if has_position {
+                                    format!("{} {}%", entity.state.as_ref(), cover_vm.position)
+                                } else {
+                                    (*entity.state).to_string()
+                                };
+                                TileVM::Entity(EntityTileVM {
+                                    name,
+                                    state,
+                                    icon_id,
+                                    preferred_columns,
+                                    preferred_rows,
+                                    placement,
+                                    pending: false,
+                                })
+                            }
                             // Phase 4 schema adds Camera, History, Fan, Lock, Alarm
-                            // variants. Phase 6 adds Cover, MediaPlayer, Climate,
+                            // variants. Phase 6 adds MediaPlayer, Climate,
                             // PowerFlow. Until dedicated Slint tile components exist
-                            // (TASK-102..TASK-109), these are rendered as EntityTileVM —
+                            // (TASK-103..TASK-109), these are rendered as EntityTileVM —
                             // the generic entity tile covers the state display until
                             // per-kind tiles ship.
                             WidgetKind::EntityTile
@@ -483,7 +559,6 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                             | WidgetKind::Fan
                             | WidgetKind::Lock
                             | WidgetKind::Alarm
-                            | WidgetKind::Cover
                             | WidgetKind::MediaPlayer
                             | WidgetKind::Climate
                             | WidgetKind::PowerFlow => TileVM::Entity(EntityTileVM {
@@ -1795,6 +1870,103 @@ pub mod pin_entry_slint {
 }
 
 pub use pin_entry_slint::PinEntryWindow;
+
+// ---------------------------------------------------------------------------
+// CoverTile Slint module (TASK-102)
+// ---------------------------------------------------------------------------
+//
+// `ui/slint/cover_tile.slint` is compiled by `build.rs` (TASK-102) to a
+// separate generated Rust file exposed via the `HANUI_COVER_TILE_INCLUDE`
+// env var — the same pattern as `pin_entry.slint` (TASK-100),
+// `view_switcher.slint` (TASK-086), and `gesture_test_window.slint`
+// (TASK-060). This module picks it up via `include!` so the generated
+// `CoverTile`, `CoverTileVM`, and `CoverTilePlacement` types are available
+// for the `compute_cover_tile_vm` projection function below without
+// polluting the production `slint_ui` namespace (which would clash with
+// the same-named Rust struct declared earlier in this file).
+//
+// Future work: once `main_window.slint` grows a `cover-tiles` array
+// property, this module's types will be re-exported through the
+// production `slint_ui` namespace instead. The separate compile is the
+// minimal-blast path that satisfies TASK-102's "Slint compile gate"
+// acceptance criterion (cover_tile.slint must be in the build graph)
+// without amending any of the protected `must_not_touch` Slint files.
+pub mod cover_tile_slint {
+    include!(env!("HANUI_COVER_TILE_INCLUDE"));
+}
+
+pub use cover_tile_slint::{CoverTile, CoverTilePlacement as SlintCoverTilePlacement};
+
+// ---------------------------------------------------------------------------
+// compute_cover_tile_vm (TASK-102)
+// ---------------------------------------------------------------------------
+
+/// Project a typed Rust [`CoverTileVM`] from a live entity snapshot, threading
+/// through [`crate::ui::cover::CoverVM::from_entity`] for the per-frame derived
+/// state (`is_open` / `is_moving` / `position`).
+///
+/// # Hot-path discipline
+///
+/// Called at entity-change time (NOT per render). The result is a typed
+/// `CoverTileVM` Rust struct; the further `String -> SharedString` /
+/// `icon_id -> Image` conversions are deferred to a follow-up ticket once
+/// `main_window.slint` declares the `cover-tiles` array property.
+///
+/// # Position / tilt fallback
+///
+/// `has_position` / `has_tilt` are derived from the presence of the
+/// `current_position` / `current_tilt_position` HA attributes. When the
+/// attribute is absent or out of range, the boolean is `false` and the
+/// numeric field carries the state-derived default
+/// (`CoverVM::from_entity` returns 0 for closed-equivalent states and
+/// 100 for `"open"`). The Slint tile gates the position/tilt labels
+/// behind these booleans (`if view-model.has-position : Text { ... }`).
+///
+/// # Naming
+///
+/// Returns the Rust [`CoverTileVM`] (defined earlier in this file). The
+/// Slint-shape projection (`SlintCoverTileVM` from
+/// [`cover_tile_slint::CoverTileVM`]) is not built here because there is
+/// no `cover-tiles` `MainWindow` property to write into yet — that
+/// shape conversion lives next to the `set_cover_tiles` call site once
+/// it exists.
+#[must_use]
+pub fn compute_cover_tile_vm(
+    name: String,
+    icon_id: String,
+    preferred_columns: i32,
+    preferred_rows: i32,
+    placement: TilePlacement,
+    entity: &crate::ha::entity::Entity,
+) -> CoverTileVM {
+    let cover_vm = crate::ui::cover::CoverVM::from_entity(entity);
+
+    // Derive the has-position / has-tilt booleans from the live
+    // entity. We re-check via `cover::read_*_attribute` rather than
+    // re-fetching by name so out-of-range numeric attributes count as
+    // "not present" — matching the fall-through logic in `CoverVM::from_entity`.
+    let has_position = entity.attributes.get("current_position").is_some();
+    let tilt_value = crate::ui::cover::read_tilt_attribute(entity);
+    let has_tilt = tilt_value.is_some();
+
+    let state = entity.state.as_ref().to_owned();
+
+    CoverTileVM {
+        name,
+        state,
+        position: i32::from(cover_vm.position),
+        tilt: i32::from(tilt_value.unwrap_or(0)),
+        has_position,
+        has_tilt,
+        is_open: cover_vm.is_open,
+        is_moving: cover_vm.is_moving,
+        icon_id,
+        preferred_columns,
+        preferred_rows,
+        placement,
+        pending: false,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // PinEntryHost bridge implementation (TASK-100)
@@ -6211,5 +6383,223 @@ mod tests {
         let slot2: super::PinSubmitSlot = Arc::new(Mutex::new(Some(Box::new(|_: String| {}))));
         setup_pin_window(&window2, slot2, false);
         assert!(!window2.get_numeric_only(), "numeric_only set to false");
+    }
+
+    // -----------------------------------------------------------------------
+    // CoverTileVM / compute_cover_tile_vm tests (TASK-102)
+    // -----------------------------------------------------------------------
+
+    /// Construct an [`Entity`] carrying a single attribute, parsed from a
+    /// YAML/JSON snippet. Mirrors `src/ui/cover.rs::tests::entity_with_attr`
+    /// — JSON is a strict subset of YAML 1.2, and `serde_yaml_ng` is the
+    /// workspace's YAML crate. We never name the JSON crate textually so
+    /// this file stays inside Gate 2 (`src/ui/**` ban on the JSON-crate path).
+    fn entity_with_attr(state: &str, key: &str, value_str: &str) -> Entity {
+        let snippet = format!("{{\"{key}\":{value_str}}}");
+        let map =
+            serde_yaml_ng::from_str(&snippet).expect("test snippet must parse as a YAML/JSON map");
+        Entity {
+            id: EntityId::from("cover.test"),
+            state: Arc::from(state),
+            attributes: Arc::new(map),
+            last_changed: Timestamp::UNIX_EPOCH,
+            last_updated: Timestamp::UNIX_EPOCH,
+        }
+    }
+
+    /// `compute_cover_tile_vm` produces the typed Rust [`CoverTileVM`] from
+    /// an entity, threading the cover-state derivation through
+    /// `CoverVM::from_entity`. Sanity-check the output for a closed cover.
+    #[test]
+    fn compute_cover_tile_vm_closed_state_no_attributes() {
+        let entity = make_test_entity("cover.garage", "closed");
+        let vm = compute_cover_tile_vm(
+            "Garage".to_owned(),
+            "mdi:garage".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.name, "Garage");
+        assert_eq!(vm.state, "closed");
+        assert!(!vm.is_open);
+        assert!(!vm.is_moving);
+        assert!(
+            !vm.has_position,
+            "no current_position attribute → has_position=false"
+        );
+        assert!(!vm.has_tilt);
+        assert_eq!(vm.position, 0, "closed default position");
+        assert!(!vm.pending);
+    }
+
+    /// `compute_cover_tile_vm` reads `current_position` and exposes it as
+    /// the `position` field with `has_position=true`.
+    #[test]
+    fn compute_cover_tile_vm_open_with_position_attribute() {
+        let entity = entity_with_attr("open", "current_position", "75");
+        let vm = compute_cover_tile_vm(
+            "Patio".to_owned(),
+            "mdi:window-shutter".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.state, "open");
+        assert!(vm.is_open);
+        assert!(!vm.is_moving);
+        assert!(
+            vm.has_position,
+            "current_position present → has_position=true"
+        );
+        assert_eq!(vm.position, 75);
+    }
+
+    /// `compute_cover_tile_vm` reads `current_tilt_position` and exposes
+    /// `has_tilt=true` with the tilt value populated.
+    #[test]
+    fn compute_cover_tile_vm_open_with_tilt_attribute() {
+        let entity = entity_with_attr("open", "current_tilt_position", "60");
+        let vm = compute_cover_tile_vm(
+            "Blind".to_owned(),
+            "mdi:blinds".to_owned(),
+            1,
+            1,
+            TilePlacement::default_for(1, 1),
+            &entity,
+        );
+        assert!(vm.has_tilt, "current_tilt_position present → has_tilt=true");
+        assert_eq!(vm.tilt, 60);
+    }
+
+    /// `compute_cover_tile_vm` for an opening cover sets is_moving=true and
+    /// is_open=true (active state colors with the destination).
+    #[test]
+    fn compute_cover_tile_vm_opening_state_is_moving() {
+        let entity = make_test_entity("cover.garage", "opening");
+        let vm = compute_cover_tile_vm(
+            "Garage".to_owned(),
+            "mdi:garage-open".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert!(vm.is_open, "opening colors with destination open");
+        assert!(vm.is_moving, "opening is moving");
+    }
+
+    /// `build_tiles` for a `WidgetKind::Cover` widget with a
+    /// `current_position` attribute produces an `EntityTileVM` whose
+    /// `state` string is enriched with the position percentage. This
+    /// confirms the bridge dispatches the cover state-change through
+    /// `CoverVM::from_entity` per TASK-102 AC #7.
+    #[test]
+    fn build_tiles_cover_widget_includes_position_in_state_when_attribute_present() {
+        use crate::ha::store::MemoryStore;
+
+        let entity = entity_with_attr("open", "current_position", "42");
+        let entity = Entity {
+            id: EntityId::from("cover.patio"),
+            ..entity
+        };
+        let store = MemoryStore::load(vec![entity]).expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("cover.patio", WidgetKind::Cover);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1);
+        match &tiles[0] {
+            TileVM::Entity(vm) => {
+                assert_eq!(
+                    vm.state, "open 42%",
+                    "cover state must be enriched with position percentage"
+                );
+            }
+            other => panic!("expected EntityTileVM (Cover fallback), got {other:?}"),
+        }
+    }
+
+    /// `build_tiles` for a cover entity WITHOUT a `current_position`
+    /// attribute keeps the raw HA state string (no spurious percentage).
+    #[test]
+    fn build_tiles_cover_widget_without_position_keeps_raw_state() {
+        use crate::ha::store::MemoryStore;
+
+        let store = MemoryStore::load(vec![make_test_entity("cover.patio", "closed")])
+            .expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("cover.patio", WidgetKind::Cover);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1);
+        match &tiles[0] {
+            TileVM::Entity(vm) => {
+                assert_eq!(
+                    vm.state, "closed",
+                    "no current_position → no percentage suffix"
+                );
+            }
+            other => panic!("expected EntityTileVM, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // CoverBody more-info richer impl (TASK-102)
+    // -----------------------------------------------------------------------
+
+    /// `CoverBody::render_rows` emits a `position` row when the entity
+    /// has the `current_position` attribute.
+    #[test]
+    fn cover_body_emits_position_row_when_attribute_present() {
+        use crate::ui::more_info::{CoverBody, MoreInfoBody};
+        let entity = entity_with_attr("open", "current_position", "60");
+        let rows = CoverBody::new().render_rows(&entity);
+        // Always emits state; emits position when current_position present.
+        assert!(rows.iter().any(|r| r.key == "state" && r.value == "open"));
+        assert!(
+            rows.iter().any(|r| r.key == "position" && r.value == "60%"),
+            "CoverBody must emit a position row when current_position is set; got {rows:?}"
+        );
+    }
+
+    /// `CoverBody::render_rows` skips the `position` row when the entity
+    /// has no `current_position` attribute.
+    #[test]
+    fn cover_body_skips_position_row_when_attribute_absent() {
+        use crate::ui::more_info::{CoverBody, MoreInfoBody};
+        let entity = make_test_entity("cover.garage", "closed");
+        let rows = CoverBody::new().render_rows(&entity);
+        assert!(
+            !rows.iter().any(|r| r.key == "position"),
+            "no current_position → no position row; got {rows:?}"
+        );
+    }
+
+    /// `CoverBody::render_rows` emits a `tilt` row when
+    /// `current_tilt_position` is present.
+    #[test]
+    fn cover_body_emits_tilt_row_when_attribute_present() {
+        use crate::ui::more_info::{CoverBody, MoreInfoBody};
+        let entity = entity_with_attr("open", "current_tilt_position", "30");
+        let rows = CoverBody::new().render_rows(&entity);
+        assert!(
+            rows.iter().any(|r| r.key == "tilt" && r.value == "30%"),
+            "CoverBody must emit a tilt row when current_tilt_position is set; got {rows:?}"
+        );
+    }
+
+    /// `CoverBody::render_rows` emits a `supported_features` row when
+    /// the bitmask attribute is present.
+    #[test]
+    fn cover_body_emits_supported_features_row_when_attribute_present() {
+        use crate::ui::more_info::{CoverBody, MoreInfoBody};
+        let entity = entity_with_attr("open", "supported_features", "11");
+        let rows = CoverBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "supported_features" && r.value == "11"),
+            "CoverBody must emit a supported_features row when present; got {rows:?}"
+        );
     }
 }

@@ -204,4 +204,40 @@ fn main() {
         "cargo:rustc-env=HANUI_PIN_ENTRY_INCLUDE={}",
         pin_entry_output.display()
     );
+
+    // CoverTile component (TASK-102) — Phase 6 Wave 2 cover tile.
+    //
+    // Compiles `ui/slint/cover_tile.slint` to a separate output file so
+    // the bridge's `cover_tile_slint` submodule can reference the generated
+    // `CoverTile`, `CoverTileVM`, and `CoverTilePlacement` types without
+    // pulling in the full production `MainWindow` symbol set. This mirrors
+    // the pattern used by `gesture_test_window.slint` (TASK-060),
+    // `view_switcher.slint` (TASK-086), and `pin_entry.slint` (TASK-100).
+    //
+    // This compile puts `cover_tile.slint` in the build graph: `cargo build`
+    // fails if the component has a syntax or type error (satisfying the
+    // "Slint component compile gate" acceptance criterion in TASK-102).
+    //
+    // The generated types are accessible to `src/ui/bridge.rs` via
+    // `include!(env!("HANUI_COVER_TILE_INCLUDE"))` inside the
+    // `cover_tile_slint` submodule. Future work (when `main_window.slint` is
+    // amended in a subsequent ticket) will swap to the production import
+    // chain and this separate compile will become test-only.
+    let cover_tile_input = manifest_dir.join("ui/slint/cover_tile.slint");
+    let cover_tile_output = out_dir.join("cover_tile.rs");
+
+    let cover_tile_deps = slint_build::compile_with_output_path(
+        &cover_tile_input,
+        &cover_tile_output,
+        slint_build::CompilerConfiguration::default(),
+    )
+    .expect("compile ui/slint/cover_tile.slint with slint-build");
+
+    for dep in cover_tile_deps {
+        println!("cargo:rerun-if-changed={}", dep.display());
+    }
+    println!(
+        "cargo:rustc-env=HANUI_COVER_TILE_INCLUDE={}",
+        cover_tile_output.display()
+    );
 }

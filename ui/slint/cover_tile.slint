@@ -1,0 +1,204 @@
+// cover_tile.slint — Phase 6 Wave 2 (TASK-102) tile for `type: cover`.
+//
+// Renders a Home Assistant cover entity (window covers, blinds, shutters,
+// garage doors, awnings) with a three-state visual: idle (closed), active
+// (opening/closing), and unavailable. The Rust bridge produces a
+// `CoverTileVM` per cover widget via `crate::ui::cover::CoverVM::from_entity`
+// followed by a Slint-shape projection in `src/ui/bridge.rs::compute_cover_tile_vm`.
+//
+// All colors come from theme tokens; no inline hex literals (CI hex-color
+// gate, .github/workflows/ci.yml § Gate 1). Visual primitives only — no
+// SVG-based icons in the tile body itself; the icon image is resolved by
+// the Rust asset layer (TASK-010) and bound via `CoverTileVM.icon`.
+//
+// View-model contract (see `src/ui/bridge.rs::CoverTileVM`):
+//   * The struct shape is mirrored 1:1 in Rust by the bridge. The Slint
+//     compiler generates a Rust struct named `CoverTileVM` whose fields
+//     match these names with kebab→snake conversion.
+//   * `state` is the canonical HA state string: `"open"`, `"closed"`,
+//     `"opening"`, `"closing"`, `"stopped"`, `"unavailable"`. Anything
+//     else is treated as unavailable by the colour fallback.
+//   * `is-moving` and `is-open` are precomputed by `CoverVM::from_entity`
+//     so the Slint side does not branch on the state-string vocabulary.
+//   * `position` is in 0..=100; rendered as a label only (the position
+//     slider lives in the more-info modal per
+//     `locked_decisions.cover_slider_component`).
+//   * `has-position` / `has-tilt` gate the per-feature labels; covers
+//     that don't expose `current_position` show only the state name.
+//   * `placement` is a NESTED struct (`CoverTilePlacement`) for 1:1
+//     mapping with `dashboard::schema::Placement` in Rust.
+//
+// Three-state render (per Phase 6 plan acceptance):
+//   * idle (state == "closed")        — text-secondary icon tint, full opacity.
+//   * active (is-moving == true)      — accent icon tint, full opacity.
+//   * idle-open (state == "open")     — state-on icon tint (warm amber).
+//   * unavailable                     — state-unavailable tint, reduced opacity (0.5).
+//
+// AnimationBudget integration:
+//   * Press feedback inherited from CardBase. Active-count mutation
+//     deferred to Phase 3 (no specific ticket yet); the bridge will
+//     wire increment/decrement around the press timer it owns. See
+//     ui/slint/light_tile.slint:23-32 for the canonical deferral
+//     rationale.
+//
+// Out of scope (TASK-108 / TASK-099 dispatcher wiring):
+//   * Open/close/stop button dispatch — landed by the Phase 3 dispatcher
+//     wiring through CardBase's tap/hold callbacks; this tile renders state
+//     only and forwards gestures to CardBase (no tile-level TouchArea).
+//   * Position slider visual design — owned by TASK-108 (climate),
+//     consumed by `CoverBody` more-info modal as a stub here.
+
+import { Theme } from "theme.slint";
+import { CardBase } from "card_base.slint";
+
+// Computed grid placement, mirrors `dashboard::schema::Placement` in Rust.
+// Re-declared per tile file for self-documentation; identical to
+// `LightTilePlacement` / `SensorTilePlacement` / `EntityTilePlacement`.
+export struct CoverTilePlacement {
+    col: int,
+    row: int,
+    span-cols: int,
+    span-rows: int,
+}
+
+// Typed view-model for a cover tile.
+//
+// Field semantics:
+//   * name           — user-visible entity label (friendly_name fallback to id).
+//   * state          — canonical HA state string (`"open"`, `"closed"`,
+//                      `"opening"`, `"closing"`, `"stopped"`, `"unavailable"`).
+//   * position       — current position 0..=100. Meaningful only when
+//                      `has-position == true`; otherwise the bridge sets it
+//                      to a state-derived default (0 or 100).
+//   * tilt           — current tilt position 0..=100. Meaningful only when
+//                      `has-tilt == true`.
+//   * has-position   — whether the cover entity exposes `current_position`.
+//   * has-tilt       — whether the cover entity exposes `current_tilt_position`.
+//   * is-open        — derived: true for `"open"` / `"opening"`.
+//   * is-moving      — derived: true for `"opening"` / `"closing"`.
+//   * icon-id        — design-token id (e.g. "mdi:window-shutter"); resolved
+//                      to bytes by the asset layer (TASK-010).
+//   * icon           — resolved Slint image written by the bridge (TASK-015).
+//   * preferred-columns / preferred-rows — author intent from YAML, used
+//                      by the grid packer (TASK-014).
+//   * placement      — packed grid coordinates and span. Static this phase.
+//   * pending        — true while an OptimisticEntry exists for this tile's
+//                      entity. Drives the per-tile spinner overlay on
+//                      CardBase (TASK-067), bound from
+//                      `LiveStore::pending_for_widget(widget_id)`.
+export struct CoverTileVM {
+    name: string,
+    state: string,
+    position: int,
+    tilt: int,
+    has-position: bool,
+    has-tilt: bool,
+    is-open: bool,
+    is-moving: bool,
+    icon-id: string,
+    icon: image,
+    preferred-columns: int,
+    preferred-rows: int,
+    placement: CoverTilePlacement,
+    pending: bool,
+}
+
+// CoverTile — wraps CardBase with the cover-specific content layout.
+//
+// Press feedback and gesture detection both live on CardBase (TASK-060):
+// the single TouchArea inside CardBase captures pointer events for the
+// whole tile and exposes `pressed` as an out-property this tile reads
+// for visual feedback. Tile-level TouchAreas were removed to avoid
+// double-capture (Risk #4).
+export component CoverTile inherits Rectangle {
+    in property <CoverTileVM> view-model;
+
+    // Resolved state colour. Branches on the precomputed booleans first
+    // (active / open) and falls back to the state-string match for the
+    // remaining cases. No inline hex literals; every branch picks a token
+    // from `Theme`.
+    property <color> state-color:
+        view-model.state == "unavailable" ? Theme.state-unavailable
+        : view-model.is-moving ? Theme.accent
+        : view-model.is-open ? Theme.state-on
+        : Theme.state-off;
+
+    // Reduce opacity for the unavailable visual state (Phase 6 plan
+    // three-state render acceptance). Idle and active render at full
+    // opacity; only unavailable dims.
+    opacity: view-model.state == "unavailable" ? 0.5 : 1.0;
+
+    base := CardBase {
+        // Bind the per-tile pending-spinner gate (TASK-067). The Rust
+        // bridge writes `view-model.pending` from
+        // `LiveStore::pending_for_widget` (TASK-064 read API) on each
+        // refresh; this property feeds the spinner overlay declared on
+        // CardBase. Slint MUST read only this property — there is no
+        // parallel pending-state path (Risk #14).
+        pending: view-model.pending;
+
+        VerticalLayout {
+            spacing: Theme.space-2;
+
+            // Header row: icon + entity name. Icon is tinted with the
+            // resolved state colour so a glance at the tile reveals
+            // open/closed/moving status.
+            HorizontalLayout {
+                spacing: Theme.space-2;
+                alignment: start;
+
+                Image {
+                    source: view-model.icon;
+                    width: Theme.font-xl;
+                    height: Theme.font-xl;
+                    colorize: state-color;
+                }
+
+                Text {
+                    text: view-model.name;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-medium;
+                    vertical-alignment: center;
+                }
+            }
+
+            // State value, displayed in the state colour for redundancy
+            // with the icon tint (accessibility: do not rely on colour
+            // alone). Cover state strings are short ("open", "closed",
+            // "opening", "closing", "stopped") so font-lg is the right
+            // hero size — sensor-tile-like font-xxl would push the
+            // position label off the card.
+            Text {
+                text: view-model.state;
+                color: state-color;
+                font-size: Theme.font-lg;
+                font-weight: Theme.font-weight-bold;
+            }
+
+            // Position label, shown only when the cover exposes
+            // `current_position`. Rendered as `"NN%"` — the position
+            // slider visual is owned by the more-info modal
+            // (`CoverBody`) per `locked_decisions.cover_slider_component`,
+            // not the tile itself.
+            if view-model.has-position : Text {
+                text: view-model.position + "%";
+                color: Theme.text-secondary;
+                font-size: Theme.font-sm;
+                font-weight: Theme.font-weight-regular;
+            }
+
+            // Tilt label, shown only when the cover exposes
+            // `current_tilt_position`. Rendered with a "tilt" prefix to
+            // distinguish from the main position; both labels stay on
+            // the card so the user does not need to open the modal to
+            // see the current values.
+            if view-model.has-tilt : Text {
+                text: "tilt " + view-model.tilt + "%";
+                color: Theme.text-secondary;
+                font-size: Theme.font-sm;
+                font-weight: Theme.font-weight-regular;
+            }
+        }
+    }
+}
