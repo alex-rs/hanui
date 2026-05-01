@@ -2971,6 +2971,19 @@ mod tests {
         predicate()
     }
 
+    #[tokio::test]
+    async fn wait_until_returns_false_when_predicate_never_true() {
+        // Coverage: exercise the post-timeout `predicate()` call in wait_until
+        // (line reached only when the predicate never returns true within the
+        // timeout window).  A 1 ms timeout with a permanently-false predicate
+        // exhausts the loop and falls through to the final call.
+        let result = wait_until(1, || false).await;
+        assert!(
+            !result,
+            "wait_until must return false when predicate never becomes true"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn flush_propagates_update_within_one_cadence() {
         ensure_icons_init();
@@ -3647,6 +3660,18 @@ mod tests {
         assert!(
             !recorder.snapshot_tile_writes().is_empty(),
             "initial Live-transition write must have landed before subscriber exit"
+        );
+
+        // Coverage: ClosingStore::for_each must delegate to its map.  The
+        // EntityStore trait requires the impl; exercise it directly since
+        // build_tiles no longer calls for_each (TASK-118 F3).
+        let mut visited = 0usize;
+        store.for_each(&mut |_id, _entity| {
+            visited += 1;
+        });
+        assert_eq!(
+            visited, 1,
+            "ClosingStore::for_each must visit the single entity in the map"
         );
     }
 
