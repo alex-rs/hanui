@@ -1342,12 +1342,8 @@ async fn run_entity_fan_in(
                 futs.push(next_recv(idx, rx));
             }
             Err(RecvError::Lagged(n)) => {
-                let lagging_id = ids
-                    .get(idx)
-                    .map(|id| id.as_str())
-                    .unwrap_or("<out-of-range>");
                 tracing::warn!(
-                    entity_id = %lagging_id,
+                    entity_id = %ids[idx].as_str(),
                     skipped = n,
                     entity_count = ids.len(),
                     "fan-in subscriber lagged; marking all visible entities dirty"
@@ -1378,12 +1374,8 @@ async fn run_entity_fan_in(
                 futs.push(next_recv(idx, fresh));
             }
             Err(RecvError::Closed) => {
-                let closed_id = ids
-                    .get(idx)
-                    .map(|id| id.as_str())
-                    .unwrap_or("<out-of-range>");
                 tracing::debug!(
-                    entity_id = %closed_id,
+                    entity_id = %ids[idx].as_str(),
                     "fan-in subscriber: receiver closed for entity"
                 );
                 // Drop `rx`; do NOT push a replacement.  When every
@@ -6177,30 +6169,59 @@ mod tests {
 
     /// When all broadcast senders are dropped, `run_entity_fan_in` must exit
     /// cleanly — covers the `RecvError::Closed` arm and the loop-exit path.
+    /// Uses `StubStore` with pre-seeded senders that are immediately dropped
+    /// so every `subscribe` call returns a closed receiver.
     #[tokio::test]
     async fn fan_in_exits_when_all_receivers_closed() {
-        use std::collections::HashMap as StdHashMap;
-
-        struct ImmediateCloseStore;
-        impl EntityStore for ImmediateCloseStore {
-            fn get(&self, _id: &EntityId) -> Option<Entity> {
-                None
+        // Build a StubStore with two entities, subscribe before passing to
+        // fan-in, then drop the store so the internal senders are gone and
+        // every recv() returns Closed immediately.
+        let entities = vec![
+            make_test_entity("light.a", "on"),
+            make_test_entity("light.b", "off"),
+        ];
+        let store = Arc::new(StubStore::new(entities));
+        // Warm up the senders so the subscribe call below gets real channels.
+        let _rx_a = store.subscribe(&[EntityId::from("light.a")]);
+        let _rx_b = store.subscribe(&[EntityId::from("light.b")]);
+        // Drop the store — its Arc<Sender>s are released, closing the channels.
+        let store_dyn: Arc<dyn EntityStore> = {
+            // Create a fresh StubStore whose senders are immediately dropped.
+            let (tx_a, rx_a) = broadcast::channel::<EntityUpdate>(1);
+            let (tx_b, rx_b) = broadcast::channel::<EntityUpdate>(1);
+            drop(tx_a);
+            drop(tx_b);
+            // Wrap in a ClosedChannelStore that hands out these dead receivers.
+            struct ClosedChannelStore {
+                rxs: Mutex<Vec<broadcast::Receiver<EntityUpdate>>>,
             }
-            fn for_each(&self, _f: &mut dyn FnMut(&EntityId, &Entity)) {}
-            fn subscribe(&self, _ids: &[EntityId]) -> broadcast::Receiver<EntityUpdate> {
-                let (tx, rx) = broadcast::channel(1);
-                drop(tx); // closed immediately
-                rx
+            impl EntityStore for ClosedChannelStore {
+                fn get(&self, _: &EntityId) -> Option<Entity> {
+                    None
+                }
+                fn for_each(&self, _: &mut dyn FnMut(&EntityId, &Entity)) {}
+                fn subscribe(&self, _: &[EntityId]) -> broadcast::Receiver<EntityUpdate> {
+                    self.rxs.lock().unwrap().pop().unwrap_or_else(|| {
+                        let (_tx, rx) = broadcast::channel(1);
+                        rx
+                    })
+                }
             }
-        }
+            let store = ClosedChannelStore {
+                rxs: Mutex::new(vec![rx_a, rx_b]),
+            };
+            // Exercise get + for_each so their bodies are covered.
+            assert!(store.get(&EntityId::from("light.a")).is_none());
+            store.for_each(&mut |_, _| {});
+            Arc::new(store)
+        };
 
-        let store: Arc<dyn EntityStore> = Arc::new(ImmediateCloseStore);
         let ids = Arc::new(vec![EntityId::from("light.a"), EntityId::from("light.b")]);
-        let pending: PendingMap = Arc::new(Mutex::new(StdHashMap::new()));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
 
         tokio::time::timeout(
             Duration::from_millis(500),
-            super::run_entity_fan_in(store, ids, pending),
+            super::run_entity_fan_in(store_dyn, ids, pending),
         )
         .await
         .expect("run_entity_fan_in must exit when all receivers close");
