@@ -3,11 +3,15 @@
 //! # FSM
 //!
 //! ```text
-//! Connecting → Authenticating → Subscribing → Snapshotting → Services → Live
-//!                                                                          │
-//!                                            ←── Reconnecting ←───────────┘
-//!                                                     │
-//!                                                 (retry)
+//! Connecting → Authenticating
+//!   → SubscribingStateChanged
+//!   → SubscribingServiceReg
+//!   → SubscribingServiceRem
+//!   → Snapshotting → Services → Live
+//!                                  │
+//!                ←── Reconnecting ←┘
+//!                       │
+//!                   (retry)
 //!
 //! auth_invalid or overflow circuit-breaker → Failed (no reconnect)
 //! ```
@@ -436,13 +440,51 @@ fn apply_service_lifecycle_event(
 ///
 /// `pub(crate)` so that in-crate tests can construct and inspect phases
 /// without exposing the type in the public API.
+///
+/// # TASK-123 (F7): three filtered subscribe phases
+///
+/// Pre-TASK-123 the FSM had a single `Subscribing { subscribe_id }` phase that
+/// sent a wildcard `subscribe_events` (no `event_type`).  HA forwarded EVERY
+/// event on the bus — `automation_triggered`, `call_service`,
+/// `recorder_5min_statistics_generated`, etc. — and the client `parse()`d all
+/// of them just to drop everything but `state_changed` /
+/// `service_registered` / `service_removed`.  TASK-115 measured ≈10x
+/// unnecessary inbound bytes on a typical HA installation.
+///
+/// TASK-123 replaces the wildcard with three sequential filtered subscribes.
+/// Each waits for its own `result` ACK before advancing to the next phase.
+/// HA never sends the unsubscribed event types over the wire, so `parse()` is
+/// never called for irrelevant frames — the byte savings are real, not just
+/// internal-dispatch-side.
+///
+/// The snapshot-before-events ordering safety property is preserved, though
+/// the unbuffered window is wider than pre-TASK-123: `get_states` is sent
+/// only after the THIRD subscribe ACK, and the `Snapshotting` `event_buffer`
+/// continues to absorb `state_changed` events that arrive during snapshot
+/// fetch.  `state_changed` events that arrive BETWEEN `auth_ok` and the
+/// third subscribe ACK are not buffered (same as pre-TASK-123, but over a
+/// 3-RTT window rather than 1-RTT).  This is harmless: the snapshot taken
+/// after the last ACK contains the post-event state of every entity, so
+/// from the user's perspective nothing is lost — only the moment at which
+/// the change becomes visible is delayed by at most one snapshot RTT.
+/// What this FSM guarantees is the strict invariant: every event the
+/// `event_buffer` ever holds (and replays) is one HA confirmed AFTER the
+/// snapshot the FSM is about to apply, never before.
 #[derive(Debug)]
 pub(crate) enum Phase {
     /// Sending the `auth` frame; waiting for `auth_ok` or `auth_invalid`.
     Authenticating,
-    /// `auth_ok` received; `subscribe_events` sent; waiting for result ACK.
-    Subscribing { subscribe_id: u32 },
-    /// Subscription ACK received; `get_states` in flight.
+    /// `auth_ok` received; `subscribe_events` for `state_changed` sent;
+    /// waiting for the result ACK before sending the next subscribe.
+    SubscribingStateChanged { subscribe_id: u32 },
+    /// `state_changed` ACK received; `subscribe_events` for
+    /// `service_registered` sent; waiting for its ACK.
+    SubscribingServiceReg { subscribe_id: u32 },
+    /// `service_registered` ACK received; `subscribe_events` for
+    /// `service_removed` sent; waiting for its ACK before issuing
+    /// `get_states`.
+    SubscribingServiceRem { subscribe_id: u32 },
+    /// All three subscription ACKs received; `get_states` in flight.
     Snapshotting {
         get_states_id: u32,
         /// Ring buffer of state-changed events arriving during snapshot fetch.
@@ -1315,18 +1357,28 @@ impl WsClient {
                 Ok(Phase::Authenticating)
             }
 
-            // auth_ok → send subscribe_events (subscribe-all), advance to
-            // Subscribing.
+            // auth_ok → send subscribe_events for `state_changed`, advance to
+            // SubscribingStateChanged.
             //
-            // TASK-049: `event_type` is `None`, which serializes the field
-            // OUT of the JSON.  HA's WS API documents this as "subscribe to
-            // all events on the bus".  Internal dispatch by `EventVariant`
-            // (in `Phase::Live` and during snapshot-buffer replay) routes
-            // `state_changed` to the entity store, `service_registered` /
-            // `service_removed` to the `ServiceRegistry`, and everything else
-            // is ignored.  This keeps the single-ACK gate and avoids an FSM
-            // phase explosion that three separate filtered subscriptions
-            // would have required.
+            // TASK-123 (F7): replaces the pre-existing wildcard `event_type:
+            // None` subscribe with three sequential filtered subscribes
+            // (`state_changed`, `service_registered`, `service_removed`).
+            // HA's WS API treats absence of `event_type` as "subscribe to all
+            // events on the bus" — measured at ~10x the inbound bytes the
+            // client actually consumes (TASK-115 audit).  After F7 HA never
+            // forwards `automation_triggered`, `call_service`,
+            // `recorder_5min_statistics_generated`, etc. — they are dropped
+            // server-side, before they hit the wire.  The dispatcher arms in
+            // `Phase::Live` and the snapshot-buffer replay continue to
+            // demultiplex by `EventVariant` because the three subscribed
+            // event types are still distinct on the wire.
+            //
+            // The single-ACK gate becomes a three-ACK gate: each subscribe
+            // is sent only after the previous ACK arrives, and `get_states`
+            // is sent only after the THIRD ACK.  Phase 3's snapshot-before-
+            // events invariant is preserved because the `event_buffer` in
+            // `Snapshotting` opens at the same point in the sequence
+            // (post-third-ACK, pre-`get_states`-reply) as it did pre-F7.
             (Phase::Authenticating, InboundMsg::AuthOk(_)) => {
                 self.set_state(ConnectionState::Subscribing);
                 let subscribe_id = self.next_id();
@@ -1334,13 +1386,13 @@ impl WsClient {
                     .send(Message::Text(serde_json::to_string(
                         &OutboundMsg::SubscribeEvents(SubscribeEventsPayload {
                             id: subscribe_id,
-                            event_type: None,
+                            event_type: Some("state_changed".to_owned()),
                         }),
                     )?))
                     .await
                     .map_err(ClientError::Transport)?;
-                tracing::info!(id = subscribe_id, "subscribe_events sent (all events)");
-                Ok(Phase::Subscribing { subscribe_id })
+                tracing::info!(id = subscribe_id, "subscribe_events sent (state_changed)");
+                Ok(Phase::SubscribingStateChanged { subscribe_id })
             }
 
             // auth_invalid → Failed (no reconnect; token plaintext not logged).
@@ -1354,26 +1406,116 @@ impl WsClient {
                 Err(ClientError::AuthInvalid { reason: p.message })
             }
 
-            // ── Subscribing ──────────────────────────────────────────────────
+            // ── SubscribingStateChanged ──────────────────────────────────────
 
-            // Await the result ACK for subscribe_events.
-            (Phase::Subscribing { subscribe_id }, InboundMsg::Result(result))
-                if result.id == subscribe_id =>
-            {
+            // ACK for the `state_changed` subscribe → send the
+            // `service_registered` subscribe.  TASK-123: the FSM does NOT
+            // proceed to `get_states` here — that is gated on all three
+            // subscribe ACKs (see `SubscribingServiceRem` arm below).
+            (
+                Phase::SubscribingStateChanged {
+                    subscribe_id: ack_id,
+                },
+                InboundMsg::Result(result),
+            ) if result.id == ack_id => {
                 if !result.success {
                     let reason = result
                         .error
                         .map(|e| e.message)
-                        .unwrap_or_else(|| "subscribe_events failed".to_owned());
-                    tracing::error!(%reason, "subscribe_events result: failure");
+                        .unwrap_or_else(|| "subscribe_events(state_changed) failed".to_owned());
+                    tracing::error!(%reason, "subscribe_events(state_changed) result: failure");
                     self.on_disconnect();
                     self.set_state(ConnectionState::Failed);
                     return Err(ClientError::AuthInvalid { reason });
                 }
-                tracing::info!(id = subscribe_id, "subscribe_events ACK received");
+                tracing::info!(id = ack_id, "subscribe_events(state_changed) ACK received");
+
+                let subscribe_id = self.next_id();
+                write
+                    .send(Message::Text(serde_json::to_string(
+                        &OutboundMsg::SubscribeEvents(SubscribeEventsPayload {
+                            id: subscribe_id,
+                            event_type: Some("service_registered".to_owned()),
+                        }),
+                    )?))
+                    .await
+                    .map_err(ClientError::Transport)?;
+                tracing::info!(
+                    id = subscribe_id,
+                    "subscribe_events sent (service_registered)"
+                );
+                Ok(Phase::SubscribingServiceReg { subscribe_id })
+            }
+
+            // ── SubscribingServiceReg ────────────────────────────────────────
+
+            // ACK for the `service_registered` subscribe → send the
+            // `service_removed` subscribe.
+            (
+                Phase::SubscribingServiceReg {
+                    subscribe_id: ack_id,
+                },
+                InboundMsg::Result(result),
+            ) if result.id == ack_id => {
+                if !result.success {
+                    let reason = result.error.map(|e| e.message).unwrap_or_else(|| {
+                        "subscribe_events(service_registered) failed".to_owned()
+                    });
+                    tracing::error!(%reason, "subscribe_events(service_registered) result: failure");
+                    self.on_disconnect();
+                    self.set_state(ConnectionState::Failed);
+                    return Err(ClientError::AuthInvalid { reason });
+                }
+                tracing::info!(
+                    id = ack_id,
+                    "subscribe_events(service_registered) ACK received"
+                );
+
+                let subscribe_id = self.next_id();
+                write
+                    .send(Message::Text(serde_json::to_string(
+                        &OutboundMsg::SubscribeEvents(SubscribeEventsPayload {
+                            id: subscribe_id,
+                            event_type: Some("service_removed".to_owned()),
+                        }),
+                    )?))
+                    .await
+                    .map_err(ClientError::Transport)?;
+                tracing::info!(id = subscribe_id, "subscribe_events sent (service_removed)");
+                Ok(Phase::SubscribingServiceRem { subscribe_id })
+            }
+
+            // ── SubscribingServiceRem ────────────────────────────────────────
+
+            // ACK for the `service_removed` subscribe → all three subscribes
+            // are live; NOW issue `get_states`.  This is the load-bearing
+            // sequencing gate (TASK-029): the snapshot is requested only
+            // after every event subscription has been ACKed by HA, so the
+            // `Snapshotting` `event_buffer` is guaranteed to capture every
+            // `state_changed` event that arrives before the snapshot reply.
+            (
+                Phase::SubscribingServiceRem {
+                    subscribe_id: ack_id,
+                },
+                InboundMsg::Result(result),
+            ) if result.id == ack_id => {
+                if !result.success {
+                    let reason = result
+                        .error
+                        .map(|e| e.message)
+                        .unwrap_or_else(|| "subscribe_events(service_removed) failed".to_owned());
+                    tracing::error!(%reason, "subscribe_events(service_removed) result: failure");
+                    self.on_disconnect();
+                    self.set_state(ConnectionState::Failed);
+                    return Err(ClientError::AuthInvalid { reason });
+                }
+                tracing::info!(
+                    id = ack_id,
+                    "subscribe_events(service_removed) ACK received; all three subscriptions live"
+                );
                 self.set_state(ConnectionState::Snapshotting);
 
-                // Gate: ACK received — NOW issue get_states.
+                // Gate: all three ACKs received — NOW issue get_states.
                 let get_states_id = self.next_id();
                 write
                     .send(Message::Text(serde_json::to_string(
@@ -1477,9 +1619,13 @@ impl WsClient {
                 // events arrived during snapshot fetch; replaying them after
                 // the snapshot is applied keeps the store consistent with HA.
                 //
-                // TASK-049: with the subscribe-all subscription, the buffer
-                // can also hold `service_registered` / `service_removed`
-                // events.  Apply them best-effort here — note that the
+                // TASK-049 / TASK-123: under the three filtered subscribes
+                // the buffer can hold `state_changed`, `service_registered`,
+                // or `service_removed` events — the three event types the
+                // FSM has subscribed to by the time `Snapshotting` is
+                // reached.  Apply each best-effort: state_changed flows
+                // into the entity store, service-lifecycle events flow
+                // into the ServiceRegistry.  Note that the
                 // `Phase::Services → Live` transition below will overwrite
                 // the registry with the authoritative `get_services` reply
                 // anyway, so service events arriving DURING the snapshot
@@ -1598,14 +1744,17 @@ impl WsClient {
             // service_removed), and update the stable-Live tracker so the
             // backoff counter can reset.
             //
-            // TASK-049: dispatch by `EventVariant` — `state_changed` flows to
-            // the entity store as before; service-lifecycle events flow into
-            // the shared `services_handle` so the LiveStore-side
-            // `services_lookup` accessor returns fresh state mid-session
-            // without waiting for a reconnect.  Unknown event types
-            // (`EventVariant::Other`) are silently ignored — the
-            // subscribe-all strategy means HA may emit events the client
-            // doesn't care about, and the FSM should not crash on them.
+            // TASK-049 / TASK-123: dispatch by `EventVariant` —
+            // `state_changed` flows to the entity store as before;
+            // service-lifecycle events flow into the shared
+            // `services_handle` so the LiveStore-side `services_lookup`
+            // accessor returns fresh state mid-session without waiting for
+            // a reconnect.  Unknown event types (`EventVariant::Other`) are
+            // silently ignored — under the TASK-123 three-filtered-subscribes
+            // strategy HA SHOULD only forward `state_changed` /
+            // `service_registered` / `service_removed` over the wire, but a
+            // forward-compatible FSM still tolerates an unexpected variant
+            // rather than crashing.
             (Phase::Live, InboundMsg::Event(event)) => {
                 if let Some(update) = event_to_entity_update(&event) {
                     if let Some(store) = self.store.as_ref() {
@@ -1662,10 +1811,10 @@ impl WsClient {
             //      timeout recovery).
             //
             // CRITICAL: this arm runs ONLY for results whose ids are not
-            // matched by an earlier phase-specific arm (the Subscribing
-            // ACK / Snapshotting ACK / Services ACK arms above each gate
-            // on `result.id == <expected_id>`).  Internal handshake replies
-            // never reach this catch-all.
+            // matched by an earlier phase-specific arm (the three Subscribing
+            // ACK arms / Snapshotting ACK / Services ACK arms above each
+            // gate on `result.id == <expected_id>`).  Internal handshake
+            // replies never reach this catch-all.
             (phase, InboundMsg::Result(result)) => {
                 let id = result.id;
                 if self.pending.contains_key(&id) {
@@ -1875,6 +2024,73 @@ mod tests {
         serde_json::from_str(json).unwrap_or_else(|e| panic!("bad test JSON: {e}: {json}"))
     }
 
+    /// Drive the FSM through the three filtered-subscribe ACKs (TASK-123 F7).
+    ///
+    /// Caller must already have advanced through `auth_required` + `auth_ok`
+    /// so that `phase` is `Phase::SubscribingStateChanged`.  Returns the
+    /// `Phase::Snapshotting` reached after the third ACK is processed.  The
+    /// helper exists so individual tests don't each have to spell out three
+    /// near-identical ACK steps; before TASK-123 a single ACK was enough.
+    async fn drive_three_subscribe_acks<S>(
+        client: &mut WsClient,
+        phase: Phase,
+        sink: &mut S,
+    ) -> Phase
+    where
+        S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    {
+        let id1 = match &phase {
+            Phase::SubscribingStateChanged { subscribe_id } => *subscribe_id,
+            other => {
+                panic!("drive_three_subscribe_acks expects SubscribingStateChanged; got: {other:?}")
+            }
+        };
+        let phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{id1},"success":true,"result":null}}"#
+                )),
+                phase,
+                sink,
+            )
+            .await
+            .expect("state_changed ACK must advance FSM");
+
+        let id2 = match &phase {
+            Phase::SubscribingServiceReg { subscribe_id } => *subscribe_id,
+            other => panic!(
+                "drive_three_subscribe_acks expects SubscribingServiceReg after ACK 1; got: {other:?}"
+            ),
+        };
+        let phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{id2},"success":true,"result":null}}"#
+                )),
+                phase,
+                sink,
+            )
+            .await
+            .expect("service_registered ACK must advance FSM");
+
+        let id3 = match &phase {
+            Phase::SubscribingServiceRem { subscribe_id } => *subscribe_id,
+            other => panic!(
+                "drive_three_subscribe_acks expects SubscribingServiceRem after ACK 2; got: {other:?}"
+            ),
+        };
+        client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{id3},"success":true,"result":null}}"#
+                )),
+                phase,
+                sink,
+            )
+            .await
+            .expect("service_removed ACK must advance FSM to Snapshotting")
+    }
+
     /// Build a minimal entity with the given `last_updated` timestamp string.
     fn make_entity_ts(id: &str, state: &str, last_updated: &str) -> crate::ha::entity::Entity {
         use jiff::Timestamp;
@@ -1904,15 +2120,22 @@ mod tests {
         };
         let (mut sink, sent) = MockSink::new();
 
+        // TASK-123 (F7): three filtered subscribes → ids 1, 2, 3 are the
+        // three subscribe ACKs (state_changed, service_registered,
+        // service_removed); id 4 is get_states; id 5 is get_services.
         let messages = vec![
             inbound(r#"{"type":"auth_required","ha_version":"2024.4.0"}"#),
             inbound(r#"{"type":"auth_ok","ha_version":"2024.4.0"}"#),
-            // subscribe_events ACK (id=1)
+            // subscribe_events(state_changed) ACK (id=1)
             inbound(r#"{"type":"result","id":1,"success":true,"result":null}"#),
-            // get_states result (id=2)
-            inbound(r#"{"type":"result","id":2,"success":true,"result":[]}"#),
-            // get_services result (id=3)
-            inbound(r#"{"type":"result","id":3,"success":true,"result":{}}"#),
+            // subscribe_events(service_registered) ACK (id=2)
+            inbound(r#"{"type":"result","id":2,"success":true,"result":null}"#),
+            // subscribe_events(service_removed) ACK (id=3)
+            inbound(r#"{"type":"result","id":3,"success":true,"result":null}"#),
+            // get_states result (id=4)
+            inbound(r#"{"type":"result","id":4,"success":true,"result":[]}"#),
+            // get_services result (id=5)
+            inbound(r#"{"type":"result","id":5,"success":true,"result":{}}"#),
         ];
 
         let mut phase = Phase::Authenticating;
@@ -1932,27 +2155,37 @@ mod tests {
         let frames = sent.lock().await;
         assert_eq!(
             frames.len(),
-            4,
-            "expected 4 outbound frames: auth, subscribe_events, get_states, get_services"
+            6,
+            "expected 6 outbound frames: auth, 3x subscribe_events, get_states, get_services"
         );
 
         let auth_f: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
         assert_eq!(auth_f["type"], "auth");
 
-        let sub_f: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
-        assert_eq!(sub_f["type"], "subscribe_events");
-        // TASK-049: subscribe-all — the `event_type` field MUST be absent
-        // from the serialized frame (HA treats absence, not `null`, as
-        // "all events").  This pins the wire-level guarantee.
-        assert!(
-            sub_f.get("event_type").is_none(),
-            "subscribe_events frame must omit `event_type` (subscribe-all); got: {sub_f}"
-        );
+        // Three filtered subscribe_events frames in order: state_changed,
+        // service_registered, service_removed.  Each MUST set
+        // `event_type` (TASK-123 pins this against regression to wildcard).
+        let expected_event_types = ["state_changed", "service_registered", "service_removed"];
+        for (i, expected) in expected_event_types.iter().enumerate() {
+            let sub_f: serde_json::Value = serde_json::from_str(&frames[1 + i]).unwrap();
+            assert_eq!(
+                sub_f["type"],
+                "subscribe_events",
+                "frame {} must be subscribe_events; got: {sub_f}",
+                1 + i
+            );
+            assert_eq!(
+                sub_f["event_type"],
+                *expected,
+                "frame {} subscribe_events must filter on `{expected}`; got: {sub_f}",
+                1 + i
+            );
+        }
 
-        let gs_f: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
+        let gs_f: serde_json::Value = serde_json::from_str(&frames[4]).unwrap();
         assert_eq!(gs_f["type"], "get_states");
 
-        let gsvc_f: serde_json::Value = serde_json::from_str(&frames[3]).unwrap();
+        let gsvc_f: serde_json::Value = serde_json::from_str(&frames[5]).unwrap();
         assert_eq!(gsvc_f["type"], "get_services");
     }
 
@@ -2056,7 +2289,7 @@ mod tests {
         };
         let (mut sink, sent) = MockSink::new();
 
-        // Drive auth_required + auth_ok → Subscribing.
+        // Drive auth_required + auth_ok → SubscribingStateChanged.
         let phase = client
             .handle_message(
                 inbound(r#"{"type":"auth_required","ha_version":"2024.4.0"}"#),
@@ -2074,12 +2307,14 @@ mod tests {
             .await
             .unwrap();
 
-        // After auth_ok: 2 frames sent (auth + subscribe_events), no get_states yet.
+        // After auth_ok: 2 frames sent (auth + subscribe_events for
+        // state_changed), no get_states yet.
         {
             let frames = sent.lock().await;
             assert_eq!(frames.len(), 2);
             let sub_f: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
             assert_eq!(sub_f["type"], "subscribe_events");
+            assert_eq!(sub_f["event_type"], "state_changed");
             let has_get_states = frames.iter().any(|f| {
                 serde_json::from_str::<serde_json::Value>(f)
                     .map(|v| v["type"] == "get_states")
@@ -2087,28 +2322,101 @@ mod tests {
             });
             assert!(
                 !has_get_states,
-                "get_states must NOT be sent before subscribe_events ACK"
+                "get_states must NOT be sent before any subscribe_events ACK"
             );
         }
 
-        let subscribe_id = match &phase {
-            Phase::Subscribing { subscribe_id } => *subscribe_id,
-            other => panic!("expected Subscribing phase; got: {other:?}"),
+        // ACK #1 (state_changed) → SubscribingServiceReg.  get_states still
+        // MUST NOT have been sent — TASK-123 gates `get_states` on ALL THREE
+        // subscribe ACKs.
+        let subscribe_id_1 = match &phase {
+            Phase::SubscribingStateChanged { subscribe_id } => *subscribe_id,
+            other => panic!("expected SubscribingStateChanged phase; got: {other:?}"),
         };
-
-        // Now send the subscribe ACK.
-        let _phase = client
+        let phase = client
             .handle_message(
                 inbound(&format!(
-                    r#"{{"type":"result","id":{subscribe_id},"success":true,"result":null}}"#
+                    r#"{{"type":"result","id":{subscribe_id_1},"success":true,"result":null}}"#
                 )),
                 phase,
                 &mut sink,
             )
             .await
             .unwrap();
+        {
+            let frames = sent.lock().await;
+            let has_get_states = frames.iter().any(|f| {
+                serde_json::from_str::<serde_json::Value>(f)
+                    .map(|v| v["type"] == "get_states")
+                    .unwrap_or(false)
+            });
+            assert!(
+                !has_get_states,
+                "get_states must NOT be sent after only the state_changed ACK \
+                 (two more subscribe ACKs are still pending)"
+            );
+            // Most recent subscribe frame must be `service_registered`.
+            let last = frames
+                .iter()
+                .rev()
+                .find_map(|f| serde_json::from_str::<serde_json::Value>(f).ok())
+                .expect("at least one frame must parse");
+            assert_eq!(last["type"], "subscribe_events");
+            assert_eq!(last["event_type"], "service_registered");
+        }
 
-        // After ACK: get_states must now be present.
+        // ACK #2 (service_registered) → SubscribingServiceRem.  Still no
+        // get_states.
+        let subscribe_id_2 = match &phase {
+            Phase::SubscribingServiceReg { subscribe_id } => *subscribe_id,
+            other => panic!("expected SubscribingServiceReg phase; got: {other:?}"),
+        };
+        let phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{subscribe_id_2},"success":true,"result":null}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        {
+            let frames = sent.lock().await;
+            let has_get_states = frames.iter().any(|f| {
+                serde_json::from_str::<serde_json::Value>(f)
+                    .map(|v| v["type"] == "get_states")
+                    .unwrap_or(false)
+            });
+            assert!(
+                !has_get_states,
+                "get_states must NOT be sent after only two of three subscribe ACKs"
+            );
+            let last = frames
+                .iter()
+                .rev()
+                .find_map(|f| serde_json::from_str::<serde_json::Value>(f).ok())
+                .expect("at least one frame must parse");
+            assert_eq!(last["type"], "subscribe_events");
+            assert_eq!(last["event_type"], "service_removed");
+        }
+
+        // ACK #3 (service_removed) → Snapshotting.  NOW get_states must be
+        // present.
+        let subscribe_id_3 = match &phase {
+            Phase::SubscribingServiceRem { subscribe_id } => *subscribe_id,
+            other => panic!("expected SubscribingServiceRem phase; got: {other:?}"),
+        };
+        let _phase = client
+            .handle_message(
+                inbound(&format!(
+                    r#"{{"type":"result","id":{subscribe_id_3},"success":true,"result":null}}"#
+                )),
+                phase,
+                &mut sink,
+            )
+            .await
+            .unwrap();
         {
             let frames = sent.lock().await;
             let has_get_states = frames.iter().any(|f| {
@@ -2118,7 +2426,7 @@ mod tests {
             });
             assert!(
                 has_get_states,
-                "get_states must be sent after subscribe_events ACK"
+                "get_states must be sent after the THIRD subscribe_events ACK"
             );
         }
     }
@@ -2459,22 +2767,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Get subscribe_id so we can ACK it.
-            let subscribe_id = match &phase {
-                Phase::Subscribing { subscribe_id } => *subscribe_id,
-                other => panic!("expected Subscribing; got: {other:?}"),
-            };
-
-            let phase = client
-                .handle_message(
-                    inbound(&format!(
-                        r#"{{"type":"result","id":{subscribe_id},"success":true,"result":null}}"#
-                    )),
-                    phase,
-                    &mut sink,
-                )
-                .await
-                .unwrap();
+            // Drive through the three filtered-subscribe ACKs (TASK-123 F7).
+            let phase = drive_three_subscribe_acks(&mut client, phase, &mut sink).await;
 
             // Verify we're in Snapshotting.
             assert!(
@@ -2567,20 +2861,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let subscribe_id = match &phase {
-            Phase::Subscribing { subscribe_id } => *subscribe_id,
-            other => panic!("expected Subscribing; got: {other:?}"),
-        };
-        let phase = client
-            .handle_message(
-                inbound(&format!(
-                    r#"{{"type":"result","id":{subscribe_id},"success":true,"result":null}}"#
-                )),
-                phase,
-                &mut sink,
-            )
-            .await
-            .unwrap();
+        // TASK-123 F7: drive through the three filtered-subscribe ACKs.
+        let phase = drive_three_subscribe_acks(&mut client, phase, &mut sink).await;
         let get_states_id = match &phase {
             Phase::Snapshotting { get_states_id, .. } => *get_states_id,
             other => panic!("expected Snapshotting; got: {other:?}"),
@@ -2700,20 +2982,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let subscribe_id = match &phase {
-            Phase::Subscribing { subscribe_id } => *subscribe_id,
-            other => panic!("expected Subscribing; got: {other:?}"),
-        };
-        let phase = client
-            .handle_message(
-                inbound(&format!(
-                    r#"{{"type":"result","id":{subscribe_id},"success":true,"result":null}}"#
-                )),
-                phase,
-                &mut sink,
-            )
-            .await
-            .unwrap();
+        // TASK-123 F7: drive through the three filtered-subscribe ACKs.
+        let phase = drive_three_subscribe_acks(&mut client, phase, &mut sink).await;
         let get_states_id = match &phase {
             Phase::Snapshotting { get_states_id, .. } => *get_states_id,
             other => panic!("expected Snapshotting; got: {other:?}"),
@@ -2851,20 +3121,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let subscribe_id = match &phase {
-            Phase::Subscribing { subscribe_id } => *subscribe_id,
-            other => panic!("expected Subscribing; got: {other:?}"),
-        };
-        let phase = client
-            .handle_message(
-                inbound(&format!(
-                    r#"{{"type":"result","id":{subscribe_id},"success":true,"result":null}}"#
-                )),
-                phase,
-                &mut sink,
-            )
-            .await
-            .unwrap();
+        // TASK-123 F7: drive through the three filtered-subscribe ACKs.
+        let phase = drive_three_subscribe_acks(&mut client, phase, &mut sink).await;
         let get_states_id = match &phase {
             Phase::Snapshotting { get_states_id, .. } => *get_states_id,
             other => panic!("expected Snapshotting; got: {other:?}"),
@@ -2981,20 +3239,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let subscribe_id = match &phase {
-            Phase::Subscribing { subscribe_id } => *subscribe_id,
-            other => panic!("expected Subscribing; got: {other:?}"),
-        };
-        let phase = client
-            .handle_message(
-                inbound(&format!(
-                    r#"{{"type":"result","id":{subscribe_id},"success":true,"result":null}}"#
-                )),
-                phase,
-                &mut sink,
-            )
-            .await
-            .unwrap();
+        // TASK-123 F7: drive through the three filtered-subscribe ACKs.
+        let phase = drive_three_subscribe_acks(&mut client, phase, &mut sink).await;
 
         // Arrived in Snapshotting — simulate failure by calling on_disconnect
         // without ever reaching Live.
@@ -3051,20 +3297,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let subscribe_id = match &phase {
-            Phase::Subscribing { subscribe_id } => *subscribe_id,
-            other => panic!("expected Subscribing; got: {other:?}"),
-        };
-        let phase = client
-            .handle_message(
-                inbound(&format!(
-                    r#"{{"type":"result","id":{subscribe_id},"success":true,"result":null}}"#
-                )),
-                phase,
-                &mut sink,
-            )
-            .await
-            .unwrap();
+        // TASK-123 F7: drive through the three filtered-subscribe ACKs.
+        let phase = drive_three_subscribe_acks(&mut client, phase, &mut sink).await;
         let get_states_id = match &phase {
             Phase::Snapshotting { get_states_id, .. } => *get_states_id,
             other => panic!("expected Snapshotting; got: {other:?}"),
@@ -3346,20 +3580,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let subscribe_id = match &phase {
-            Phase::Subscribing { subscribe_id } => *subscribe_id,
-            other => panic!("expected Subscribing; got: {other:?}"),
-        };
-        let phase = client
-            .handle_message(
-                inbound(&format!(
-                    r#"{{"type":"result","id":{subscribe_id},"success":true,"result":null}}"#
-                )),
-                phase,
-                &mut sink,
-            )
-            .await
-            .unwrap();
+        // TASK-123 F7: drive through the three filtered-subscribe ACKs.
+        let phase = drive_three_subscribe_acks(&mut client, phase, &mut sink).await;
         let get_states_id = match &phase {
             Phase::Snapshotting { get_states_id, .. } => *get_states_id,
             other => panic!("expected Snapshotting; got: {other:?}"),
@@ -3440,20 +3662,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let subscribe_id = match &phase {
-            Phase::Subscribing { subscribe_id } => *subscribe_id,
-            other => panic!("expected Subscribing; got: {other:?}"),
-        };
-        let phase = client
-            .handle_message(
-                inbound(&format!(
-                    r#"{{"type":"result","id":{subscribe_id},"success":true,"result":null}}"#
-                )),
-                phase,
-                &mut sink,
-            )
-            .await
-            .unwrap();
+        // TASK-123 F7: drive through the three filtered-subscribe ACKs.
+        let phase = drive_three_subscribe_acks(&mut client, phase, &mut sink).await;
         let get_states_id = match &phase {
             Phase::Snapshotting { get_states_id, .. } => *get_states_id,
             other => panic!("expected Snapshotting; got: {other:?}"),
@@ -3584,20 +3794,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let subscribe_id = match &phase {
-            Phase::Subscribing { subscribe_id } => *subscribe_id,
-            other => panic!("expected Subscribing; got: {other:?}"),
-        };
-        let phase = client
-            .handle_message(
-                inbound(&format!(
-                    r#"{{"type":"result","id":{subscribe_id},"success":true,"result":null}}"#
-                )),
-                phase,
-                &mut sink,
-            )
-            .await
-            .unwrap();
+        // TASK-123 F7: drive through the three filtered-subscribe ACKs.
+        let phase = drive_three_subscribe_acks(&mut client, phase, &mut sink).await;
         let get_states_id = match &phase {
             Phase::Snapshotting { get_states_id, .. } => *get_states_id,
             other => panic!("expected Snapshotting; got: {other:?}"),

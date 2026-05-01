@@ -223,11 +223,47 @@ impl MockWsServer {
         .await;
     }
 
-    /// Script the `subscribe_events` ACK (`result { id, success: true }`).
+    /// Script the `subscribe_events` ACK handshake.
+    ///
+    /// TASK-123 (F7): the FSM now sends THREE filtered `subscribe_events`
+    /// frames in sequence (`state_changed`, `service_registered`,
+    /// `service_removed`) instead of a single wildcard subscribe.  Each
+    /// frame is gated on the previous ACK, so the canonical "script the
+    /// subscribe handshake" now queues three identical `OnRequest` replies
+    /// — one per inbound subscribe frame.  The mock matches OnRequest by
+    /// `match_type` and removes the matched entry, so three queued replies
+    /// answer the three subscribe frames in order; reply bodies are
+    /// identical because each ACK is `result { id, success: true,
+    /// result: null }`.
+    ///
+    /// Pre-TASK-123 callers issued exactly one `script_subscribe_ack().await`
+    /// per accepted connection; the function quietly absorbs the FSM
+    /// change here so no caller-side fan-out is required.
     pub async fn script_subscribe_ack(&self) {
+        for _ in 0..3 {
+            self.push_reply(ScriptedReply::OnRequest {
+                match_type: "subscribe_events".to_owned(),
+                body: r#"{"type":"result","id":{{ID}},"success":true,"result":null}"#.to_owned(),
+                forward_id: true,
+            })
+            .await;
+        }
+    }
+
+    /// Script `n` successful subscribe ACKs followed by one failure ACK.
+    /// Used to test FSM failure paths for each of the three subscribe phases.
+    pub async fn script_subscribe_n_acks_then_fail(&self, n: usize) {
+        for _ in 0..n {
+            self.push_reply(ScriptedReply::OnRequest {
+                match_type: "subscribe_events".to_owned(),
+                body: r#"{"type":"result","id":{{ID}},"success":true,"result":null}"#.to_owned(),
+                forward_id: true,
+            })
+            .await;
+        }
         self.push_reply(ScriptedReply::OnRequest {
             match_type: "subscribe_events".to_owned(),
-            body: r#"{"type":"result","id":{{ID}},"success":true,"result":null}"#.to_owned(),
+            body: r#"{"type":"result","id":{{ID}},"success":false,"error":{"code":"unknown_error","message":"subscribe failed"}}"#.to_owned(),
             forward_id: true,
         })
         .await;
