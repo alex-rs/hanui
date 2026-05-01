@@ -103,6 +103,61 @@ pub enum LoadError {
     },
 }
 
+/// Read and parse `path` into a [`Dashboard`] without resolving the
+/// `home_assistant.token_env` env var or running the Phase 4 validator.
+///
+/// This is the **F4-bootstrap pre-flight** entry point used by
+/// `src/lib.rs::run` (TASK-120a) to read the `device_profile` field BEFORE
+/// the Tokio runtime is constructed. The full [`load`] function is still
+/// invoked later by `run_with_live_store`; that second call is the one that
+/// performs token resolution and (eventually) full schema validation.
+///
+/// # Why a separate entry point?
+///
+/// During bootstrap we have not yet decided which Tokio worker count to use,
+/// and the only thing we need from the YAML is the typed `device_profile`
+/// enum. Performing token resolution here would mean validating env-var
+/// presence twice on every startup (once for the profile pre-flight, once
+/// for the real load), and would expand the surface where a missing
+/// `HA_TOKEN`-style env var could change the runtime's thread count. By
+/// limiting this entry point to parse-only behaviour we keep the rule
+/// "Tokio runtime size is determined solely by the YAML `device_profile`
+/// field" structurally enforced.
+///
+/// # Errors
+///
+/// Same first three error variants as [`load`]:
+/// * [`LoadError::ConfigNotFound`]
+/// * [`LoadError::ConfigTooLarge`]
+/// * [`LoadError::ParseError`]
+///
+/// Token-env and validation errors are NOT returned here — they are surfaced
+/// later by the call to [`load`] inside `run_with_live_store`.
+pub fn load_dashboard_only(path: &Path) -> Result<Dashboard, LoadError> {
+    if !path.exists() {
+        return Err(LoadError::ConfigNotFound {
+            path: path.to_owned(),
+        });
+    }
+
+    let bytes = std::fs::read(path).map_err(|_| LoadError::ConfigNotFound {
+        path: path.to_owned(),
+    })?;
+
+    if bytes.len() > MAX_YAML_BYTES {
+        return Err(LoadError::ConfigTooLarge {
+            bytes: bytes.len(),
+            cap: MAX_YAML_BYTES,
+        });
+    }
+
+    serde_yaml_ng::from_slice::<Dashboard>(&bytes).map_err(|e| {
+        let msg = e.to_string();
+        let excerpt = msg.chars().take(256).collect::<String>();
+        LoadError::ParseError { excerpt }
+    })
+}
+
 /// Load, parse, and validate a `dashboard.yaml` file.
 ///
 /// # Arguments
@@ -508,6 +563,89 @@ views:
             "YAML with valid token_env must load successfully; got: {result:?}"
         );
         unsafe { std::env::remove_var(var_name) };
+    }
+
+    // -----------------------------------------------------------------------
+    // load_dashboard_only — TASK-120a F4-bootstrap pre-flight
+    // -----------------------------------------------------------------------
+
+    /// `load_dashboard_only` happy path: a minimal valid YAML returns a
+    /// `Dashboard` whose `device_profile` matches the YAML field, WITHOUT
+    /// touching `home_assistant.token_env` resolution. No env-var setup is
+    /// required because this entry point skips token resolution entirely.
+    #[test]
+    fn load_dashboard_only_returns_parsed_dashboard_without_token_resolution() {
+        // Build a YAML payload that DOES include `home_assistant.token_env`,
+        // but with a token env name we deliberately leave UNSET. If the
+        // bootstrap pre-flight accidentally invoked `Config::resolve_token_env`
+        // it would error out; load_dashboard_only must succeed regardless.
+        let var_name = "HANUI_TEST_BOOTSTRAP_NEVER_RESOLVED_120A";
+        unsafe { std::env::remove_var(var_name) };
+
+        let yaml = format!(
+            r#"version: 1
+device_profile: opi-zero3
+default_view: home
+home_assistant:
+  url: "ws://homeassistant.local:8123/api/websocket"
+  token_env: "{var_name}"
+views:
+  - id: home
+    title: Home
+    layout: sections
+    sections: []
+"#
+        );
+        let tmp = TempFile::new(&yaml);
+        let result = load_dashboard_only(tmp.path());
+        assert!(
+            result.is_ok(),
+            "bootstrap pre-flight must succeed without env-var setup; got: {result:?}"
+        );
+        let dashboard = result.expect("ok above");
+        assert_eq!(
+            dashboard.device_profile,
+            crate::dashboard::schema::ProfileKey::OpiZero3,
+            "device_profile must round-trip through the parser"
+        );
+    }
+
+    /// `load_dashboard_only` propagates `ConfigNotFound` for a missing path —
+    /// matches the behaviour of the full `load` for the same condition.
+    #[test]
+    fn load_dashboard_only_config_not_found_for_missing_path() {
+        let path = std::path::Path::new("/tmp/hanui_nonexistent_bootstrap_120a.yaml");
+        let result = load_dashboard_only(path);
+        assert!(
+            matches!(result, Err(LoadError::ConfigNotFound { .. })),
+            "missing path must return ConfigNotFound; got: {result:?}"
+        );
+    }
+
+    /// `load_dashboard_only` enforces the same 256 KiB byte cap as `load`;
+    /// the F4-bootstrap pre-flight must not be a back door around the
+    /// YAML-bomb / RSS-spike mitigation.
+    #[test]
+    fn load_dashboard_only_config_too_large_above_cap() {
+        let payload = "x".repeat(MAX_YAML_BYTES + 1);
+        let tmp = TempFile::new(&payload);
+        let result = load_dashboard_only(tmp.path());
+        assert!(
+            matches!(result, Err(LoadError::ConfigTooLarge { .. })),
+            "byte-cap overflow must return ConfigTooLarge; got: {result:?}"
+        );
+    }
+
+    /// `load_dashboard_only` returns `ParseError` for malformed YAML.
+    #[test]
+    fn load_dashboard_only_parse_error_on_invalid_yaml() {
+        let bad_yaml = "this: is: not: valid: yaml: {{{";
+        let tmp = TempFile::new(bad_yaml);
+        let result = load_dashboard_only(tmp.path());
+        assert!(
+            matches!(result, Err(LoadError::ParseError { .. })),
+            "malformed YAML must return ParseError; got: {result:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

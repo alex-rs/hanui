@@ -544,6 +544,32 @@ pub fn select_profile(yaml_override: Option<&str>) -> &'static DeviceProfile {
     }
 }
 
+/// Map a typed [`ProfileKey`] to its corresponding static [`DeviceProfile`].
+///
+/// Total mapping (every variant of [`ProfileKey`] resolves to a preset):
+/// * [`ProfileKey::Rpi4`] → `&PROFILE_RPI4`
+/// * [`ProfileKey::OpiZero3`] → `&PROFILE_OPI_ZERO3`
+/// * [`ProfileKey::Desktop`] → `&PROFILE_DESKTOP`
+///
+/// Used by the F4-bootstrap path in `src/lib.rs::run` (TASK-120a): the early
+/// dashboard parse yields a typed `ProfileKey`, this helper converts it to the
+/// static profile reference whose `tokio_workers` count seeds the Tokio
+/// runtime builder. Distinct from [`select_profile`], which takes a free-form
+/// string from older callers — this function is total, exhaustive, and admits
+/// no fallback because [`ProfileKey`] is a closed enum. Adding a new variant
+/// to [`ProfileKey`] is a compile-time forcing function to update this match.
+///
+/// [`ProfileKey`]: crate::dashboard::schema::ProfileKey
+#[must_use]
+pub fn profile_for_key(key: crate::dashboard::schema::ProfileKey) -> &'static DeviceProfile {
+    use crate::dashboard::schema::ProfileKey;
+    match key {
+        ProfileKey::Rpi4 => &PROFILE_RPI4,
+        ProfileKey::OpiZero3 => &PROFILE_OPI_ZERO3,
+        ProfileKey::Desktop => &PROFILE_DESKTOP,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,6 +746,71 @@ mod tests {
     fn select_profile_unrecognised_returns_desktop_preset() {
         let p = select_profile(Some("future-tablet"));
         assert_eq!(p.tokio_workers, 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // profile_for_key — TASK-120a
+    //
+    // The typed `ProfileKey` accessor used by the F4-bootstrap path in
+    // `src/lib.rs::run`. Asserting one preset value per variant pins the
+    // mapping; if a future variant is added without extending the match,
+    // the compile-time exhaustiveness check fails (no test needed for that).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn profile_for_key_rpi4_returns_rpi4_preset() {
+        use crate::dashboard::schema::ProfileKey;
+        let p = profile_for_key(ProfileKey::Rpi4);
+        assert_eq!(p.tokio_workers, 2);
+        assert_eq!(p.max_entities, 4_096);
+    }
+
+    #[test]
+    fn profile_for_key_opi_zero3_returns_opi_zero3_preset() {
+        use crate::dashboard::schema::ProfileKey;
+        let p = profile_for_key(ProfileKey::OpiZero3);
+        assert_eq!(p.tokio_workers, 2);
+        assert_eq!(p.max_entities, 2_048);
+    }
+
+    #[test]
+    fn profile_for_key_desktop_returns_desktop_preset() {
+        use crate::dashboard::schema::ProfileKey;
+        let p = profile_for_key(ProfileKey::Desktop);
+        assert_eq!(p.tokio_workers, 4);
+        assert_eq!(p.max_entities, 16_384);
+    }
+
+    /// Each `ProfileKey` variant must map to a *distinct* preset. Without this
+    /// guard, a copy-paste error in `profile_for_key` (e.g. all three variants
+    /// pointing at `PROFILE_DESKTOP`) would silently regress runtime behaviour
+    /// on rpi4 / opi_zero3 hardware. The check uses value-equality against
+    /// each `pub const` preset (pointer-equality is unreliable across `const`
+    /// items, which the compiler may inline at each call site).
+    #[test]
+    fn profile_for_key_returns_distinct_presets_per_variant() {
+        use crate::dashboard::schema::ProfileKey;
+        let rpi4 = profile_for_key(ProfileKey::Rpi4);
+        let opi = profile_for_key(ProfileKey::OpiZero3);
+        let desktop = profile_for_key(ProfileKey::Desktop);
+        assert_eq!(*rpi4, PROFILE_RPI4, "Rpi4 must map to PROFILE_RPI4");
+        assert_eq!(
+            *opi, PROFILE_OPI_ZERO3,
+            "OpiZero3 must map to PROFILE_OPI_ZERO3"
+        );
+        assert_eq!(
+            *desktop, PROFILE_DESKTOP,
+            "Desktop must map to PROFILE_DESKTOP"
+        );
+        assert_ne!(*rpi4, *opi, "rpi4 and opi presets must not value-alias");
+        assert_ne!(
+            *rpi4, *desktop,
+            "rpi4 and desktop presets must not value-alias"
+        );
+        assert_ne!(
+            *opi, *desktop,
+            "opi and desktop presets must not value-alias"
+        );
     }
 
     // -----------------------------------------------------------------------
