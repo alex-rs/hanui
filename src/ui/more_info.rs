@@ -339,15 +339,37 @@ impl MoreInfoBody for CoverBody {
     }
 }
 
-/// More-info body for `fan` entities.
+/// More-info body for `fan` entities (TASK-103).
 ///
-/// Returns the entity's state. Phase 6a (`TASK-103`) will replace this with a
-/// richer fan-speed control.
+/// Renders fan-specific rows: state, current speed percentage (when
+/// exposed), current preset mode (when exposed), oscillating boolean
+/// (when exposed), and direction (when exposed). The Slint shell
+/// already binds `body-rows` to the modal's row list, so [`FanBody`]
+/// reuses the generic rendering path — keeping the trait shape stable
+/// per TASK-098 + TASK-103.
+///
+/// # Speed picker integration (locked_decisions.fan_speed_set_vocabulary)
+///
+/// The richer speed-picker UI (preset modes vs numeric step indices)
+/// is dispatcher-side: tapping a speed dispatches `SetFanSpeed` (TASK-099)
+/// and the dispatcher reads `FanOptions.preset_modes` from the dashboard
+/// config at dispatch time. This body surfaces only the *current*
+/// snapshot of the entity (percentage and active preset_mode),
+/// keeping the modal informative without duplicating the dispatcher's
+/// preset_modes list lookup.
+///
+/// # Stateless
+///
+/// `FanBody` carries no fields; the body queries the live entity at
+/// `render_rows` time. Per locked_decisions.more_info_modal, the body
+/// is invoked exactly once per modal-open — so the per-call attribute
+/// reads are not on a hot path.
 #[derive(Debug, Default)]
 pub struct FanBody;
 
 impl FanBody {
-    /// Construct a [`FanBody`].
+    /// Construct a [`FanBody`]. Stateless; the constructor exists so callers
+    /// do not depend on `Default`.
     #[must_use]
     pub fn new() -> Self {
         FanBody
@@ -356,10 +378,67 @@ impl FanBody {
 
 impl MoreInfoBody for FanBody {
     fn render_rows(&self, entity: &Entity) -> Vec<ModalRow> {
-        vec![ModalRow {
+        // Capacity of 5 covers the worst case (state + speed + preset +
+        // oscillating + direction) without growing.
+        let mut rows = Vec::with_capacity(5);
+
+        // State row — always emitted, matches the per-domain stub
+        // contract every other body upholds.
+        rows.push(ModalRow {
             key: "state".to_owned(),
             value: entity.state.as_ref().to_owned(),
-        }]
+        });
+
+        // Speed percentage row, only when the entity exposes a numeric,
+        // in-range `percentage`. We thread through
+        // `crate::ui::fan::FanVM::from_entity` for the canonical
+        // percentage-resolution logic — the body sees the same value the
+        // tile renders. This keeps tile and modal in lockstep without
+        // duplicating the parsing logic.
+        let fan_vm = crate::ui::fan::FanVM::from_entity(entity);
+        if let Some(pct) = fan_vm.speed_pct {
+            rows.push(ModalRow {
+                key: "speed".to_owned(),
+                value: format!("{pct}%"),
+            });
+        }
+
+        // Preset mode row, only when the entity exposes `preset_mode`.
+        // Some fans report only percentage, others only preset modes,
+        // some both — both labels coexist when present.
+        if let Some(speed) = fan_vm.current_speed.as_deref() {
+            rows.push(ModalRow {
+                key: "preset_mode".to_owned(),
+                value: speed.to_owned(),
+            });
+        }
+
+        // Oscillating row, only when the boolean attribute is present.
+        // Surfacing this in the modal lets the user verify the fan's
+        // oscillation state without opening the entity in HA's own UI.
+        if let Some(osc) = crate::ui::fan::read_oscillating_attribute(entity) {
+            rows.push(ModalRow {
+                key: "oscillating".to_owned(),
+                value: if osc {
+                    "true".to_owned()
+                } else {
+                    "false".to_owned()
+                },
+            });
+        }
+
+        // Direction row, only when the string attribute is present.
+        // Standard HA values are "forward" / "reverse"; we surface the
+        // raw value so any integration-specific direction names pass
+        // through unchanged.
+        if let Some(dir) = crate::ui::fan::read_direction_attribute(entity) {
+            rows.push(ModalRow {
+                key: "direction".to_owned(),
+                value: dir,
+            });
+        }
+
+        rows
     }
 }
 
