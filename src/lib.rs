@@ -43,7 +43,7 @@ use tracing::info;
 
 use crate::dashboard::fixture::fixture_dashboard;
 use crate::dashboard::loader;
-use crate::dashboard::profiles::PROFILE_DESKTOP;
+use crate::dashboard::profiles::{profile_for_key, DeviceProfile, PROFILE_DESKTOP};
 use crate::dashboard::schema::Dashboard;
 use crate::ha::client::{full_jitter, ClientError, SnapshotApplier, WsClient};
 use crate::ha::live_store::LiveStore;
@@ -64,39 +64,168 @@ use crate::ui::bridge::{build_tiles, split_tile_vms, wire_window, LiveBridge, Ma
 /// 1. Initialise the tracing subscriber from `RUST_LOG`
 ///    (default: `info,hanui=debug`).
 /// 2. Force `SLINT_BACKEND=software` unless already set by the launcher.
-/// 3. Build a multi-thread Tokio runtime with `PROFILE_DESKTOP.tokio_workers`
-///    threads.
-/// 4. Populate the icon cache via `assets::icons::init()`.
-/// 5. Build the chosen [`EntityStore`] and call [`build_tiles`] for the
+/// 3. Parse CLI args (`--fixture`, `--config`).
+/// 4. (Live path only) Read the dashboard YAML's `device_profile` field via
+///    [`loader::load_dashboard_only`] — a parse-only pre-flight that does
+///    NOT resolve token env vars or run the validator. The full validating
+///    load happens later inside [`run_with_live_store`]; this pre-flight
+///    only exists so the Tokio runtime is built with the matching
+///    `tokio_workers` count for the user's hardware (TASK-120a F4).
+/// 5. Build a multi-thread Tokio runtime with the selected profile's
+///    `tokio_workers` count. Fixture mode uses `PROFILE_DESKTOP` (no
+///    dashboard YAML to read).
+/// 6. Populate the icon cache via `assets::icons::init()`.
+/// 7. Build the chosen [`EntityStore`] and call [`build_tiles`] for the
 ///    initial render.
-/// 6. Construct the [`MainWindow`] and call [`wire_window`].
-/// 7. (Live path only) Spawn the WS reconnect loop and a [`LiveBridge`] so
+/// 8. Construct the [`MainWindow`] and call [`wire_window`].
+/// 9. (Live path only) Spawn the WS reconnect loop and a [`LiveBridge`] so
 ///    later updates flow into the window.
-/// 8. Run the Slint event loop on the main thread.
+/// 10. Run the Slint event loop on the main thread.
 ///
 /// Slint's `window.run()` blocks the main thread; all async work happens on
 /// Tokio worker threads.  Holding the `tokio::runtime::Runtime` value in scope
 /// keeps the runtime alive for the lifetime of `run`; its `Drop` joins all
 /// spawned tasks after `window.run()` returns.
+///
+/// # Bootstrap-load failure handling (TASK-120a)
+///
+/// If the bootstrap pre-flight fails (config missing, too large, or
+/// malformed YAML), the runtime falls back to `PROFILE_DESKTOP` so the
+/// process can still construct a runtime and reach
+/// [`run_with_live_store`] — which then re-runs the full validating
+/// [`loader::load`] and surfaces a typed [`loader::LoadError`] via
+/// `anyhow::Context`. The fallback is logged at `warn` level with the
+/// original error message; only structural metadata is logged, never YAML
+/// content. The error path is therefore observably preserved: a startup
+/// failure still terminates with the same typed error message it did
+/// before TASK-120a, just after a (non-fatal) desktop-profile runtime has
+/// been constructed.
 pub fn run() -> Result<()> {
     init_tracing();
     info!("hanui starting");
     init_slint_backend();
 
+    // Step 1: parse CLI args BEFORE the runtime — we need to know whether
+    // we are in fixture mode (no YAML to read) or live mode (read the
+    // device_profile from YAML).
+    let args: Vec<String> = std::env::args().collect();
+    let parsed = parse_args(&args)?;
+
+    // Step 2: select the device profile.
+    //   * Fixture mode: no dashboard YAML exists → desktop profile is the
+    //     conservative default. The fixture path uses MemoryStore and does
+    //     not consume the Tokio runtime's worker count, so this choice is
+    //     observationally neutral.
+    //   * Live mode: parse-only pre-flight reads `device_profile`.
+    let profile: &'static DeviceProfile = if parsed.fixture.is_some() {
+        &PROFILE_DESKTOP
+    } else {
+        let dashboard_path = match parsed.config.as_deref() {
+            Some(p) => std::path::PathBuf::from(p),
+            None => resolve_xdg_dashboard_path(),
+        };
+        early_load_profile(&dashboard_path)
+    };
+
+    // Step 3: build the runtime with the selected profile's worker count.
     // Hold the runtime in scope until run() returns; Drop joins spawned tasks.
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(PROFILE_DESKTOP.tokio_workers)
+        .worker_threads(profile.tokio_workers)
         .enable_all()
         .build()
         .context("build Tokio runtime")?;
 
     assets::icons::init();
 
-    let args: Vec<String> = std::env::args().collect();
-    let parsed = parse_args(&args)?;
     match parsed.fixture {
         Some(path) => run_with_memory_store(&path),
         None => run_with_live_store(&runtime, parsed.config.as_deref()),
+    }
+}
+
+/// Parse the dashboard YAML at `path` to read its `device_profile` field,
+/// returning the matching static [`DeviceProfile`].
+///
+/// This is the bootstrap pre-flight invoked from [`run`]. It calls the
+/// parse-only [`loader::load_dashboard_only`] — token resolution and
+/// validation are deliberately NOT performed here; those happen later in
+/// [`run_with_live_store`] via the full [`loader::load`].
+///
+/// On parse failure (file missing, byte-cap overflow, malformed YAML) this
+/// helper logs a structural `warn!` and returns `&PROFILE_DESKTOP` so the
+/// caller can still construct a Tokio runtime and reach the live-path
+/// loader, which re-runs the validating load and produces the typed error
+/// the user actually sees. This intentionally swallows the bootstrap
+/// error — the second load on the live path is the source of truth for
+/// startup failure messaging.
+///
+/// # Reachable-error invariant
+///
+/// [`loader::load_dashboard_only`] is structurally limited to three
+/// [`loader::LoadError`] variants: `ConfigNotFound`, `ConfigTooLarge`, and
+/// `ParseError`. The token-resolution variants (`TokenEnvNotFound`,
+/// `TokenEnvEmpty`) and `Validation` are never produced by the
+/// parse-only path because the function returns before reaching either of
+/// those code paths. The match arm below names the three reachable
+/// variants explicitly so a future refactor that widens
+/// `load_dashboard_only`'s error surface forces a recompile-time decision
+/// at THIS log site (rather than silently leaking a token-env-name through
+/// a generic `Display` formatter).
+///
+/// # Logging discipline
+///
+/// Every reachable-error variant's `Display` form is verified to contain
+/// no token material:
+/// * `ConfigNotFound { path }` — emits the filesystem path. Paths are not
+///   secrets and are already echoed by `run_with_live_store`'s
+///   `with_context` chain.
+/// * `ConfigTooLarge { bytes, cap }` — emits two `usize` values.
+/// * `ParseError { excerpt }` — emits a 256-char structural excerpt of the
+///   `serde_yaml_ng` error message; per `LoadError::ParseError`'s
+///   docstring, no token material is captured here.
+fn early_load_profile(path: &std::path::Path) -> &'static DeviceProfile {
+    match loader::load_dashboard_only(path) {
+        Ok(dashboard) => {
+            let p = profile_for_key(dashboard.device_profile);
+            tracing::debug!(
+                tokio_workers = p.tokio_workers,
+                "early profile load succeeded"
+            );
+            p
+        }
+        Err(
+            e @ (loader::LoadError::ConfigNotFound { .. }
+            | loader::LoadError::ConfigTooLarge { .. }
+            | loader::LoadError::ParseError { .. }),
+        ) => {
+            // Display forms of the three reachable variants are audited as
+            // safe (see the function-level rustdoc Reachable-error
+            // invariant). The path is also reported separately so the
+            // operator can correlate the warn with the configured path.
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "early profile load failed; defaulting to desktop. \
+                 The full load in run_with_live_store will surface the typed error."
+            );
+            &PROFILE_DESKTOP
+        }
+        Err(other) => {
+            // load_dashboard_only's contract limits its error surface to the
+            // three variants matched above. If a future refactor widens it,
+            // we conservatively log only the variant discriminant (the
+            // anyhow `Debug` form) without piping the value through Display
+            // — until a security review of the new variant's Display impl
+            // confirms it is sanitized. This branch is unreachable today.
+            tracing::warn!(
+                variant = ?std::mem::discriminant(&other),
+                path = %path.display(),
+                "early profile load failed with an unexpected LoadError variant; \
+                 defaulting to desktop. The full load in run_with_live_store will \
+                 surface the typed error."
+            );
+            &PROFILE_DESKTOP
+        }
     }
 }
 
@@ -1343,6 +1472,120 @@ mod tests {
             "unknown (domain, service) must still return None through the \
              shared registry"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // early_load_profile — TASK-120a F4-bootstrap
+    //
+    // The pre-runtime profile selector. Three branches:
+    //   1. Happy path — YAML parses, the typed `device_profile` maps to the
+    //      matching static profile.
+    //   2. Missing-file fallback — non-existent path returns &PROFILE_DESKTOP
+    //      (the conservative bootstrap default; the live-path loader is the
+    //      source of truth for the user-facing error).
+    //   3. Malformed-YAML fallback — same fallback behaviour as missing file.
+    // -----------------------------------------------------------------------
+
+    /// Helper: write `content` to a fresh tempfile and return the path. The
+    /// tempfile is leaked into the OS tempdir; tests are short-lived and the
+    /// OS reaps tempdirs on shutdown, so cleanup is not load-bearing.
+    fn write_tmp_yaml(content: &str) -> std::path::PathBuf {
+        use std::io::Write as _;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let tid = std::thread::current().id();
+        let path = std::env::temp_dir().join(format!("hanui_120a_{tid:?}_{nanos}.yaml"));
+        let mut f = std::fs::File::create(&path).expect("create tmp yaml");
+        f.write_all(content.as_bytes()).expect("write tmp yaml");
+        f.flush().expect("flush tmp yaml");
+        path
+    }
+
+    #[test]
+    fn early_load_profile_happy_path_resolves_yaml_device_profile() {
+        // `opi-zero3` is the kebab-case wire form for `ProfileKey::OpiZero3`.
+        // We pick OPI on purpose: its `tokio_workers` differs from desktop
+        // (2 vs 4), and its other distinguishing fields (max_entities,
+        // density, animation_framerate_cap) form a fingerprint no other
+        // preset matches — pinning the full struct rejects accidental
+        // fall-throughs to PROFILE_RPI4 (which also has tokio_workers=2).
+        let yaml = r#"version: 1
+device_profile: opi-zero3
+default_view: home
+views:
+  - id: home
+    title: Home
+    layout: sections
+    sections: []
+"#;
+        let path = write_tmp_yaml(yaml);
+        let profile = early_load_profile(&path);
+        assert_eq!(
+            *profile,
+            crate::dashboard::profiles::PROFILE_OPI_ZERO3,
+            "opi-zero3 YAML must resolve to PROFILE_OPI_ZERO3 (full struct equality)"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn early_load_profile_missing_file_falls_back_to_desktop() {
+        let path = std::path::Path::new("/tmp/hanui_120a_does_not_exist.yaml");
+        let profile = early_load_profile(path);
+        assert_eq!(
+            *profile, PROFILE_DESKTOP,
+            "missing config must fall back to PROFILE_DESKTOP so the live-path \
+             loader gets a chance to surface the typed error"
+        );
+    }
+
+    #[test]
+    fn early_load_profile_malformed_yaml_falls_back_to_desktop() {
+        let path = write_tmp_yaml("this: is: not: valid: yaml: {{{");
+        let profile = early_load_profile(&path);
+        assert_eq!(
+            *profile, PROFILE_DESKTOP,
+            "malformed YAML must fall back to PROFILE_DESKTOP; the live-path \
+             loader's ParseError is the user-facing error"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn early_load_profile_does_not_resolve_token_env() {
+        // The bootstrap pre-flight MUST NOT invoke `Config::resolve_token_env`.
+        // We verify this structurally by referring to a `token_env` whose
+        // env var is intentionally unset — if the pre-flight resolved it
+        // we would observe a fall-back to PROFILE_DESKTOP. Instead the
+        // happy-path mapping must still resolve to rpi4.
+        let var_name = "HANUI_TEST_BOOTSTRAP_NEVER_RESOLVED_LIB_120A";
+        unsafe { std::env::remove_var(var_name) };
+        let yaml = format!(
+            r#"version: 1
+device_profile: rpi4
+default_view: home
+home_assistant:
+  url: "ws://homeassistant.local:8123/api/websocket"
+  token_env: "{var_name}"
+views:
+  - id: home
+    title: Home
+    layout: sections
+    sections: []
+"#
+        );
+        let path = write_tmp_yaml(&yaml);
+        let profile = early_load_profile(&path);
+        assert_eq!(
+            *profile,
+            crate::dashboard::profiles::PROFILE_RPI4,
+            "bootstrap pre-flight must skip token_env resolution and still \
+             return PROFILE_RPI4 for `device_profile: rpi4` (rejects regression \
+             to PROFILE_DESKTOP fallback)"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// `exit_after_ms` returns `None` when the var is unset, empty, zero, or
