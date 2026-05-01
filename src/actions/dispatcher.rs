@@ -5315,4 +5315,91 @@ mod tests {
             );
         }
     }
+
+    /// When `require_confirmation_on_unlock` is set but no `ConfirmHost` is
+    /// wired, the dispatcher must fail-closed with `NotImplementedYet` rather
+    /// than silently skipping the modal.
+    #[test]
+    fn unlock_confirm_required_but_no_host_fails_closed() {
+        let services = handle_from(ServiceRegistry::new());
+        let (tx, _rx) = mpsc::channel::<OutboundCommand>(8);
+
+        let mut settings = HashMap::new();
+        settings.insert(
+            WidgetId::from("w"),
+            LockDispatchSettings {
+                pin_policy: PinPolicy::None,
+                require_confirmation_on_unlock: true,
+            },
+        );
+
+        // No confirm_host wired — dispatcher must fail-closed.
+        let dispatcher = Dispatcher::with_command_tx(services, tx).with_lock_settings(settings);
+
+        let action = Action::Unlock {
+            entity_id: "lock.front_door".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("lock.front_door", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("unlock-with-confirm but no host must return Err");
+        assert!(
+            matches!(err, DispatchError::NotImplementedYet { .. }),
+            "expected NotImplementedYet, got {err:?}"
+        );
+    }
+
+    /// After a confirm-modal accept, if the inner dispatch fails (e.g. no
+    /// command channel), `continue_after_confirm` logs the error and returns
+    /// without panicking. Covers the `Err(e)` arm in `continue_after_confirm`.
+    #[test]
+    fn continue_after_confirm_logs_inner_error_without_panic() {
+        let services = handle_from(ServiceRegistry::new());
+        // Drop the receiver immediately so try_send fails on every command.
+        let (tx, _rx_dropped) = mpsc::channel::<OutboundCommand>(1);
+        drop(_rx_dropped);
+
+        let confirm_host = Arc::new(MockConfirmHost::new());
+
+        let mut settings = HashMap::new();
+        settings.insert(
+            WidgetId::from("w"),
+            LockDispatchSettings {
+                pin_policy: PinPolicy::None,
+                require_confirmation_on_unlock: true,
+            },
+        );
+
+        let dispatcher = Dispatcher::with_command_tx(services, tx)
+            .with_confirm_host_arc(confirm_host.clone() as Arc<dyn ConfirmHost>)
+            .with_lock_settings(settings);
+
+        let action = Action::Unlock {
+            entity_id: "lock.front_door".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("lock.front_door", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        // Dispatch returns LockAwaitingConfirm and queues the on_accept closure.
+        let outcome = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect("initial dispatch should succeed with confirm host");
+        assert!(
+            matches!(outcome, DispatchOutcome::LockAwaitingConfirm { .. }),
+            "expected LockAwaitingConfirm, got {outcome:?}"
+        );
+
+        // Trigger on_accept — continue_after_confirm runs, inner dispatch fails
+        // (channel closed), error is logged but no panic.
+        confirm_host.accept();
+        // Reaching here without panic is the assertion.
+    }
 }
