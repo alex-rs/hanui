@@ -908,9 +908,11 @@ pub fn write_gesture_config(window: &MainWindow, config: GestureConfig) -> Resul
 //     and the status banner is shown.
 //   * On return to `Live`, immediately fire a full `for_each` resync to
 //     re-render every visible tile and clear the banner.
-//   * On `RecvError::Lagged` from a per-entity subscriber, call `store.get(id)`
-//     for ALL subscribed ids (Phase 1 contract pattern, applied per-entity), then
-//     re-`store.subscribe(&[id])` for that id.
+//   * On `RecvError::Lagged` from any receiver in the central fan-in
+//     subscriber (TASK-125 F6), acquire the pending-map mutex once,
+//     batch-mark every subscribed id dirty, drop the lock, then call
+//     `store.get(id)` for ALL subscribed ids (Phase 1 contract preserved)
+//     and re-`store.subscribe(&[id])` for the lagging id only.
 //
 // **Doc-comment clarification (Codex Nit N7).** "No Rust-side property writes"
 // while gated does NOT suppress Slint's internal animation engine. Animations
@@ -922,9 +924,16 @@ pub fn write_gesture_config(window: &MainWindow, config: GestureConfig) -> Resul
 // **Thread model.** All store-watching work runs on Tokio. Each `LiveBridge`
 // spawns:
 //
-//   1. One subscriber task **per entity id** that calls `recv()` in a loop and
-//      writes the id into the shared pending-updates map on each event. On
-//      `RecvError::Lagged`, the task re-runs the resync path and re-subscribes.
+//   1. One **central fan-in subscriber task** (TASK-125 F6) that owns one
+//      `broadcast::Receiver` per visible entity id and multiplexes them via
+//      `futures::stream::FuturesUnordered`.  Pre-TASK-125 the bridge spawned
+//      one tokio task **per entity id** (up to 16,384 idle tasks under the
+//      OPI profile); the central task collapses that into a single
+//      sequencing point.  On `RecvError::Lagged` from any receiver, the
+//      task acquires the pending-map mutex **once** and batch-marks every
+//      visible entity dirty (fixing the pre-TASK-125 O(N²)
+//      `lagging_subscribers × total_entities` lock pattern), then
+//      re-subscribes only the lagging receiver.
 //   2. One flush task that wakes every 80 ms, drains the pending map under the
 //      ConnectionState gate, builds the tiles, and posts the result to the
 //      Slint event loop via `invoke_from_event_loop`.
@@ -1097,9 +1106,19 @@ pub(crate) type RowIndexHandle = Arc<RwLock<RowIndex>>;
 /// stub store, exercise it for the duration of the test, and let it drop at
 /// scope end so the runtime can shut down cleanly.
 pub struct LiveBridge {
-    /// Subscriber task per entity id.  Stored so the `Drop` impl can abort
-    /// them; never read after construction.
-    subscriber_tasks: Vec<JoinHandle<()>>,
+    /// Single central fan-in subscriber task (TASK-125 F6).
+    ///
+    /// Replaces the pre-TASK-125 vector of per-entity subscriber tasks
+    /// (one task per visible entity id, up to 16,384 under OPI profile).
+    /// One task multiplexes every per-entity broadcast receiver via
+    /// [`futures::stream::FuturesUnordered`], which collapses idle-task
+    /// overhead AND fixes the O(N²) lock-acquisition pattern previously
+    /// triggered on `RecvError::Lagged` (each lagging subscriber locked
+    /// the pending map once per visible entity id; the central task
+    /// locks it once per lag event regardless of the entity count).
+    /// Stored so the `Drop` impl can abort it; never read after
+    /// construction.
+    fan_in_task: JoinHandle<()>,
     /// 80 ms flush task.
     flush_task: JoinHandle<()>,
     /// Connection-state watcher task.
@@ -1108,9 +1127,7 @@ pub struct LiveBridge {
 
 impl Drop for LiveBridge {
     fn drop(&mut self) {
-        for h in &self.subscriber_tasks {
-            h.abort();
-        }
+        self.fan_in_task.abort();
         self.flush_task.abort();
         self.state_task.abort();
     }
@@ -1181,16 +1198,26 @@ impl LiveBridge {
         // fires exactly once per LiveBridge::spawn.
         let row_index: RowIndexHandle = Arc::new(RwLock::new(build_row_index(&dashboard)));
 
-        // Per-entity subscriber tasks.
-        let mut subscriber_tasks = Vec::with_capacity(ids.len());
-        for id in ids.iter().cloned() {
+        // Central fan-in subscriber task (TASK-125 F6).
+        //
+        // Pre-TASK-125 the bridge spawned one tokio task per visible
+        // entity id (up to 16,384 idle tasks under the OPI profile) and
+        // each lagging subscriber re-acquired the `pending` mutex once
+        // per resync id (O(lagging_subscribers × total_entities) lock
+        // acquisitions per lag burst).  The central task below owns
+        // every per-entity broadcast receiver, multiplexes them via
+        // `futures::stream::FuturesUnordered`, and locks `pending`
+        // exactly once per ready event — including lag recovery, where
+        // one lock acquisition marks every visible entity dirty in a
+        // single critical section.
+        let fan_in_task = {
             let store = Arc::clone(&store);
             let pending = Arc::clone(&pending);
-            let ids_for_resync = Arc::clone(&ids);
-            subscriber_tasks.push(tokio::spawn(async move {
-                run_entity_subscriber(store, id, pending, ids_for_resync).await;
-            }));
-        }
+            let ids = Arc::clone(&ids);
+            tokio::spawn(async move {
+                run_entity_fan_in(store, ids, pending).await;
+            })
+        };
 
         // Flush task.
         let flush_task = {
@@ -1217,65 +1244,158 @@ impl LiveBridge {
         };
 
         LiveBridge {
-            subscriber_tasks,
+            fan_in_task,
             flush_task,
             state_task,
         }
     }
 }
 
-/// Per-entity subscriber loop.
+/// Central fan-in subscriber loop (TASK-125 F6).
 ///
-/// Subscribes via `store.subscribe(&[id])`, then loops on `recv()`:
+/// Replaces the pre-TASK-125 per-entity subscriber tasks with a single task
+/// that owns one [`tokio::sync::broadcast::Receiver`] per visible entity id
+/// and multiplexes them via [`futures::stream::FuturesUnordered`].
 ///
-///   * `Ok(_update)` — record the id in the pending map (latest-overwrite).
-///   * `Err(RecvError::Lagged(_))` — Phase 1 contract pattern applied per
-///     entity: call `store.get(id)` for ALL subscribed ids (not just the lagged
-///     one) to recover current state, mark them all pending so the next flush
-///     re-renders, then re-subscribe via `store.subscribe(&[id])`.
-///   * `Err(RecvError::Closed)` — the sender was dropped; exit the loop.
-async fn run_entity_subscriber(
+/// # Why a single task
+///
+/// Under the OPI profile a dashboard can reference up to 16,384 entity ids;
+/// the previous implementation spawned that many idle tokio tasks (one
+/// `recv()` loop per id).  The fan-in collapses them into one task that
+/// awaits any-receiver-ready, eliminating the idle-task overhead AND
+/// providing a single sequencing point at which to lock the pending map.
+///
+/// # Why one receiver per id (and not one receiver for all ids)
+///
+/// `EntityStore::subscribe` is implemented per-id by `LiveStore`: only the
+/// first element of the `ids` slice is honoured, so a single
+/// `store.subscribe(ids)` call would only receive updates for `ids[0]`.
+/// Subscribing per-id remains the only correct shape; the savings come
+/// from collapsing the *task* count, not the receiver count.
+///
+/// # Per-event behaviour
+///
+/// * `Ok(update)` — lock `pending` once and insert `update.id`.
+/// * `Err(RecvError::Lagged(n))` — lock `pending` once and batch-insert
+///   every visible entity id (single critical section, fixing the
+///   pre-TASK-125 O(N²) `lagging_subscribers × total_entities` lock
+///   pattern).  After the lock is released, call `store.get(id)` for
+///   every visible id (the test contract still requires the bridge to
+///   exercise `store.get` after a lag burst — see
+///   `lagged_on_one_subscriber_triggers_get_for_all_subscribed_ids`)
+///   and re-subscribe ONLY the lagging receiver.
+/// * `Err(RecvError::Closed)` — that receiver's sender was dropped.  The
+///   receiver is discarded WITHOUT pushing a replacement future, so
+///   `FuturesUnordered` shrinks by one.  When every receiver has closed
+///   (or the id list was empty to begin with) the task returns via the
+///   stream's `None` terminator.
+async fn run_entity_fan_in(
     store: Arc<dyn EntityStore>,
-    id: EntityId,
+    ids: Arc<Vec<EntityId>>,
     pending: PendingMap,
-    ids_for_resync: Arc<Vec<EntityId>>,
 ) {
-    let mut rx = store.subscribe(std::slice::from_ref(&id));
-    loop {
-        match rx.recv().await {
+    use futures::stream::{FuturesUnordered, StreamExt};
+
+    // Empty id list: no receivers to multiplex.  Returning immediately
+    // matches the pre-TASK-125 "no per-entity tasks spawned" behaviour.
+    if ids.is_empty() {
+        tracing::debug!("fan-in subscriber: no visible entities; exiting");
+        return;
+    }
+
+    // One in-flight future per still-open receiver.  Each future owns
+    // its receiver and yields `(idx, rx, result)`.  After the parent
+    // loop processes the result it pushes a fresh future for the same
+    // idx (or drops the receiver if the channel closed), so the
+    // FuturesUnordered always tracks exactly the live receiver count
+    // — no per-iteration rebuild and no double-borrow against a
+    // shared `Vec<Option<Receiver>>`.
+    type RxFuture = futures::future::BoxFuture<
+        'static,
+        (
+            usize,
+            tokio::sync::broadcast::Receiver<EntityUpdate>,
+            Result<EntityUpdate, RecvError>,
+        ),
+    >;
+    fn next_recv(idx: usize, mut rx: tokio::sync::broadcast::Receiver<EntityUpdate>) -> RxFuture {
+        Box::pin(async move {
+            let res = rx.recv().await;
+            (idx, rx, res)
+        })
+    }
+
+    let mut futs: FuturesUnordered<RxFuture> = FuturesUnordered::new();
+    for (idx, id) in ids.iter().enumerate() {
+        let rx = store.subscribe(std::slice::from_ref(id));
+        futs.push(next_recv(idx, rx));
+    }
+
+    while let Some((idx, rx, result)) = futs.next().await {
+        match result {
             Ok(EntityUpdate { id: updated_id, .. }) => {
-                let mut guard = pending.lock().expect("PendingMap mutex poisoned");
-                guard.insert(updated_id, ());
+                {
+                    let mut guard = pending.lock().expect("PendingMap mutex poisoned");
+                    guard.insert(updated_id, ());
+                }
+                // Re-arm the same receiver for the next event.
+                futs.push(next_recv(idx, rx));
             }
             Err(RecvError::Lagged(n)) => {
+                let lagging_id = ids
+                    .get(idx)
+                    .map(|id| id.as_str())
+                    .unwrap_or("<out-of-range>");
                 tracing::warn!(
-                    entity_id = %id.as_str(),
+                    entity_id = %lagging_id,
                     skipped = n,
-                    "subscriber lagged; recovering all subscribed ids via store.get + re-subscribe"
+                    entity_count = ids.len(),
+                    "fan-in subscriber lagged; marking all visible entities dirty"
                 );
-                // Recover by reading current state for every subscribed id.
-                // The actual entity values are read inside the flush path via
-                // store.get; here we only need to mark the ids dirty so the
-                // next flush re-renders them.  Reading store.get for each id
-                // also exercises the "Lagged → bridge calls store.get for all
-                // subscribed ids" AC explicitly.
-                for resync_id in ids_for_resync.iter() {
-                    let _ = store.get(resync_id);
+                // Single lock acquisition for ALL ids — fixes the
+                // pre-TASK-125 O(N²) `lagging_subscribers × total_entities`
+                // lock pattern.  The flush path will re-read each
+                // entity's current state via `store.get` at the next
+                // 80 ms tick.
+                {
                     let mut guard = pending.lock().expect("PendingMap mutex poisoned");
-                    guard.insert(resync_id.clone(), ());
+                    for id in ids.iter() {
+                        guard.insert(id.clone(), ());
+                    }
                 }
-                // Re-subscribe to recover from the lagged channel.
-                rx = store.subscribe(std::slice::from_ref(&id));
+                // Exercise the test contract: after a lag burst, the
+                // bridge calls `store.get` for every subscribed id.
+                // These reads happen OUTSIDE the pending-map critical
+                // section, so they do not extend lock-hold time.
+                for resync_id in ids.iter() {
+                    let _ = store.get(resync_id);
+                }
+                // Discard the lagged `rx` and re-subscribe a fresh
+                // receiver for this id only.  Other receivers stay
+                // armed in `futs` and continue to flow.
+                drop(rx);
+                let fresh = store.subscribe(std::slice::from_ref(&ids[idx]));
+                futs.push(next_recv(idx, fresh));
             }
             Err(RecvError::Closed) => {
+                let closed_id = ids
+                    .get(idx)
+                    .map(|id| id.as_str())
+                    .unwrap_or("<out-of-range>");
                 tracing::debug!(
-                    entity_id = %id.as_str(),
-                    "subscriber channel closed; exiting"
+                    entity_id = %closed_id,
+                    "fan-in subscriber: receiver closed for entity"
                 );
-                return;
+                // Drop `rx`; do NOT push a replacement.  When every
+                // receiver has closed `futs` becomes empty and
+                // `futs.next().await` yields `None`, exiting the
+                // outer loop.
+                drop(rx);
             }
         }
     }
+
+    tracing::debug!("fan-in subscriber: all receivers closed; exiting");
 }
 
 /// Flush loop: 80 ms cadence, gated on [`ConnectionState`].
