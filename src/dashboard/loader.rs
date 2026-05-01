@@ -41,6 +41,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::dashboard::profiles::DeviceProfile;
 use crate::dashboard::schema::{Dashboard, Issue, Severity};
 use crate::platform::config::{Config, ConfigError};
 
@@ -169,11 +170,23 @@ pub fn load_dashboard_only(path: &Path) -> Result<Dashboard, LoadError> {
 /// * `config` — the platform config used to resolve the `token_env` name.
 ///   [`Config::resolve_token_env`] is called for the `home_assistant.token_env`
 ///   field; the loader itself NEVER calls the env-var lookup directly.
+/// * `profile` — the static [`DeviceProfile`] selected by the F4-bootstrap
+///   pre-flight in `src/lib.rs::run` (TASK-120a). Forwarded into
+///   [`crate::dashboard::validate::validate`] so per-profile caps
+///   (`max_widgets_per_view`, `camera_interval_min_s`, `history_window_max_s`,
+///   …) are enforced at load time. The reference is `'static` to match
+///   TASK-120b's threading of `&'static DeviceProfile` through every live-path
+///   entry point — every shipped profile lives in `static` storage
+///   (`PROFILE_DESKTOP`, `PROFILE_OPI_ZERO3`, `PROFILE_RPI4`).
 ///
 /// # Errors
 ///
 /// See [`LoadError`] for the full taxonomy.
-pub fn load(path: &Path, config: &Config) -> Result<Dashboard, LoadError> {
+pub fn load(
+    path: &Path,
+    config: &Config,
+    profile: &'static DeviceProfile,
+) -> Result<Dashboard, LoadError> {
     // Step 1: check existence.
     if !path.exists() {
         return Err(LoadError::ConfigNotFound {
@@ -226,24 +239,20 @@ pub fn load(path: &Path, config: &Config) -> Result<Dashboard, LoadError> {
         // Config::expose_token at connection time.
     }
 
-    // Step 6: validation stub.
+    // Step 6: validate against the selected hardware profile.
     //
-    // TASK-083 (validate.rs) will implement the full validator. Until it
-    // merges, we perform a no-op validation pass: no issues, no allowlist.
-    //
-    // When TASK-083 lands, replace this block with:
-    //   let issues = crate::dashboard::validate::run(&dashboard, profile);
-    //   let errors: Vec<Issue> = issues.iter()
-    //       .filter(|i| i.severity == Severity::Error)
-    //       .cloned()
-    //       .collect();
-    //   if !errors.is_empty() {
-    //       return Err(LoadError::Validation { issues: errors });
-    //   }
-    //
-    // For now, assert that the type-level parse was complete (no Error issues
-    // from a hypothetical validator — stub returns empty).
-    let issues: Vec<Issue> = vec![];
+    // TASK-121 (F5) wires the real Phase 4/6 validator (`validate.rs`) into the
+    // loader. The validator returns:
+    //   * `Vec<Issue>` — every rule finding, both Error and Warning severities.
+    //     Only Error-severity issues abort the load; Warnings are surfaced
+    //     elsewhere (the dashboard still loads).
+    //   * `CallServiceAllowlist` — the per-config allowlist of (domain, service)
+    //     pairs found in widget action fields. Per
+    //     `locked_decisions.call_service_allowlist_runtime_access`, this is the
+    //     future consumer for the runtime actions queue (TASK-090). The
+    //     loader does not store the allowlist here — that wiring belongs to
+    //     a follow-up task and is intentionally out of scope for TASK-121.
+    let (issues, _allowlist) = crate::dashboard::validate::validate(&dashboard, profile);
     let errors: Vec<Issue> = issues
         .iter()
         .filter(|i| i.severity == Severity::Error)
@@ -263,12 +272,25 @@ pub fn load(path: &Path, config: &Config) -> Result<Dashboard, LoadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dashboard::profiles::{PROFILE_DESKTOP, PROFILE_OPI_ZERO3, PROFILE_RPI4};
     use crate::platform::config::Config;
 
     /// Construct a minimal stub `Config` that satisfies the loader's
     /// `config: &Config` parameter without touching real env vars.
     fn stub_config() -> Config {
         Config::new_for_testing("ws://stub".to_string())
+    }
+
+    /// Default static profile used by tests that do not exercise per-profile
+    /// validation rules. Most tests pin `device_profile: rpi4` in their YAML
+    /// fixtures (the `MINIMAL_YAML` constant); the validator does not consult
+    /// the YAML's `device_profile` field — it consults the profile passed in
+    /// here. Using `&PROFILE_DESKTOP` is intentional: its caps are the
+    /// loosest of the three presets, so existing tests that aim to exercise
+    /// non-validation behaviour (size cap, ParseError, token resolution)
+    /// remain green even when a YAML payload happens to contain widgets.
+    fn stub_profile() -> &'static DeviceProfile {
+        &PROFILE_DESKTOP
     }
 
     /// Minimal valid YAML dashboard payload.
@@ -345,7 +367,7 @@ views:
         assert_eq!(payload.len(), cap);
 
         let tmp = TempFile::new(&payload);
-        let result = load(tmp.path(), &stub_config());
+        let result = load(tmp.path(), &stub_config(), stub_profile());
         // Must NOT be ConfigTooLarge.
         assert!(
             !matches!(result, Err(LoadError::ConfigTooLarge { .. })),
@@ -362,7 +384,7 @@ views:
         let payload = "x".repeat(target);
 
         let tmp = TempFile::new(&payload);
-        let result = load(tmp.path(), &stub_config());
+        let result = load(tmp.path(), &stub_config(), stub_profile());
         match result {
             Err(LoadError::ConfigTooLarge { bytes, cap }) => {
                 assert_eq!(bytes, target, "bytes field must reflect actual file size");
@@ -379,7 +401,7 @@ views:
     #[test]
     fn config_not_found_returns_error() {
         let path = std::path::Path::new("/tmp/hanui_nonexistent_dashboard_xyz_082.yaml");
-        let result = load(path, &stub_config());
+        let result = load(path, &stub_config(), stub_profile());
         assert!(
             matches!(result, Err(LoadError::ConfigNotFound { .. })),
             "missing file must return ConfigNotFound; got: {result:?}"
@@ -394,7 +416,7 @@ views:
     fn parse_error_on_invalid_yaml_returns_error() {
         let bad_yaml = "this: is: not: valid: yaml: {{{";
         let tmp = TempFile::new(bad_yaml);
-        let result = load(tmp.path(), &stub_config());
+        let result = load(tmp.path(), &stub_config(), stub_profile());
         assert!(
             matches!(result, Err(LoadError::ParseError { .. })),
             "invalid YAML must return ParseError; got: {result:?}"
@@ -434,7 +456,7 @@ views:
 
         let yaml = yaml_with_token_env(var_name);
         let tmp = TempFile::new(&yaml);
-        let result = load(tmp.path(), &stub_config());
+        let result = load(tmp.path(), &stub_config(), stub_profile());
         assert!(
             matches!(result, Err(LoadError::TokenEnvNotFound { ref name }) if name == var_name),
             "absent token_env var must return TokenEnvNotFound; got: {result:?}"
@@ -449,7 +471,7 @@ views:
 
         let yaml = yaml_with_token_env(var_name);
         let tmp = TempFile::new(&yaml);
-        let result = load(tmp.path(), &stub_config());
+        let result = load(tmp.path(), &stub_config(), stub_profile());
         assert!(
             matches!(result, Err(LoadError::TokenEnvEmpty { ref name }) if name == var_name),
             "empty token_env var must return TokenEnvEmpty; got: {result:?}"
@@ -536,7 +558,7 @@ views:
     #[test]
     fn happy_path_loads_minimal_yaml() {
         let tmp = TempFile::new(MINIMAL_YAML);
-        let result = load(tmp.path(), &stub_config());
+        let result = load(tmp.path(), &stub_config(), stub_profile());
         assert!(
             result.is_ok(),
             "minimal valid YAML must load successfully; got: {result:?}"
@@ -557,7 +579,7 @@ views:
 
         let yaml = yaml_with_token_env(var_name);
         let tmp = TempFile::new(&yaml);
-        let result = load(tmp.path(), &stub_config());
+        let result = load(tmp.path(), &stub_config(), stub_profile());
         assert!(
             result.is_ok(),
             "YAML with valid token_env must load successfully; got: {result:?}"
@@ -685,7 +707,7 @@ views:
 
         let tmp = TempFile::new(&payload);
         // The load may succeed or fail — we only care about RSS.
-        let _result = load(tmp.path(), &stub_config());
+        let _result = load(tmp.path(), &stub_config(), stub_profile());
 
         let rss_after_kb = read_proc_rss_kb();
 
@@ -699,6 +721,160 @@ views:
             );
         }
         // If /proc/self/status is unavailable, the test passes (non-Linux CI).
+    }
+
+    // -----------------------------------------------------------------------
+    // Validator integration (TASK-121 F5)
+    //
+    // These tests assert the loader threads the chosen `&'static DeviceProfile`
+    // into `validate::validate()` and that profile-bound caps abort the load
+    // with `LoadError::Validation`. Per-profile cap values (asserted in
+    // `profiles::tests::preset_values_match_phases_md_budgets_table`) are
+    // duplicated in the YAML fixture sizing here as load-bearing test inputs:
+    //   * PROFILE_RPI4.max_widgets_per_view = 32
+    //   * PROFILE_OPI_ZERO3.max_widgets_per_view = 20
+    // -----------------------------------------------------------------------
+
+    /// Build a YAML payload with `count` widgets in a single section. Each
+    /// widget renders as `light_tile` with `preferred_columns: 1` so it fits
+    /// inside a 1-column grid (no SpanOverflow noise — only the widget-count
+    /// rule fires).
+    fn yaml_with_n_widgets(device_profile_kebab: &str, count: usize) -> String {
+        let mut widgets = String::with_capacity(count * 96);
+        for i in 0..count {
+            widgets.push_str(&format!(
+                "          - id: w{i}\n            \
+                 type: light_tile\n            \
+                 entity: light.w{i}\n            \
+                 visibility: always\n            \
+                 layout:\n              \
+                 preferred_columns: 1\n              \
+                 preferred_rows: 1\n",
+            ));
+        }
+        format!(
+            r#"version: 1
+device_profile: {device_profile_kebab}
+default_view: home
+views:
+  - id: home
+    title: Home
+    layout: sections
+    sections:
+      - id: s1
+        title: S1
+        grid:
+          columns: 1
+          gap: 8
+        widgets:
+{widgets}"#,
+        )
+    }
+
+    /// rpi4 caps `max_widgets_per_view` at 32. A YAML fixture with 33 widgets
+    /// in a single view must abort the load with `LoadError::Validation`,
+    /// surfacing the `MaxWidgetsPerViewExceeded` issue (Error severity).
+    ///
+    /// This test is the load-time mirror of
+    /// `validate_max_widgets_per_view_exceeded_is_error` in `validate.rs`; it
+    /// guards the loader-validator wiring (TASK-121 F5) — moving the wiring
+    /// without updating the test is caught immediately.
+    #[test]
+    fn rpi4_dashboard_over_widget_cap_fails_at_load() {
+        let cap = PROFILE_RPI4.max_widgets_per_view;
+        let yaml = yaml_with_n_widgets("rpi4", cap + 1);
+        let tmp = TempFile::new(&yaml);
+
+        let result = load(tmp.path(), &stub_config(), &PROFILE_RPI4);
+
+        match result {
+            Err(LoadError::Validation { issues }) => {
+                assert!(
+                    !issues.is_empty(),
+                    "validation must surface at least one Error-severity issue"
+                );
+                assert!(
+                    issues.iter().all(|i| i.severity == Severity::Error),
+                    "LoadError::Validation must contain only Error-severity issues; got {issues:?}"
+                );
+                assert!(
+                    issues.iter().any(|i| matches!(
+                        i.rule,
+                        crate::dashboard::schema::ValidationRule::MaxWidgetsPerViewExceeded
+                    )),
+                    "must surface MaxWidgetsPerViewExceeded for {} widgets in a {}-cap view; \
+                     got: {issues:?}",
+                    cap + 1,
+                    cap,
+                );
+            }
+            other => panic!(
+                "{} widgets in a {}-cap rpi4 view must return LoadError::Validation; got: {other:?}",
+                cap + 1,
+                cap,
+            ),
+        }
+    }
+
+    /// opi_zero3 caps `max_widgets_per_view` at 20 — a tighter cap than rpi4's
+    /// 32. A YAML fixture with 21 widgets must abort the load with
+    /// `LoadError::Validation`. Test name uses "entity_cap" per the TASK-121
+    /// brief: the validator's per-view widget cap is the principal entity-count
+    /// gate enforced at load time (the `DeviceProfile.max_entities` field is
+    /// enforced separately by `MemoryStore::load`, downstream of the loader).
+    #[test]
+    fn opi_zero3_dashboard_over_entity_cap_fails_at_load() {
+        let cap = PROFILE_OPI_ZERO3.max_widgets_per_view;
+        let yaml = yaml_with_n_widgets("opi-zero3", cap + 1);
+        let tmp = TempFile::new(&yaml);
+
+        let result = load(tmp.path(), &stub_config(), &PROFILE_OPI_ZERO3);
+
+        match result {
+            Err(LoadError::Validation { issues }) => {
+                assert!(
+                    !issues.is_empty(),
+                    "validation must surface at least one Error-severity issue"
+                );
+                assert!(
+                    issues.iter().all(|i| i.severity == Severity::Error),
+                    "LoadError::Validation must contain only Error-severity issues; got {issues:?}"
+                );
+                assert!(
+                    issues.iter().any(|i| matches!(
+                        i.rule,
+                        crate::dashboard::schema::ValidationRule::MaxWidgetsPerViewExceeded
+                    )),
+                    "must surface MaxWidgetsPerViewExceeded for {} widgets in a {}-cap view; \
+                     got: {issues:?}",
+                    cap + 1,
+                    cap,
+                );
+            }
+            other => panic!(
+                "{} widgets in a {}-cap opi_zero3 view must return LoadError::Validation; \
+                 got: {other:?}",
+                cap + 1,
+                cap,
+            ),
+        }
+    }
+
+    /// Positive control: at exactly the cap, the load succeeds. Without this
+    /// pin, a future off-by-one in the validator (say, `>=` instead of `>`)
+    /// would silently break loads for caps-edge configs while the negative
+    /// tests above continue to pass.
+    #[test]
+    fn rpi4_dashboard_at_widget_cap_loads_successfully() {
+        let cap = PROFILE_RPI4.max_widgets_per_view;
+        let yaml = yaml_with_n_widgets("rpi4", cap);
+        let tmp = TempFile::new(&yaml);
+
+        let result = load(tmp.path(), &stub_config(), &PROFILE_RPI4);
+        assert!(
+            result.is_ok(),
+            "{cap} widgets in a {cap}-cap view must NOT trigger validation; got: {result:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

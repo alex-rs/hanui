@@ -139,7 +139,7 @@ fn config_not_found_returns_err() {
     let guard = acquire_env_lock();
     let config = stub_config_with_lock(&guard);
     let path = Path::new("/nonexistent/path/hanui_integration_089.yaml");
-    let result = loader::load(path, &config);
+    let result = loader::load(path, &config, &PROFILE_DESKTOP);
     assert!(
         matches!(result, Err(LoadError::ConfigNotFound { .. })),
         "missing file must return ConfigNotFound; got: {result:?}"
@@ -169,7 +169,7 @@ fn config_at_256_kib_accepted() {
     assert_eq!(payload.len(), cap);
 
     let tmp = TempFile::new(&payload);
-    let result = loader::load(tmp.path(), &config);
+    let result = loader::load(tmp.path(), &config, &PROFILE_DESKTOP);
     assert!(
         !matches!(result, Err(LoadError::ConfigTooLarge { .. })),
         "exactly 256 KiB must not return ConfigTooLarge; got: {result:?}"
@@ -191,7 +191,7 @@ fn config_too_large_257_kib_rejected() {
     let payload = "x".repeat(target_bytes);
 
     let tmp = TempFile::new(&payload);
-    let result = loader::load(tmp.path(), &config);
+    let result = loader::load(tmp.path(), &config, &PROFILE_DESKTOP);
     match result {
         Err(LoadError::ConfigTooLarge { bytes, cap }) => {
             assert_eq!(bytes, target_bytes, "bytes field must be actual file size");
@@ -217,7 +217,7 @@ fn token_env_not_found_returns_err() {
 
     let yaml = yaml_with_token_env(var_name);
     let tmp = TempFile::new(&yaml);
-    let result = loader::load(tmp.path(), &config);
+    let result = loader::load(tmp.path(), &config, &PROFILE_DESKTOP);
     assert!(
         matches!(result, Err(LoadError::TokenEnvNotFound { ref name }) if name == var_name),
         "absent token_env must return TokenEnvNotFound; got: {result:?}"
@@ -236,7 +236,7 @@ fn token_env_empty_returns_err() {
 
     let yaml = yaml_with_token_env(var_name);
     let tmp = TempFile::new(&yaml);
-    let result = loader::load(tmp.path(), &config);
+    let result = loader::load(tmp.path(), &config, &PROFILE_DESKTOP);
     assert!(
         matches!(result, Err(LoadError::TokenEnvEmpty { ref name }) if name == var_name),
         "empty token_env must return TokenEnvEmpty; got: {result:?}"
@@ -263,7 +263,7 @@ fn parse_error_returns_bounded_excerpt() {
 
     let bad_yaml = "this: is: not: valid: yaml: {{{ broken";
     let tmp = TempFile::new(bad_yaml);
-    let result = loader::load(tmp.path(), &config);
+    let result = loader::load(tmp.path(), &config, &PROFILE_DESKTOP);
     match result {
         Err(LoadError::ParseError { ref excerpt }) => {
             assert!(!excerpt.is_empty(), "ParseError excerpt must be non-empty");
@@ -308,7 +308,7 @@ fn examples_dashboard_yaml_loads_without_issues() {
         "examples/dashboard.yaml must exist at the expected path"
     );
 
-    let result = loader::load(examples_path, &config);
+    let result = loader::load(examples_path, &config, &PROFILE_DESKTOP);
     unsafe { std::env::remove_var("HA_TOKEN") };
 
     let dashboard = result.expect("examples/dashboard.yaml must load successfully");
@@ -412,9 +412,11 @@ views:
     // Write the fixture to disk; load twice to rebuild parser state.
     let tmp = TempFile::new(FIXTURE);
 
-    let first = loader::load(tmp.path(), &config).expect("first load must succeed");
+    let first =
+        loader::load(tmp.path(), &config, &PROFILE_DESKTOP).expect("first load must succeed");
     // Re-invoke to rebuild parser state (the loader re-reads the file each call).
-    let second = loader::load(tmp.path(), &config).expect("second load must succeed");
+    let second =
+        loader::load(tmp.path(), &config, &PROFILE_DESKTOP).expect("second load must succeed");
 
     // Serialized YAML must be byte-identical.
     let first_yaml = serde_yaml_ng::to_string(&first).expect("first serialize must succeed");
