@@ -1086,14 +1086,6 @@ pub struct LiveBridge {
     flush_task: JoinHandle<()>,
     /// Connection-state watcher task.
     state_task: JoinHandle<()>,
-    /// Shared `EntityId → row_index` map (TASK-119 F2).  Built at spawn
-    /// time; protected by the same lock as the flush loop reads.  Future
-    /// full-rebuild paths (config reload, view switch, full resync) must
-    /// take the write-guard, rebuild, and release before the next flush
-    /// tick reads.  Held on the bridge so callers can probe it without
-    /// reaching into the flush task's captures.
-    #[allow(dead_code)]
-    row_index: RowIndexHandle,
 }
 
 impl Drop for LiveBridge {
@@ -1210,7 +1202,6 @@ impl LiveBridge {
             subscriber_tasks,
             flush_task,
             state_task,
-            row_index,
         }
     }
 }
