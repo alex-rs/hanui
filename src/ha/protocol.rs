@@ -29,6 +29,7 @@
 //! hierarchy to match against.
 
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -198,18 +199,25 @@ pub struct GetServicesPayload {
 
 /// An inbound WS message from HA, deserialized from the raw JSON frame.
 ///
-/// Deserialization uses a two-step approach: first parse to an untyped
-/// `serde_json::Value`, then dispatch on the `"type"` field.  This gives us
-/// control over unknown `type` values — they map to [`InboundMsg::Unknown`]
-/// instead of returning an error, so the client tolerates HA adding new
-/// message types without crashing.
+/// Deserialization uses a peek-then-deserialize approach: first capture the
+/// raw JSON bytes as a `Box<serde_json::value::RawValue>` (a borrowed
+/// reference, no payload allocation), peek at the `"type"` field via a
+/// minimal envelope struct, then deserialize the matched variant payload
+/// once, directly from the raw bytes.  This avoids the previous
+/// `Value::deserialize` + `from_value(clone())` round-trip, which doubled the
+/// per-message allocation cost on hot-path `state_changed` events
+/// (TASK-124 F8).
+///
+/// Unknown `type` values map to [`InboundMsg::Unknown`] (with the raw payload
+/// preserved as a `Value` for diagnostics) instead of returning an error, so
+/// the client tolerates HA adding new message types without crashing.
 ///
 /// # Note on `#[serde(tag = "type")]`
 ///
-/// A plain `#[serde(tag = "type")]` derive would panic (return an error) on an
-/// unknown variant.  Instead, this enum is deserialized via a custom
-/// [`Deserialize`] impl that delegates to [`RawInboundMsg`] and maps
-/// [`RawInboundMsg::Unknown`] to [`InboundMsg::Unknown`].
+/// A plain `#[serde(tag = "type")]` derive would error on an unknown variant.
+/// Instead, this enum is deserialized via a custom [`Deserialize`] impl that
+/// dispatches on the peeked `type` discriminator and falls through to
+/// [`InboundMsg::Unknown`] for anything unrecognized.
 #[derive(Debug, Clone)]
 pub enum InboundMsg {
     /// HA requires authentication before accepting any commands.
@@ -233,45 +241,79 @@ pub enum InboundMsg {
     Unknown { type_str: String, raw: Value },
 }
 
-// Intermediate representation used during deserialization.
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum RawInboundMsg {
-    AuthRequired(AuthRequiredPayload),
-    AuthOk(AuthOkPayload),
-    AuthInvalid(AuthInvalidPayload),
-    Event(Box<EventPayload>),
-    Result(ResultPayload),
-    #[serde(other)]
-    Unknown,
+// Envelope used to peek at the `type` discriminator without allocating the
+// full payload as a `serde_json::Value`.  `&'a str` borrows directly from the
+// raw JSON bytes (no string allocation when the value contains no escapes —
+// which is the steady-state case for HA's `type` field).
+#[derive(Deserialize)]
+struct TypePeek<'a> {
+    #[serde(borrow)]
+    r#type: &'a str,
+}
+
+// Owned variant of [`TypePeek`] used as a fallback when the borrowed peek
+// fails because the raw `type` string contains JSON escapes (extremely rare
+// for HA's `type` field, which is a fixed protocol enum).  This branch
+// allocates one `String` for the discriminator only — never the full payload.
+#[derive(Deserialize)]
+struct TypePeekOwned {
+    r#type: String,
 }
 
 impl<'de> Deserialize<'de> for InboundMsg {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // Deserialize to an untyped Value first so we can recover the `type`
-        // field and the full raw object for the Unknown variant.
-        let raw_value = Value::deserialize(deserializer)?;
+        // Capture the raw JSON bytes as a borrowed reference (or a single
+        // owned `Box<RawValue>` allocation) without materializing a full
+        // `serde_json::Value` tree.  This eliminates the previous-impl pattern
+        // of allocating `Value` then cloning it for `from_value`, which doubled
+        // the per-message allocation cost on hot-path `state_changed` events.
+        let raw: Box<RawValue> = Box::<RawValue>::deserialize(deserializer)?;
+        let raw_str = raw.get();
 
-        // Try to parse as a known variant.  `serde_json::from_value` clones
-        // the Value; this is acceptable because the parse path is not hot.
-        match serde_json::from_value::<RawInboundMsg>(raw_value.clone()) {
-            Ok(RawInboundMsg::AuthRequired(p)) => Ok(InboundMsg::AuthRequired(p)),
-            Ok(RawInboundMsg::AuthOk(p)) => Ok(InboundMsg::AuthOk(p)),
-            Ok(RawInboundMsg::AuthInvalid(p)) => Ok(InboundMsg::AuthInvalid(p)),
-            Ok(RawInboundMsg::Event(p)) => Ok(InboundMsg::Event(p)),
-            Ok(RawInboundMsg::Result(p)) => Ok(InboundMsg::Result(p)),
-            Ok(RawInboundMsg::Unknown) => {
-                let type_str = raw_value
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("<missing>")
-                    .to_owned();
+        // Peek at the `type` field — O(payload size to find one key), no
+        // payload allocation.  Try the borrowed path first; if the discriminator
+        // value happens to contain JSON escapes (essentially never for HA's
+        // protocol enum), fall through to the owned path.
+        let type_str: std::borrow::Cow<'_, str> =
+            match serde_json::from_str::<TypePeek<'_>>(raw_str) {
+                Ok(p) => std::borrow::Cow::Borrowed(p.r#type),
+                Err(_) => {
+                    let owned: TypePeekOwned =
+                        serde_json::from_str(raw_str).map_err(serde::de::Error::custom)?;
+                    std::borrow::Cow::Owned(owned.r#type)
+                }
+            };
+
+        // Materialize only the matching variant payload, deserializing once
+        // directly from the raw bytes (no intermediate `Value` clone).
+        match type_str.as_ref() {
+            "auth_required" => serde_json::from_str(raw_str)
+                .map(InboundMsg::AuthRequired)
+                .map_err(serde::de::Error::custom),
+            "auth_ok" => serde_json::from_str(raw_str)
+                .map(InboundMsg::AuthOk)
+                .map_err(serde::de::Error::custom),
+            "auth_invalid" => serde_json::from_str(raw_str)
+                .map(InboundMsg::AuthInvalid)
+                .map_err(serde::de::Error::custom),
+            "event" => serde_json::from_str(raw_str)
+                .map(InboundMsg::Event)
+                .map_err(serde::de::Error::custom),
+            "result" => serde_json::from_str(raw_str)
+                .map(InboundMsg::Result)
+                .map_err(serde::de::Error::custom),
+            other => {
+                // Unknown variant: still preserve the raw payload as a `Value`
+                // so `InboundMsg::Unknown { raw }` callers can forward-parse
+                // future message types.  This is the only branch that retains
+                // a `Value` allocation, and unknown messages are rare.
+                let raw_value: Value =
+                    serde_json::from_str(raw_str).map_err(serde::de::Error::custom)?;
                 Ok(InboundMsg::Unknown {
-                    type_str,
+                    type_str: other.to_owned(),
                     raw: raw_value,
                 })
             }
-            Err(e) => Err(serde::de::Error::custom(e)),
         }
     }
 }
@@ -909,6 +951,48 @@ mod tests {
                 assert_eq!(raw["context"]["id"], "ABC");
             }
             other => panic!("expected Unknown, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_type_field_returns_typed_error_not_silent_unknown() {
+        // TASK-124 F8: pins behavior when the `type` field is absent entirely.
+        // The peek-then-deserialize path uses a non-optional `type` field on
+        // the envelope struct, so a missing field surfaces as a deserialize
+        // error — matching the previous impl's behavior of erroring on
+        // missing `type` (the `#[serde(tag = "type")]` derive on the old
+        // `RawInboundMsg` enum required the tag to be present, regardless of
+        // whether the value was a known variant).  This test prevents a
+        // future refactor from silently producing
+        // `InboundMsg::Unknown { type_str: "" }` on malformed frames.
+        let json = r#"{"not_type":"value","other":"field"}"#;
+        let result = serde_json::from_str::<InboundMsg>(json);
+        assert!(
+            result.is_err(),
+            "missing `type` field must produce a deserialize error, not a silent Unknown"
+        );
+    }
+
+    #[test]
+    fn empty_type_string_falls_through_to_unknown_variant() {
+        // TASK-124 F8: pins behavior when the `type` field is present but its
+        // value is the empty string.  This is distinct from a missing field —
+        // an explicit `"type": ""` is a well-formed envelope with no matching
+        // known variant, so it falls through to `InboundMsg::Unknown` with an
+        // empty `type_str`.  This matches the behavior of the previous impl,
+        // which routed unknown-value (but present) tags through the
+        // `#[serde(other)]` fallback variant.
+        let json = r#"{"type":"","payload":"anything"}"#;
+        let msg = serde_json::from_str::<InboundMsg>(json).unwrap();
+        match msg {
+            InboundMsg::Unknown { type_str, raw } => {
+                assert_eq!(
+                    type_str, "",
+                    "empty `type` value must round-trip as an empty `type_str`"
+                );
+                assert_eq!(raw["payload"], "anything");
+            }
+            other => panic!("expected Unknown for empty type, got: {other:?}"),
         }
     }
 
