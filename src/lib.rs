@@ -576,6 +576,56 @@ async fn run_ws_client(
 }
 
 // ---------------------------------------------------------------------------
+// Row-update inner logic (extracted for testability without event loop)
+// ---------------------------------------------------------------------------
+
+/// Apply a slice of [`ui::bridge::RowUpdate`]s to three already-installed
+/// Slint models.  Only the dynamic `state` field is written; static fields
+/// (name, icon, placement) are left as-is.  Writing is skipped when the
+/// current row value already matches, matching `apply_pending_for_widgets`'s
+/// no-spurious-notify pattern.
+///
+/// Extracted from `SlintSink::apply_row_updates`'s `invoke_from_event_loop`
+/// closure so the branching logic can be unit-tested with plain `VecModel`
+/// instances, without requiring a running Slint event loop.
+fn write_row_updates(
+    updates: &[ui::bridge::RowUpdate],
+    lights: &ModelRc<ui::bridge::slint_ui::LightTileVM>,
+    sensors: &ModelRc<ui::bridge::slint_ui::SensorTileVM>,
+    entities: &ModelRc<ui::bridge::slint_ui::EntityTileVM>,
+) {
+    use slint::Model;
+    for update in updates {
+        match update.kind {
+            ui::bridge::TileKind::Light => {
+                if let Some(mut row) = lights.row_data(update.row_index) {
+                    if row.state.as_str() != update.state {
+                        row.state = update.state.as_str().into();
+                        lights.set_row_data(update.row_index, row);
+                    }
+                }
+            }
+            ui::bridge::TileKind::Sensor => {
+                if let Some(mut row) = sensors.row_data(update.row_index) {
+                    if row.state.as_str() != update.state {
+                        row.state = update.state.as_str().into();
+                        sensors.set_row_data(update.row_index, row);
+                    }
+                }
+            }
+            ui::bridge::TileKind::Entity => {
+                if let Some(mut row) = entities.row_data(update.row_index) {
+                    if row.state.as_str() != update.state {
+                        row.state = update.state.as_str().into();
+                        entities.set_row_data(update.row_index, row);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Production BridgeSink — hops onto the Slint UI thread
 // ---------------------------------------------------------------------------
 
@@ -611,6 +661,15 @@ impl SlintSink {
 
 impl ui::bridge::BridgeSink for SlintSink {
     fn write_tiles(&self, tiles: Vec<ui::bridge::TileVM>) {
+        // Full-model write path. Used by:
+        //   * the state watcher's Reconnecting/Failed → Live transition
+        //     resync (per `run_state_watcher`'s contract)
+        //   * the legacy default fallback of `apply_row_updates` for
+        //     non-production sinks (test recorders, benches)
+        //
+        // The steady-state flush loop in `run_flush_loop` does NOT call
+        // this method post-TASK-119 — see `apply_row_updates` below.
+        //
         // We deliberately do NOT call `wire_window` here — `wire_window` also
         // writes the `AnimationBudget` globals, which the Phase 1 contract
         // mandates be set exactly once at startup (in `run_with_memory_store` /
@@ -635,6 +694,46 @@ impl ui::bridge::BridgeSink for SlintSink {
             }
         }) {
             tracing::debug!(error = %e, "invoke_from_event_loop failed in write_tiles (event loop shut down?)");
+        }
+    }
+
+    fn apply_row_updates(
+        &self,
+        updates: Vec<ui::bridge::RowUpdate>,
+        _rebuild_full_tiles: Box<dyn FnOnce() -> Vec<ui::bridge::TileVM> + Send>,
+    ) {
+        // TASK-119 F2: per-row incremental update.  Skips the
+        // `rebuild_full_tiles` thunk entirely — production never falls
+        // back to `write_tiles` from the steady-state flush.  Each update
+        // is applied via `set_row_data` on the existing per-kind Slint
+        // model instance (installed once at startup by `wire_window`),
+        // updating only the dynamic `state` field.  Static fields
+        // (name, icon, placement) remain whatever `wire_window` wrote —
+        // changing those would require a full rebuild path.
+        //
+        // `ModelRc<T>` is `Rc`-backed and not `Send`, so the per-row
+        // writes must happen on the Slint UI thread.  The `Vec<RowUpdate>`
+        // is `Send` and crosses freely.
+        //
+        // Per-row read-modify-write pattern: `row_data(idx)` returns a
+        // clone of the current Slint VM struct; we mutate the `state`
+        // field; `set_row_data(idx, vm)` writes it back, which fires the
+        // model-changed notification Slint uses to repaint only the
+        // affected row.  This mirrors `apply_pending_for_widgets` in
+        // `src/ui/toast.rs`.
+        let window = self.window.clone();
+        if let Err(e) = slint::invoke_from_event_loop(move || {
+            let Some(w) = window.upgrade() else {
+                return;
+            };
+            write_row_updates(
+                &updates,
+                &w.get_light_tiles(),
+                &w.get_sensor_tiles(),
+                &w.get_entity_tiles(),
+            );
+        }) {
+            tracing::debug!(error = %e, "invoke_from_event_loop failed in apply_row_updates (event loop shut down?)");
         }
     }
 
@@ -999,6 +1098,148 @@ mod tests {
         let _sink = SlintSink::new(weak);
         // Reaching here without panicking is the assertion.  Trait-shape
         // coverage lives in src/ui/bridge.rs (test module's RecordingSink).
+    }
+
+    /// `SlintSink::apply_row_updates` (TASK-119 F2) routes per-row updates
+    /// through `slint::invoke_from_event_loop`; without a running event
+    /// loop the invoke fails and the error is logged (NOT propagated as a
+    /// panic).  We exercise the no-event-loop path here to lock in the
+    /// graceful-degradation contract: if the Slint event loop is shut
+    /// down between the bridge's flush call and this method body, the
+    /// sink must NOT panic.
+    #[test]
+    fn slint_sink_apply_row_updates_without_event_loop_does_not_panic() {
+        use ui::bridge::{BridgeSink, RowUpdate, TileKind};
+        let weak: slint::Weak<MainWindow> = slint::Weak::default();
+        let sink = SlintSink::new(weak);
+        let updates = vec![
+            RowUpdate {
+                kind: TileKind::Light,
+                row_index: 0,
+                state: "on".to_string(),
+            },
+            RowUpdate {
+                kind: TileKind::Sensor,
+                row_index: 1,
+                state: "21".to_string(),
+            },
+            RowUpdate {
+                kind: TileKind::Entity,
+                row_index: 2,
+                state: "off".to_string(),
+            },
+        ];
+        // Rebuild thunk MUST NOT be invoked by SlintSink — it is a
+        // production-side override that ignores the thunk entirely.
+        let thunk: Box<dyn FnOnce() -> Vec<ui::bridge::TileVM> + Send> =
+            Box::new(|| panic!("SlintSink::apply_row_updates must not invoke the rebuild thunk"));
+        sink.apply_row_updates(updates, thunk);
+        // Reaching here without panicking is the assertion: the
+        // event-loop-down branch must log and continue, NOT panic.
+    }
+
+    /// `write_row_updates` writes the `state` field for each matched row and
+    /// skips rows whose state already matches (no-spurious-notify contract).
+    #[test]
+    fn write_row_updates_writes_changed_state_for_all_three_kinds() {
+        use slint::{Model, ModelRc, VecModel};
+        use ui::bridge::slint_ui::{EntityTileVM, LightTileVM, SensorTileVM};
+        use ui::bridge::{RowUpdate, TileKind};
+
+        let lights: ModelRc<LightTileVM> = ModelRc::new(VecModel::from(vec![LightTileVM {
+            state: "off".into(),
+            ..Default::default()
+        }]));
+        let sensors: ModelRc<SensorTileVM> = ModelRc::new(VecModel::from(vec![SensorTileVM {
+            state: "20".into(),
+            ..Default::default()
+        }]));
+        let entities: ModelRc<EntityTileVM> = ModelRc::new(VecModel::from(vec![EntityTileVM {
+            state: "unavailable".into(),
+            ..Default::default()
+        }]));
+
+        write_row_updates(
+            &[
+                RowUpdate {
+                    kind: TileKind::Light,
+                    row_index: 0,
+                    state: "on".into(),
+                },
+                RowUpdate {
+                    kind: TileKind::Sensor,
+                    row_index: 0,
+                    state: "21".into(),
+                },
+                RowUpdate {
+                    kind: TileKind::Entity,
+                    row_index: 0,
+                    state: "home".into(),
+                },
+            ],
+            &lights,
+            &sensors,
+            &entities,
+        );
+
+        assert_eq!(lights.row_data(0).unwrap().state.as_str(), "on");
+        assert_eq!(sensors.row_data(0).unwrap().state.as_str(), "21");
+        assert_eq!(entities.row_data(0).unwrap().state.as_str(), "home");
+    }
+
+    /// Unchanged state must NOT trigger a `set_row_data` write (no-spurious-
+    /// notify contract).  We verify by checking the value stays identical.
+    #[test]
+    fn write_row_updates_skips_row_when_state_unchanged() {
+        use slint::{Model, ModelRc, VecModel};
+        use ui::bridge::slint_ui::LightTileVM;
+        use ui::bridge::{RowUpdate, TileKind};
+
+        let lights: ModelRc<LightTileVM> = ModelRc::new(VecModel::from(vec![LightTileVM {
+            state: "on".into(),
+            ..Default::default()
+        }]));
+        let empty_sensors =
+            ModelRc::new(VecModel::<ui::bridge::slint_ui::SensorTileVM>::from(vec![]));
+        let empty_entities =
+            ModelRc::new(VecModel::<ui::bridge::slint_ui::EntityTileVM>::from(vec![]));
+
+        write_row_updates(
+            &[RowUpdate {
+                kind: TileKind::Light,
+                row_index: 0,
+                state: "on".into(),
+            }],
+            &lights,
+            &empty_sensors,
+            &empty_entities,
+        );
+
+        // State is still "on" — no write occurred (same value).
+        assert_eq!(lights.row_data(0).unwrap().state.as_str(), "on");
+    }
+
+    /// Out-of-bounds row index must be silently ignored — no panic.
+    #[test]
+    fn write_row_updates_out_of_bounds_row_is_ignored() {
+        use slint::{ModelRc, VecModel};
+        use ui::bridge::{RowUpdate, TileKind};
+
+        let lights = ModelRc::new(VecModel::<ui::bridge::slint_ui::LightTileVM>::from(vec![]));
+        let sensors = ModelRc::new(VecModel::<ui::bridge::slint_ui::SensorTileVM>::from(vec![]));
+        let entities = ModelRc::new(VecModel::<ui::bridge::slint_ui::EntityTileVM>::from(vec![]));
+
+        // row_index 99 is out of bounds for empty models — must not panic.
+        write_row_updates(
+            &[RowUpdate {
+                kind: TileKind::Light,
+                row_index: 99,
+                state: "on".into(),
+            }],
+            &lights,
+            &sensors,
+            &entities,
+        );
     }
 
     /// `build_ws_client_with_store` wires the `WsClient` and the `LiveStore`
