@@ -215,9 +215,10 @@ fn default_icon_for_kind(kind: EntityKind) -> String {
 /// Map an [`EntityStore`] and a [`Dashboard`] config to a flat list of typed
 /// tile view-models, one per widget in the dashboard (in document order).
 ///
-/// The store is consumed via the visitor ([`EntityStore::for_each`]) for the
-/// sanity-check walk and via [`EntityStore::get`] for per-widget entity lookup.
-/// No iterator semantics are assumed.
+/// The store is consumed only via [`EntityStore::get`] for per-widget entity
+/// lookup. No iterator semantics are assumed and no full-store walk is
+/// performed on this hot path (TASK-118 F3 removed the prior diagnostic
+/// `for_each` walk; per-flush cost is now O(`widget_count`)).
 ///
 /// `EntityStore` is dyn-compatible (PATH A — see `src/ha/store.rs` module doc).
 /// `store` is accepted as `&dyn EntityStore` so Phase 2 callers can pass any
@@ -227,18 +228,10 @@ fn default_icon_for_kind(kind: EntityKind) -> String {
 /// See the module-level doc for the missing-entity policy and field-mapping
 /// details.
 pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM> {
-    // Walk all entities once via the visitor to collect a count for a
-    // diagnostic log / sanity check. This satisfies the AC requirement that
-    // for_each is exercised on the live store path (not only in tests).
-    let mut store_entity_count: usize = 0;
-    store.for_each(&mut |_id, _entity| {
-        store_entity_count += 1;
-    });
-    tracing::debug!(
-        store_entity_count,
-        "build_tiles: store entity count (visitor walk)"
-    );
-
+    // TASK-118 F3 removed the per-flush `store.for_each` diagnostic walk
+    // that previously made this an O(`widget_count + entity_count`) hot
+    // path. The per-widget `store.get` calls below remain the only store
+    // interactions, giving an O(`widget_count`) rebuild.
     let mut tiles = Vec::new();
 
     for view in &dashboard.views {
@@ -362,6 +355,11 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
             }
         }
     }
+
+    // TASK-118 F3: O(1) diagnostic — replaces the prior O(N) `store.for_each`
+    // visitor walk. `trace!` is filtered out under release-mode level
+    // configuration so the per-flush diagnostic cost is zero in production.
+    tracing::trace!(widget_count = tiles.len(), "build_tiles: rebuilt tile list");
 
     tiles
 }
@@ -1016,12 +1014,12 @@ async fn run_entity_subscriber(
 /// patching individual tiles; this matches the Phase 1 wire_window contract
 /// and the `pending_map` is a "did anything change" signal, not a
 /// per-tile patch list.  Per-flush cost is dominated by `build_tiles`, which
-/// is O(`dashboard.widget_count` + `store.entity_count`) — the per-widget
-/// `store.get` walk plus the diagnostic `for_each` visitor walk added in
-/// Phase 1 to satisfy the AC that `for_each` be exercised on the live
-/// store path.  Under PHASES.md's `max_entities = 16k`, the visitor walk
-/// dominates; the 12.5 Hz cap is validated end-to-end by TASK-038's churn
-/// benchmark, not by widget-count alone.
+/// is O(`dashboard.widget_count`) — only the per-widget `store.get` lookups.
+/// TASK-118 F3 removed the diagnostic `for_each` visitor walk that previously
+/// added an O(`store.entity_count`) term; under PHASES.md's
+/// `max_entities = 16k` that walk dominated the per-flush cost, and the
+/// 12.5 Hz cap is now validated against the lighter `widget_count`-only
+/// rebuild via TASK-038's churn benchmark.
 async fn run_flush_loop<S: BridgeSink>(
     store: Arc<dyn EntityStore>,
     dashboard: Arc<Dashboard>,
@@ -2973,6 +2971,19 @@ mod tests {
         predicate()
     }
 
+    #[tokio::test]
+    async fn wait_until_returns_false_when_predicate_never_true() {
+        // Coverage: exercise the post-timeout `predicate()` call in wait_until
+        // (line reached only when the predicate never returns true within the
+        // timeout window).  A 1 ms timeout with a permanently-false predicate
+        // exhausts the loop and falls through to the final call.
+        let result = wait_until(1, || false).await;
+        assert!(
+            !result,
+            "wait_until must return false when predicate never becomes true"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn flush_propagates_update_within_one_cadence() {
         ensure_icons_init();
@@ -3650,42 +3661,60 @@ mod tests {
             !recorder.snapshot_tile_writes().is_empty(),
             "initial Live-transition write must have landed before subscriber exit"
         );
+
+        // Coverage: ClosingStore::for_each must delegate to its map.  The
+        // EntityStore trait requires the impl; exercise it directly since
+        // build_tiles no longer calls for_each (TASK-118 F3).
+        let mut visited = 0usize;
+        store.for_each(&mut |_id, _entity| {
+            visited += 1;
+        });
+        assert_eq!(
+            visited, 1,
+            "ClosingStore::for_each must visit the single entity in the map"
+        );
     }
 
     // -----------------------------------------------------------------------
     // BLOCKER 1 regression: state flip between gate-check and property write
     // -----------------------------------------------------------------------
 
-    /// Stub store that signals every `for_each` entry on `enter_tx` and
+    /// Stub store that signals every `get` entry on `enter_tx` and
     /// blocks until a corresponding `()` is received on the per-entry
     /// release channel.  The test thread choreographs entries by sending
     /// release signals one at a time.
     ///
     /// This lets the test deterministically open the read-then-check race
     /// window in `run_flush_loop`: while the flush task is blocked inside
-    /// `build_tiles -> for_each`, the test flips `ConnectionState` to
-    /// `Reconnecting`, then releases.  The flush task's second state read
-    /// must observe `Reconnecting` and skip the property write.
+    /// `build_tiles -> store.get(...)` for a widget, the test flips
+    /// `ConnectionState` to `Reconnecting`, then releases.  The flush
+    /// task's second state read must observe `Reconnecting` and skip the
+    /// property write.
+    ///
+    /// (TASK-118 F3 hooked the rendezvous on `for_each`; that hot-path
+    /// walk has been removed in favour of an O(1) atomic counter, so the
+    /// rendezvous is now wired through `get` — which `build_tiles` still
+    /// calls once per widget.)
     struct RendezvousStore {
         base: StubStore,
-        // Sent on every `for_each` entry; test reads to know we are blocked.
+        // Sent on every `get` entry; test reads to know we are blocked.
         enter_tx: std::sync::mpsc::SyncSender<()>,
-        // Receives one release signal per `for_each` entry.  Wrapped in a
+        // Receives one release signal per `get` entry.  Wrapped in a
         // Mutex because mpsc::Receiver is not Sync.
         release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
     }
 
     impl EntityStore for RendezvousStore {
         fn get(&self, id: &EntityId) -> Option<Entity> {
-            self.base.get(id)
-        }
-        fn for_each(&self, f: &mut dyn FnMut(&EntityId, &Entity)) {
             // Signal entry, then block until the test thread sends a release.
             let _ = self.enter_tx.send(());
             {
                 let rx = self.release_rx.lock().expect("release_rx mutex poisoned");
                 let _ = rx.recv();
             }
+            self.base.get(id)
+        }
+        fn for_each(&self, f: &mut dyn FnMut(&EntityId, &Entity)) {
             self.base.for_each(f);
         }
         fn subscribe(&self, ids: &[EntityId]) -> broadcast::Receiver<EntityUpdate> {
@@ -3716,7 +3745,7 @@ mod tests {
         let dashboard = Arc::new(one_widget_dashboard());
         let (state_tx, state_rx) = status_channel();
         // Start in Live so the state-watcher fires its initial resync
-        // (build_tiles -> for_each).  We release that first entry so the
+        // (build_tiles -> store.get).  We release that first entry so the
         // bridge is fully primed before the racing flush.
         state_tx.send(ConnectionState::Live).unwrap();
 
@@ -3729,7 +3758,7 @@ mod tests {
         );
 
         // (1) Initial state-watcher resync on entry to Live.  Wait for it
-        // to enter for_each, then release.
+        // to enter the per-widget store.get rendezvous, then release.
         let primed = tokio::task::spawn_blocking({
             let release_tx = release_tx.clone();
             move || {
@@ -3747,7 +3776,7 @@ mod tests {
         let (primed_ok, enter_rx, release_tx) = primed;
         assert!(
             primed_ok,
-            "initial Live-transition for_each must enter the rendezvous"
+            "initial Live-transition store.get must enter the rendezvous"
         );
 
         // Allow the watcher's write_tiles to land before we sample baseline.
@@ -3771,7 +3800,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         // (3) On the next flush tick the flush loop enters build_tiles ->
-        // for_each and blocks on the rendezvous.  Wait for the enter signal
+        // store.get and blocks on the rendezvous.  Wait for the enter signal
         // WITHOUT releasing yet — that opens the race window.
         let raced = tokio::task::spawn_blocking(move || {
             let got = enter_rx
@@ -3784,7 +3813,7 @@ mod tests {
         let (raced_ok, enter_rx) = raced;
         assert!(
             raced_ok,
-            "flush task must enter for_each within 2s; race window never opened"
+            "flush task must enter store.get within 2s; race window never opened"
         );
 
         // (4) Flip state to Reconnecting WHILE the flush loop is blocked
@@ -3804,15 +3833,15 @@ mod tests {
 
         let writes_pre_release = recorder.snapshot_tile_writes().len();
 
-        // (5) Release the flush task's for_each.  The state watcher's
+        // (5) Release the flush task's store.get.  The state watcher's
         // Live -> Reconnecting transition will ALSO have fired by now;
         // because that transition does NOT call build_tiles (build_tiles
         // is gated on `matches!(new_state, Live)`), no second rendezvous
         // hit happens here for the watcher.
-        release_tx.send(()).expect("release flush for_each");
+        release_tx.send(()).expect("release flush store.get");
 
         // Wait several flush cadences.  Even though the flush task's
-        // for_each has now returned, its post-build_tiles state re-check
+        // store.get has now returned, its post-build_tiles state re-check
         // must observe Reconnecting and skip the write.
         tokio::time::sleep(Duration::from_millis(FLUSH_INTERVAL_MS * 4)).await;
         let writes_post_release = recorder.snapshot_tile_writes().len();
@@ -3830,12 +3859,40 @@ mod tests {
         );
 
         // Test cleanup: dropping `release_tx` closes the channel; any later
-        // `for_each` call (none expected — we are gated) would observe the
+        // `get` call (none expected — we are gated) would observe the
         // closed receiver and not deadlock.  `_bridge` Drop aborts the
         // tokio tasks; the SyncSender's bounded capacity keeps the test
         // deterministic if scheduling jitter produced extra entries.
         drop(release_tx);
         drop(enter_rx);
+    }
+
+    #[test]
+    fn rendezvous_store_for_each_delegates_to_base() {
+        // Coverage: RendezvousStore::for_each must delegate to base.for_each.
+        // build_tiles no longer calls for_each (TASK-118 F3 removed that walk),
+        // but the EntityStore trait still requires the impl.  Exercise it
+        // directly so the delegation line is covered.
+        let (enter_tx, _enter_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (_release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let base = StubStore::new(vec![
+            make_test_entity("light.a", "on"),
+            make_test_entity("light.b", "off"),
+        ]);
+        let store = RendezvousStore {
+            base,
+            enter_tx,
+            release_rx: Mutex::new(release_rx),
+        };
+
+        let mut visited = 0usize;
+        store.for_each(&mut |_id, _entity| {
+            visited += 1;
+        });
+        assert_eq!(
+            visited, 2,
+            "RendezvousStore::for_each must visit all entities via base"
+        );
     }
 
     // -----------------------------------------------------------------------

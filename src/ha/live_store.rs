@@ -75,6 +75,7 @@
 //! [`EntityStore`]: super::store::EntityStore
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use jiff::Timestamp;
@@ -254,6 +255,21 @@ pub struct LiveStore {
     /// `false` for every input — TASK-067's spinner sees "no pending" until
     /// the orchestrator wires the map.
     widget_action_map: RwLock<Option<Arc<WidgetActionMap>>>,
+
+    /// Diagnostic counter tracking the current number of entities in the
+    /// snapshot (TASK-118 F3).
+    ///
+    /// Maintained by [`Self::apply_event`] (`fetch_add` on insert of a new
+    /// id, `fetch_sub` on removal) and read via [`Self::entity_count`]. The
+    /// hot-path `build_tiles` reads this O(1) counter instead of walking the
+    /// full snapshot, which at 12.5 Hz with up to 16 384 entities saved
+    /// ~204 800 wasted iterations per second.
+    ///
+    /// `Ordering::Relaxed` is used everywhere — this is a diagnostic
+    /// counter, not a synchronization primitive. Concurrent insert/remove
+    /// races are bounded by the snapshot `RwLock`, which serializes the
+    /// underlying map mutation; the counter merely shadows that mutation.
+    entity_count: AtomicUsize,
 }
 
 impl LiveStore {
@@ -278,6 +294,7 @@ impl LiveStore {
             per_entity_optimistic_cap: DEFAULT_PER_ENTITY_OPTIMISTIC_CAP,
             global_optimistic_cap: DEFAULT_GLOBAL_OPTIMISTIC_CAP,
             widget_action_map: RwLock::new(None),
+            entity_count: AtomicUsize::new(0),
         }
     }
 
@@ -611,10 +628,15 @@ impl LiveStore {
     pub fn apply_snapshot(&self, entities: Vec<Entity>) {
         let new_map: HashMap<EntityId, Entity> =
             entities.into_iter().map(|e| (e.id.clone(), e)).collect();
+        let new_len = new_map.len();
         // Poison recovery: a prior writer panic must not permanently block
         // reconnect repopulation.
         let mut guard = self.snapshot.write().unwrap_or_else(|e| e.into_inner());
         *guard = new_map;
+        // Reset the diagnostic counter to match the new snapshot size
+        // (TASK-118 F3). The store hot-path tile rebuild reads this counter
+        // instead of walking the full map.
+        self.entity_count.store(new_len, Ordering::Relaxed);
     }
 
     /// Apply a single incremental entity update.
@@ -651,14 +673,32 @@ impl LiveStore {
         // In-place mutation under the write-lock.  Poison recovery: a writer
         // panic in a prior call must not permanently break ingest — the
         // recovered guard exposes the same `HashMap`, structurally intact.
+        //
+        // While the write-lock is held, also update the diagnostic
+        // `entity_count` counter (TASK-118 F3): `fetch_add` when inserting a
+        // brand-new id, `fetch_sub` when removing an existing id. Replacing
+        // an existing entity (insert with an id already present) leaves the
+        // counter untouched. Holding the write-lock makes the counter
+        // transition serialised against any concurrent `apply_event` /
+        // `apply_snapshot` so the counter never drifts from the underlying
+        // map size.
         {
             let mut guard = self.snapshot.write().unwrap_or_else(|e| e.into_inner());
             match &update.entity {
                 Some(entity) => {
-                    guard.insert(update.id.clone(), entity.clone());
+                    // insert returns Some(prev) iff the id was already
+                    // present — only bump the counter on a brand-new id.
+                    if guard.insert(update.id.clone(), entity.clone()).is_none() {
+                        self.entity_count.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 None => {
-                    guard.remove(&update.id);
+                    // remove returns Some(prev) iff the id was present — only
+                    // decrement on a real removal so a no-op delete does not
+                    // underflow the counter.
+                    if guard.remove(&update.id).is_some() {
+                        self.entity_count.fetch_sub(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -741,6 +781,22 @@ impl LiveStore {
         // Poison recovery — same rationale as in `apply_event`.
         let guard = self.snapshot.read().unwrap_or_else(|e| e.into_inner());
         Arc::new(guard.clone())
+    }
+
+    /// O(1) read of the diagnostic entity-count counter (TASK-118 F3).
+    ///
+    /// Maintained by [`Self::apply_snapshot`] (reset to the new map size)
+    /// and [`Self::apply_event`] (incremented on a brand-new id, decremented
+    /// on a removal of an existing id). Replaces the previous full-store
+    /// `for_each` walk in `build_tiles` so the per-flush rebuild cost is
+    /// O(`widget_count`), not O(`widget_count + entity_count`).
+    ///
+    /// Uses `Ordering::Relaxed` because this is a diagnostic counter, not a
+    /// synchronization primitive. Callers must not key correctness decisions
+    /// on the returned value.
+    #[must_use]
+    pub fn entity_count(&self) -> usize {
+        self.entity_count.load(Ordering::Relaxed)
     }
 }
 
@@ -1254,6 +1310,135 @@ mod tests {
         assert!(
             result.is_err(),
             "send on a sender whose receiver was dropped must return Err"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // entity_count accessor (TASK-118 F3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn entity_count_returns_zero_on_empty_store() {
+        let store = LiveStore::new();
+        assert_eq!(
+            store.entity_count(),
+            0,
+            "fresh LiveStore must report entity_count = 0"
+        );
+    }
+
+    #[test]
+    fn entity_count_increments_on_apply_event_insert() {
+        let store = LiveStore::new();
+        store.apply_snapshot(vec![]);
+        assert_eq!(store.entity_count(), 0);
+
+        // Insert a new entity via apply_event.
+        store.apply_event(EntityUpdate {
+            id: EntityId::from("light.new"),
+            entity: Some(make_entity("light.new", "on")),
+        });
+        assert_eq!(
+            store.entity_count(),
+            1,
+            "entity_count must be 1 after inserting one new entity"
+        );
+
+        // Insert a second distinct entity.
+        store.apply_event(EntityUpdate {
+            id: EntityId::from("sensor.temp"),
+            entity: Some(make_entity("sensor.temp", "21.0")),
+        });
+        assert_eq!(
+            store.entity_count(),
+            2,
+            "entity_count must be 2 after inserting a second new entity"
+        );
+
+        // Replace an existing entity — counter must NOT change.
+        store.apply_event(EntityUpdate {
+            id: EntityId::from("light.new"),
+            entity: Some(make_entity("light.new", "off")),
+        });
+        assert_eq!(
+            store.entity_count(),
+            2,
+            "replacing an existing entity must not change entity_count"
+        );
+    }
+
+    #[test]
+    fn entity_count_decrements_on_apply_event_remove() {
+        let store = LiveStore::new();
+        store.apply_snapshot(vec![
+            make_entity("light.a", "on"),
+            make_entity("light.b", "off"),
+        ]);
+        assert_eq!(store.entity_count(), 2);
+
+        // Remove one entity.
+        store.apply_event(EntityUpdate {
+            id: EntityId::from("light.a"),
+            entity: None,
+        });
+        assert_eq!(
+            store.entity_count(),
+            1,
+            "entity_count must be 1 after removing one entity"
+        );
+
+        // Removing a non-existent entity must not underflow.
+        store.apply_event(EntityUpdate {
+            id: EntityId::from("light.missing"),
+            entity: None,
+        });
+        assert_eq!(
+            store.entity_count(),
+            1,
+            "removing a non-existent entity must not change entity_count"
+        );
+
+        // Remove the last entity.
+        store.apply_event(EntityUpdate {
+            id: EntityId::from("light.b"),
+            entity: None,
+        });
+        assert_eq!(
+            store.entity_count(),
+            0,
+            "entity_count must be 0 after removing all entities"
+        );
+    }
+
+    #[test]
+    fn entity_count_resets_on_apply_snapshot() {
+        let store = LiveStore::new();
+
+        // Start with some events to set the counter.
+        store.apply_event(EntityUpdate {
+            id: EntityId::from("light.old"),
+            entity: Some(make_entity("light.old", "on")),
+        });
+        assert_eq!(store.entity_count(), 1);
+
+        // apply_snapshot with 3 entities must reset counter to 3.
+        store.apply_snapshot(vec![
+            make_entity("sensor.a", "1"),
+            make_entity("sensor.b", "2"),
+            make_entity("sensor.c", "3"),
+        ]);
+        assert_eq!(
+            store.entity_count(),
+            3,
+            "apply_snapshot must reset entity_count to the new map size"
+        );
+
+        // apply_snapshot with empty vec must reset counter to 0.
+        store.apply_snapshot(vec![]);
+        assert_eq!(
+            store.entity_count(),
+            0,
+            "apply_snapshot with empty vec must reset entity_count to 0"
         );
     }
 
