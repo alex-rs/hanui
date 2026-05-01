@@ -33,11 +33,10 @@
 //!   * `current_speed` — the active preset mode name, when the entity
 //!     exposes the `preset_mode` attribute. `None` when the fan reports
 //!     percentage only.
-//!   * `available_speeds` — the integration-reported preset list, sourced
-//!     from `preset_modes` when present, falling back to
-//!     `FanOptions.preset_modes` from the dashboard config (which is read
-//!     by the dispatcher per `locked_decisions.fan_speed_set_vocabulary`,
-//!     not by this VM — the VM surfaces only what the entity reports).
+//!
+//!   Preset mode list (`preset_modes`) is NOT stored on `FanVM` — it is
+//!   only needed by `FanBody::render_rows` and the action dispatcher,
+//!   neither of which runs at flush frequency.
 //!
 //! # JSON-crate discipline (CI Gate 2)
 //!
@@ -70,9 +69,6 @@ use crate::ha::entity::Entity;
 ///   tile and the more-info modal toggle.
 /// * `speed_pct` — `Some(0..=100)` when `percentage` is present.
 /// * `current_speed` — `Some(preset_name)` when `preset_mode` is present.
-/// * `available_speeds` — the entity-reported `preset_modes` list (often
-///   the same set the dispatcher reads from `FanOptions.preset_modes`,
-///   but emitted by HA on the entity rather than the dashboard config).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FanVM {
     /// Canonical HA state string for the tile hero label.
@@ -83,8 +79,6 @@ pub struct FanVM {
     pub speed_pct: Option<u8>,
     /// Current preset mode name when reported.
     pub current_speed: Option<String>,
-    /// Entity-reported preset list when present.
-    pub available_speeds: Vec<String>,
 }
 
 impl FanVM {
@@ -108,9 +102,9 @@ impl FanVM {
     /// `current_speed` is read from the `preset_mode` attribute (HA
     /// string). When absent or non-string, the field is `None`.
     ///
-    /// `available_speeds` is read from the `preset_modes` list attribute
-    /// (HA emits an array of strings). When absent, non-array, or empty,
-    /// the field is an empty `Vec`.
+    /// Preset mode list (`preset_modes`) is NOT read here — it is only
+    /// needed by `FanBody::render_rows` (more-info modal) and the
+    /// action dispatcher, neither of which runs at flush frequency.
     #[must_use]
     pub fn from_entity(entity: &Entity) -> Self {
         let state = entity.state.as_ref();
@@ -118,14 +112,12 @@ impl FanVM {
 
         let speed_pct = read_percentage_attribute(entity);
         let current_speed = read_preset_mode_attribute(entity);
-        let available_speeds = read_preset_modes_attribute(entity);
 
         FanVM {
             state: state.to_owned(),
             is_on,
             speed_pct,
             current_speed,
-            available_speeds,
         }
     }
 }
@@ -170,28 +162,6 @@ fn read_preset_mode_attribute(entity: &Entity) -> Option<String> {
     value.as_str().map(str::to_owned)
 }
 
-/// Read the `preset_modes` attribute as a `Vec<String>`.
-///
-/// Returns an empty `Vec` when:
-///   * The attribute is absent.
-///   * The attribute is not an array.
-///   * Every element is non-string.
-///
-/// Per-element non-string entries are dropped silently (defensive against
-/// integration variants that may mix in numeric or null entries; the
-/// dispatcher-side validation catches malformed lists at config-load time).
-fn read_preset_modes_attribute(entity: &Entity) -> Vec<String> {
-    let Some(value) = entity.attributes.get("preset_modes") else {
-        return Vec::new();
-    };
-    let Some(arr) = value.as_array() else {
-        return Vec::new();
-    };
-    arr.iter()
-        .filter_map(|v| v.as_str().map(str::to_owned))
-        .collect()
-}
-
 /// Read the `oscillating` attribute as a `bool` if present.
 ///
 /// HA fan integrations expose oscillation state as a boolean. The
@@ -224,6 +194,21 @@ mod tests {
     use super::*;
     use crate::ha::entity::EntityId;
     use std::sync::Arc;
+
+    /// Test-only helper: read the `preset_modes` attribute as a Vec<String>.
+    /// Not on the hot path — only used in more-info modal and dispatcher
+    /// contexts, so it lives here rather than in production code.
+    fn read_preset_modes_attribute(entity: &Entity) -> Vec<String> {
+        let Some(value) = entity.attributes.get("preset_modes") else {
+            return Vec::new();
+        };
+        let Some(arr) = value.as_array() else {
+            return Vec::new();
+        };
+        arr.iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect()
+    }
 
     /// Construct a minimal [`Entity`] with an empty attribute map.
     /// Mirrors the helper in `src/ui/cover.rs::tests` — uses
@@ -296,7 +281,6 @@ mod tests {
         assert_eq!(vm.state, "garbage_state_name");
         assert!(vm.speed_pct.is_none());
         assert!(vm.current_speed.is_none());
-        assert!(vm.available_speeds.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -372,28 +356,25 @@ mod tests {
     }
 
     #[test]
-    fn available_speeds_reads_preset_modes_array() {
+    fn read_preset_modes_reads_array() {
         let entity = entity_with_attrs("on", r#"{"preset_modes":["Low","Medium","High"]}"#);
-        let vm = FanVM::from_entity(&entity);
         assert_eq!(
-            vm.available_speeds,
+            read_preset_modes_attribute(&entity),
             vec!["Low".to_owned(), "Medium".to_owned(), "High".to_owned()]
         );
     }
 
     #[test]
-    fn available_speeds_absent_is_empty_vec() {
+    fn read_preset_modes_absent_is_empty_vec() {
         let entity = minimal_entity("fan.bedroom", "on");
-        let vm = FanVM::from_entity(&entity);
-        assert!(vm.available_speeds.is_empty());
+        assert!(read_preset_modes_attribute(&entity).is_empty());
     }
 
     #[test]
-    fn available_speeds_drops_non_string_entries() {
+    fn read_preset_modes_drops_non_string_entries() {
         let entity = entity_with_attrs("on", r#"{"preset_modes":["Low",2,null,"High"]}"#);
-        let vm = FanVM::from_entity(&entity);
         assert_eq!(
-            vm.available_speeds,
+            read_preset_modes_attribute(&entity),
             vec!["Low".to_owned(), "High".to_owned()]
         );
     }
