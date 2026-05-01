@@ -29,6 +29,7 @@ use tokio::sync::mpsc;
 use hanui::actions::dispatcher::{DispatchError, Dispatcher, Gesture};
 use hanui::actions::map::{WidgetActionEntry, WidgetActionMap, WidgetId};
 use hanui::actions::Action;
+use hanui::dashboard::profiles::PROFILE_DESKTOP;
 use hanui::ha::client::{AckResult, OutboundCommand, SnapshotApplier, WsClient};
 use hanui::ha::entity::EntityId;
 use hanui::ha::live_store::LiveStore;
@@ -172,7 +173,7 @@ async fn dispatcher_command_round_trips_through_ws_client_and_resolves_ack() {
     // Spawn WsClient::run with the receiver attached.
     let (state_tx, mut state_rx) = status::channel();
     let store_for_ws: Arc<dyn SnapshotApplier> = store.clone();
-    let mut client = WsClient::new(config, state_tx)
+    let mut client = WsClient::new(config, state_tx, &PROFILE_DESKTOP)
         .with_store(store_for_ws)
         .with_registry(services_handle);
     client.set_command_rx(cmd_rx);

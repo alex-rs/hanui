@@ -138,8 +138,8 @@ pub fn run() -> Result<()> {
     assets::icons::init();
 
     match parsed.fixture {
-        Some(path) => run_with_memory_store(&path),
-        None => run_with_live_store(&runtime, parsed.config.as_deref()),
+        Some(path) => run_with_memory_store(&path, profile),
+        None => run_with_live_store(&runtime, parsed.config.as_deref(), profile),
     }
 }
 
@@ -383,7 +383,13 @@ fn init_slint_backend() {
 ///
 /// Used by `cargo run -- --fixture <path>` for local dev and the CI smoke
 /// test.  No env-var validation, no `LiveStore`, no WS connection attempt.
-fn run_with_memory_store(path: &str) -> Result<()> {
+///
+/// `profile` is the [`DeviceProfile`] selected at startup by [`run`]
+/// (TASK-120b F4). Fixture mode does not consume the WS payload caps or the
+/// snapshot buffer, but [`wire_window`] still reads the animation budget
+/// from it; passing the same profile keeps the fixture path observably
+/// consistent with the live path.
+fn run_with_memory_store(path: &str, profile: &'static DeviceProfile) -> Result<()> {
     let store = ha::fixture::load(path).with_context(|| format!("load fixture from {path}"))?;
     info!(entity_count = ?store_entity_count(&store), fixture = %path, "fixture loaded");
 
@@ -392,7 +398,7 @@ fn run_with_memory_store(path: &str) -> Result<()> {
     info!(tile_count = tiles.len(), "tiles built");
 
     let window = MainWindow::new()?;
-    wire_window(&window, &tiles)?;
+    wire_window(&window, &tiles, profile)?;
 
     arm_smoke_exit_timer(&window);
 
@@ -437,7 +443,11 @@ fn run_with_memory_store(path: &str) -> Result<()> {
 /// `ConnectionState` watch channel is updated to `Reconnecting` by
 /// `WsClient`'s FSM on disconnect — `LiveBridge`'s state-watcher flips the
 /// status banner visible.  No token is logged on the failure path; the URL is.
-fn run_with_live_store(runtime: &tokio::runtime::Runtime, config_path: Option<&str>) -> Result<()> {
+fn run_with_live_store(
+    runtime: &tokio::runtime::Runtime,
+    config_path: Option<&str>,
+    profile: &'static DeviceProfile,
+) -> Result<()> {
     let config = Config::from_env()
         .context("load HA connection config from env (HA_URL and HA_TOKEN must both be set)")?;
     info!(url = %config.url, "loaded HA config");
@@ -489,7 +499,7 @@ fn run_with_live_store(runtime: &tokio::runtime::Runtime, config_path: Option<&s
     );
 
     let window = MainWindow::new()?;
-    wire_window(&window, &initial_tiles)?;
+    wire_window(&window, &initial_tiles, profile)?;
     arm_smoke_exit_timer(&window);
 
     // Production sink: hops onto the Slint UI thread for every property write.
@@ -521,6 +531,7 @@ fn run_with_live_store(runtime: &tokio::runtime::Runtime, config_path: Option<&s
         state_tx,
         store_for_ws,
         services_handle,
+        profile,
     ));
 
     // Spawn the bridge.  The returned handle is held until window.run() exits;
@@ -558,14 +569,19 @@ fn run_with_live_store(runtime: &tokio::runtime::Runtime, config_path: Option<&s
 /// through `WsClient::with_registry` so the resulting client and the passed
 /// `LiveStore` share the same backing `Arc<RwLock<ServiceRegistry>>`.
 ///
+/// TASK-120b F4: signature now takes the active [`DeviceProfile`] and
+/// forwards it into [`WsClient::new`] so the WS payload caps and snapshot
+/// buffer follow the dashboard YAML's `device_profile` field.
+///
 /// [`ServiceRegistryHandle`]: crate::ha::services::ServiceRegistryHandle
 fn build_ws_client_with_store(
     config: Config,
     state_tx: tokio::sync::watch::Sender<ConnectionState>,
     store: Arc<dyn SnapshotApplier>,
     services_handle: crate::ha::services::ServiceRegistryHandle,
+    profile: &'static DeviceProfile,
 ) -> WsClient {
-    WsClient::new(config, state_tx)
+    WsClient::new(config, state_tx, profile)
         .with_store(store)
         .with_registry(services_handle)
 }
@@ -640,6 +656,7 @@ async fn run_ws_client(
     state_tx: tokio::sync::watch::Sender<ConnectionState>,
     store: Arc<LiveStore>,
     services_handle: crate::ha::services::ServiceRegistryHandle,
+    profile: &'static DeviceProfile,
 ) {
     use rand::rngs::SmallRng;
     use rand::SeedableRng;
@@ -649,7 +666,7 @@ async fn run_ws_client(
     let snapshot_applier: Arc<dyn SnapshotApplier> = store.clone();
 
     let mut client =
-        build_ws_client_with_store(config, state_tx, snapshot_applier, services_handle);
+        build_ws_client_with_store(config, state_tx, snapshot_applier, services_handle, profile);
     let mut rng = SmallRng::from_entropy();
 
     loop {
@@ -1422,8 +1439,13 @@ mod tests {
         let store_for_ws: Arc<dyn SnapshotApplier> = store.clone();
 
         let (state_tx, _state_rx) = status::channel();
-        let client =
-            build_ws_client_with_store(config, state_tx, store_for_ws, services_handle.clone());
+        let client = build_ws_client_with_store(
+            config,
+            state_tx,
+            store_for_ws,
+            services_handle.clone(),
+            &PROFILE_DESKTOP,
+        );
 
         // Invariant 1: client and store reference the same Arc.  This is the
         // structural proof that `with_registry` and `with_services_handle`
@@ -1585,6 +1607,122 @@ views:
              return PROFILE_RPI4 for `device_profile: rpi4` (rejects regression \
              to PROFILE_DESKTOP fallback)"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-120b F4 — profile threading
+    //
+    // The bootstrap pre-flight selects a `&'static DeviceProfile` from the
+    // dashboard YAML's `device_profile` field. TASK-120b threads that
+    // reference through every downstream consumer that previously
+    // hard-coded `PROFILE_DESKTOP`. The test below pins the wiring
+    // end-to-end at the `WsClient` boundary: an `opi_zero3` YAML must
+    // produce a `WsClient` whose `profile()` accessor returns
+    // `PROFILE_OPI_ZERO3` (NOT the desktop fallback), and the OPI-specific
+    // constants `ws_payload_cap` / `snapshot_buffer_events` must reach the
+    // FSM unchanged.
+    //
+    // Pre-TASK-120b regression mode: every dashboard, regardless of YAML,
+    // ran with the desktop payload cap (16 MiB) and snapshot buffer
+    // (10 000 events), which silently broke the SBC memory budget. This
+    // test catches that regression by asserting the OPI-specific values
+    // (8 MiB and 2 500 events) are observable on the constructed client.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dashboard_with_opi_zero3_profile_wires_opi_constants_into_runtime() {
+        use crate::dashboard::profiles::{PROFILE_DESKTOP, PROFILE_OPI_ZERO3};
+        use std::sync::Mutex;
+
+        // Serialised against other env-mutating tests in this module.
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap();
+
+        // Step 1: pin OPI ≠ Desktop on the two fields actually threaded
+        // through `WsClient::new` (TASK-120b F4 read sites in
+        // `src/ha/client.rs::run` and the snapshot overflow arm in
+        // `handle_message`). Without this guard a future profile-table
+        // edit that accidentally aligned the two presets would make the
+        // wiring assertion below trivially pass.
+        assert_ne!(
+            PROFILE_OPI_ZERO3.ws_payload_cap, PROFILE_DESKTOP.ws_payload_cap,
+            "PROFILE_OPI_ZERO3.ws_payload_cap must differ from PROFILE_DESKTOP \
+             so the wiring assertion below has bite"
+        );
+        assert_ne!(
+            PROFILE_OPI_ZERO3.snapshot_buffer_events, PROFILE_DESKTOP.snapshot_buffer_events,
+            "PROFILE_OPI_ZERO3.snapshot_buffer_events must differ from \
+             PROFILE_DESKTOP so the wiring assertion below has bite"
+        );
+
+        // Step 2: a dashboard YAML with `device_profile: opi-zero3` resolves
+        // to PROFILE_OPI_ZERO3 via the bootstrap pre-flight.
+        let yaml = r#"version: 1
+device_profile: opi-zero3
+default_view: home
+views:
+  - id: home
+    title: Home
+    layout: sections
+    sections: []
+"#;
+        let path = write_tmp_yaml(yaml);
+        let profile: &'static DeviceProfile = early_load_profile(&path);
+        assert_eq!(
+            *profile, PROFILE_OPI_ZERO3,
+            "opi-zero3 YAML must resolve to PROFILE_OPI_ZERO3"
+        );
+
+        // Step 3: build a Config (env-driven) so `WsClient::new` can be
+        // invoked. SAFETY: serialised via LOCK above.
+        unsafe {
+            std::env::set_var("HA_URL", "ws://127.0.0.1:0/api/websocket");
+            std::env::set_var("HA_TOKEN", "tok-task-120b-opi-wiring");
+        }
+        let config = Config::from_env().expect("env-driven Config::from_env must succeed");
+        unsafe {
+            std::env::remove_var("HA_URL");
+            std::env::remove_var("HA_TOKEN");
+        }
+
+        // Step 4: construct the client through the same factory
+        // `run_with_live_store` uses, threading the OPI profile.
+        let services_handle = crate::ha::services::ServiceRegistry::new_handle();
+        let store: Arc<LiveStore> =
+            Arc::new(LiveStore::new().with_services_handle(services_handle.clone()));
+        let store_for_ws: Arc<dyn SnapshotApplier> = store.clone();
+        let (state_tx, _state_rx) = status::channel();
+        let client =
+            build_ws_client_with_store(config, state_tx, store_for_ws, services_handle, profile);
+
+        // Step 5: the client carries the OPI profile, and the OPI-specific
+        // values are reachable via the public accessor. This is the proof
+        // that `&PROFILE_OPI_ZERO3` survived the journey from
+        // `early_load_profile` → `run_with_live_store` →
+        // `build_ws_client_with_store` → `WsClient::new`. If any link in
+        // that chain dropped the profile and fell back to PROFILE_DESKTOP,
+        // both ws_payload_cap (8 MiB vs 16 MiB) and snapshot_buffer_events
+        // (2 500 vs 10 000) would be wrong.
+        assert_eq!(
+            *client.profile(),
+            PROFILE_OPI_ZERO3,
+            "WsClient::profile() must return PROFILE_OPI_ZERO3 after threading \
+             through run() → run_with_live_store → build_ws_client_with_store"
+        );
+        assert_eq!(
+            client.profile().ws_payload_cap,
+            PROFILE_OPI_ZERO3.ws_payload_cap,
+            "OPI ws_payload_cap (8 MiB) must reach WsClient — regression to \
+             PROFILE_DESKTOP would surface as 16 MiB here"
+        );
+        assert_eq!(
+            client.profile().snapshot_buffer_events,
+            PROFILE_OPI_ZERO3.snapshot_buffer_events,
+            "OPI snapshot_buffer_events (2 500) must reach WsClient — \
+             regression to PROFILE_DESKTOP would surface as 10 000 here"
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 

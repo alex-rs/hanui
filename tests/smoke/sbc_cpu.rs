@@ -52,7 +52,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hanui::dashboard::profiles::PROFILE_DESKTOP;
+use hanui::dashboard::profiles::{DeviceProfile, PROFILE_DESKTOP};
 use hanui::ha::client::WsClient;
 use hanui::ha::live_store::LiveStore;
 use hanui::platform::config::Config;
@@ -146,7 +146,7 @@ async fn wait_for_state(
 // The CPU smoke scenario
 // ---------------------------------------------------------------------------
 
-/// 60 s churn at 50 ev/s — average CPU% must stay ≤ PROFILE_DESKTOP.cpu_smoke_budget_pct.
+/// 60 s churn at 50 ev/s — average CPU% must stay ≤ `profile.cpu_smoke_budget_pct`.
 ///
 /// Scenario:
 /// 1. Start mock WS server and script a full happy-path handshake.
@@ -162,11 +162,25 @@ async fn wait_for_state(
 /// The 60 s run is intentionally short: at 50 ev/s the mock generates
 /// 3 000 events, which is enough to surface hot-path regressions without
 /// making the CI nightly budget painful.
+///
+/// # TASK-120b F4 — profile threading
+///
+/// The CPU budget is read from a local [`DeviceProfile`] reference rather
+/// than directly from `PROFILE_DESKTOP`; the same reference is threaded
+/// into [`WsClient::new`] (where it now governs `ws_payload_cap` and
+/// `snapshot_buffer_events`). Today this binding is `&PROFILE_DESKTOP`
+/// because the smoke harness has no dashboard YAML to consult; TASK-122
+/// will widen the harness to honour `device_profile` from the YAML.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sbc_cpu_smoke_50evs_60s_below_budget() {
     const CHURN_SECS: u64 = 60;
     const EV_PER_SEC: u64 = 50;
     const TOTAL_EVENTS: u64 = CHURN_SECS * EV_PER_SEC;
+
+    // TASK-120b F4 read-site fix: bind the profile once and feed both the
+    // WsClient construction and the budget assertion from the same source.
+    // TASK-122 will replace this with the YAML-driven selection.
+    let profile: &'static DeviceProfile = &PROFILE_DESKTOP;
 
     let server = MockWsServer::start().await;
 
@@ -180,7 +194,7 @@ async fn sbc_cpu_smoke_50evs_60s_below_budget() {
     let store = Arc::new(LiveStore::new());
     let config = make_config(&server.ws_url, "tok-sbc-smoke");
     let (state_tx, mut state_rx) = status::channel();
-    let client = WsClient::new(config, state_tx).with_store(store.clone());
+    let client = WsClient::new(config, state_tx, profile).with_store(store.clone());
     let client_handle = tokio::spawn(async move {
         let mut c = client;
         c.run().await
@@ -234,7 +248,7 @@ async fn sbc_cpu_smoke_50evs_60s_below_budget() {
     // Assert CPU budget
     // -----------------------------------------------------------------------
 
-    let budget_pct = f64::from(PROFILE_DESKTOP.cpu_smoke_budget_pct);
+    let budget_pct = f64::from(profile.cpu_smoke_budget_pct);
 
     match (cpu_start, cpu_end) {
         (Some(start), Some(end)) => {
@@ -249,7 +263,7 @@ async fn sbc_cpu_smoke_50evs_60s_below_budget() {
             assert!(
                 avg_cpu_pct <= budget_pct,
                 "sbc_cpu_smoke: average CPU% {avg_cpu_pct:.1}% exceeds \
-                 PROFILE_DESKTOP.cpu_smoke_budget_pct={budget_pct}% \
+                 profile.cpu_smoke_budget_pct={budget_pct}% \
                  (cpu_secs={cpu_secs:.2} wall_secs={wall_secs:.2}). \
                  Check for hot-path regressions in the WS+LiveStore loop."
             );

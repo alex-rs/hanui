@@ -197,7 +197,7 @@ fn spawn_client(
     tokio::task::JoinHandle<Result<(), ClientError>>,
 ) {
     let (state_tx, state_rx) = status::channel();
-    let client = WsClient::new(config, state_tx).with_store(store);
+    let client = WsClient::new(config, state_tx, &PROFILE_DESKTOP).with_store(store);
     let handle = tokio::spawn(async move {
         let mut c = client;
         c.run().await

@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
+use hanui::dashboard::profiles::PROFILE_DESKTOP;
 use hanui::ha::client::{ClientError, WsClient};
 use hanui::ha::live_store::LiveStore;
 use hanui::ha::store::EntityStore;
@@ -56,7 +57,11 @@ fn spawn_client(
     tokio::task::JoinHandle<Result<(), ClientError>>,
 ) {
     let (state_tx, state_rx) = status::channel();
-    let mut client = WsClient::new(config, state_tx);
+    // TASK-120b F4: tests stay on PROFILE_DESKTOP so existing payload-cap +
+    // snapshot-buffer expectations are preserved. The opi_zero3 wiring
+    // assertion lives in `lib.rs::tests` (see
+    // `dashboard_with_opi_zero3_profile_wires_opi_constants_into_runtime`).
+    let mut client = WsClient::new(config, state_tx, &PROFILE_DESKTOP);
     if let Some(s) = store {
         client = client.with_store(s);
     }
@@ -423,7 +428,7 @@ async fn scenario_entity_removal_carries_none_and_drops_from_store() {
 async fn scenario_id_correlation_out_of_order_replies() {
     let config = make_config("ws://127.0.0.1:1/api/websocket", "tok-corr");
     let (state_tx, _state_rx) = status::channel();
-    let mut client = WsClient::new(config, state_tx);
+    let mut client = WsClient::new(config, state_tx, &PROFILE_DESKTOP);
 
     let rx10 = client.register_pending(10);
     let rx20 = client.register_pending(20);
@@ -570,7 +575,7 @@ async fn scenario_reconnect_resync_only_broadcasts_changed_entities() {
 
     let config1 = make_config(&server1.ws_url, "tok-resync-1");
     let (state_tx1, mut state_rx1) = status::channel();
-    let client1 = WsClient::new(config1, state_tx1).with_store(store.clone());
+    let client1 = WsClient::new(config1, state_tx1, &PROFILE_DESKTOP).with_store(store.clone());
     let handle1 = tokio::spawn(async move {
         let mut c = client1;
         c.run().await
@@ -622,7 +627,7 @@ async fn scenario_reconnect_resync_only_broadcasts_changed_entities() {
 
     let config2 = make_config(&server2.ws_url, "tok-resync-2");
     let (state_tx2, mut state_rx2) = status::channel();
-    let client2 = WsClient::new(config2, state_tx2).with_store(store.clone());
+    let client2 = WsClient::new(config2, state_tx2, &PROFILE_DESKTOP).with_store(store.clone());
     let handle2 = tokio::spawn(async move {
         let mut c = client2;
         c.run().await
@@ -803,7 +808,7 @@ async fn scenario_consecutive_overflow_circuit_breaker_trips() {
 
     let config = make_config(&server.ws_url, "tok-cb-fsm");
     let (state_tx, state_rx) = status::channel();
-    let mut client = WsClient::new(config, state_tx);
+    let mut client = WsClient::new(config, state_tx, &PROFILE_DESKTOP);
 
     // Overflow #1 — Transport error, breaker counter increments to 1.
     let err1 = drive_one_fsm_overflow(&server, &mut client).await;
@@ -1009,7 +1014,7 @@ async fn scenario_services_registry_visible_from_test_task_via_live_store() {
 
     let config = make_config(&server.ws_url, "tok-task-048-cross-task");
     let (state_tx, mut state_rx) = status::channel();
-    let mut client = WsClient::new(config, state_tx)
+    let mut client = WsClient::new(config, state_tx, &PROFILE_DESKTOP)
         .with_store(store_for_ws)
         .with_registry(services_handle.clone());
 
@@ -1147,7 +1152,7 @@ async fn scenario_service_registered_event_updates_registry() {
 
     let config = make_config(&server.ws_url, "tok-svc-registered");
     let (state_tx, mut state_rx) = status::channel();
-    let mut client = WsClient::new(config, state_tx)
+    let mut client = WsClient::new(config, state_tx, &PROFILE_DESKTOP)
         .with_store(store_for_ws)
         .with_registry(services_handle.clone());
 
@@ -1236,7 +1241,7 @@ async fn scenario_service_removed_event_evicts_from_registry() {
 
     let config = make_config(&server.ws_url, "tok-svc-removed");
     let (state_tx, mut state_rx) = status::channel();
-    let mut client = WsClient::new(config, state_tx)
+    let mut client = WsClient::new(config, state_tx, &PROFILE_DESKTOP)
         .with_store(store_for_ws)
         .with_registry(services_handle.clone());
 

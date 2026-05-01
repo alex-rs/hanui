@@ -3,9 +3,18 @@
 //! # Entry point
 //!
 //! ```ignore
-//! pub fn validate(dashboard: &Dashboard, profile: &DeviceProfile)
+//! pub fn validate(dashboard: &Dashboard, profile: &'static DeviceProfile)
 //!     -> (Vec<Issue>, CallServiceAllowlist)
 //! ```
+//!
+//! TASK-120b F4 tightened the `profile` parameter from `&DeviceProfile` to
+//! `&'static DeviceProfile` to match the rest of the device-profile
+//! threading across the live-path entry points (`WsClient::new`,
+//! `wire_window`, `run_with_live_store`). Every shipped profile lives in
+//! `static` storage (`PROFILE_DESKTOP`, `PROFILE_OPI_ZERO3`,
+//! `PROFILE_RPI4`), so the lifetime change is observably neutral but
+//! prevents a future caller from passing a stack-local profile struct that
+//! would not survive the full live-path lifetime.
 //!
 //! The validator runs in two logical passes:
 //!
@@ -509,7 +518,7 @@ fn check_widget(widget: &Widget, ctx: &WidgetCtx<'_>, issues: &mut Vec<Issue>) {
 /// allowlist is irrelevant.
 pub fn validate(
     dashboard: &Dashboard,
-    profile: &DeviceProfile,
+    profile: &'static DeviceProfile,
 ) -> (Vec<Issue>, CallServiceAllowlist) {
     // Pass 1: build the CallService allowlist from all declared actions.
     let allowlist = build_allowlist(dashboard);
