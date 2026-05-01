@@ -442,15 +442,37 @@ impl MoreInfoBody for FanBody {
     }
 }
 
-/// More-info body for `lock` entities.
+/// More-info body for `lock` entities (TASK-104).
 ///
-/// Returns the entity's state. Phase 6a (`TASK-104`) will replace this with a
-/// PIN entry integration.
+/// Renders lock-specific rows: state, battery level (when exposed),
+/// jammed indicator (when the entity is in the `jammed` state), and the
+/// `code_format` hint (when exposed). The Slint shell already binds
+/// `body-rows` to the modal's row list, so [`LockBody`] reuses the
+/// generic rendering path — keeping the trait shape stable per
+/// TASK-098 + TASK-104.
+///
+/// # PIN entry integration (locked_decisions.pin_entry_dispatch)
+///
+/// The richer PIN-entry UI is dispatcher-side: tapping unlock dispatches
+/// `Action::Unlock` (TASK-099) and the dispatcher invokes
+/// `PinEntryHost::request_pin` via `crate::ui::bridge::SlintPinHost`
+/// when the widget's `pin_policy` is `Required`. This body surfaces
+/// only the *current* snapshot of the entity (state, battery, jammed,
+/// code_format), keeping the modal informative without duplicating the
+/// dispatcher's PIN-policy lookup.
+///
+/// # Stateless
+///
+/// `LockBody` carries no fields; the body queries the live entity at
+/// `render_rows` time. Per locked_decisions.more_info_modal, the body
+/// is invoked exactly once per modal-open — so the per-call attribute
+/// reads are not on a hot path.
 #[derive(Debug, Default)]
 pub struct LockBody;
 
 impl LockBody {
-    /// Construct a [`LockBody`].
+    /// Construct a [`LockBody`]. Stateless; the constructor exists so callers
+    /// do not depend on `Default`.
     #[must_use]
     pub fn new() -> Self {
         LockBody
@@ -459,10 +481,53 @@ impl LockBody {
 
 impl MoreInfoBody for LockBody {
     fn render_rows(&self, entity: &Entity) -> Vec<ModalRow> {
-        vec![ModalRow {
+        // Capacity of 4 covers the worst case (state + battery + jammed
+        // + code_format) without growing.
+        let mut rows = Vec::with_capacity(4);
+
+        // State row — always emitted, matches the per-domain stub
+        // contract every other body upholds.
+        rows.push(ModalRow {
             key: "state".to_owned(),
             value: entity.state.as_ref().to_owned(),
-        }]
+        });
+
+        // Battery level row, only when the entity exposes the
+        // `battery_level` attribute. The shared `read_battery_level_attribute`
+        // helper in `crate::ui::lock` keeps the parsing rules identical
+        // for the body and any future tile-level battery indicator.
+        if let Some(level) = crate::ui::lock::read_battery_level_attribute(entity) {
+            rows.push(ModalRow {
+                key: "battery".to_owned(),
+                value: format!("{level}%"),
+            });
+        }
+
+        // Jammed indicator. HA reports a jammed lock by setting the
+        // entity's state itself to `"jammed"` (rather than via a
+        // separate attribute), so this row fires off the state string.
+        // Surfacing the warning explicitly in the modal lets the user
+        // confirm the lock's mechanical condition without inspecting
+        // the entity in HA's own UI.
+        if entity.state.as_ref() == "jammed" {
+            rows.push(ModalRow {
+                key: "jammed".to_owned(),
+                value: "true".to_owned(),
+            });
+        }
+
+        // code_format row, only when the string attribute is present.
+        // Standard HA values are `"number"` / `"text"`; we surface the
+        // raw value verbatim so any integration-specific format names
+        // pass through unchanged.
+        if let Some(fmt) = crate::ui::lock::read_code_format_attribute(entity) {
+            rows.push(ModalRow {
+                key: "code_format".to_owned(),
+                value: fmt,
+            });
+        }
+
+        rows
     }
 }
 

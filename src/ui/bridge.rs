@@ -267,6 +267,56 @@ pub struct FanTileVM {
 }
 
 // ---------------------------------------------------------------------------
+// LockTileVM (TASK-104)
+// ---------------------------------------------------------------------------
+
+/// View-model for a `LockTile` widget, mirroring the Slint `LockTileVM`
+/// struct in `ui/slint/lock_tile.slint`.
+///
+/// Built by [`compute_lock_tile_vm`], which threads through
+/// [`crate::ui::lock::LockVM::from_entity`] to derive the `is_locked`
+/// boolean used by the Slint tile's locked / unlocked colour branches.
+/// The unavailable / jammed state colours are driven by the verbatim
+/// `state` string match in the Slint tile itself.
+///
+/// The `icon: image` Slint field is absent here; it is written by the
+/// Slint bridge during property wiring (the same pattern used for
+/// `LightTileVM` / `SensorTileVM` / `EntityTileVM` / `CoverTileVM` /
+/// `FanTileVM`).
+///
+/// Note (TASK-104 scope): the `MainWindow` Slint component does not yet
+/// declare a `lock-tiles` array property — `ui/slint/main_window.slint`
+/// is in this ticket's `must_not_touch` list. `compute_lock_tile_vm` is
+/// invoked indirectly via [`build_tiles`] so lock entities exercise the
+/// `LockVM::from_entity` path on every state change, and the result
+/// flows into the existing fallback `EntityTileVM` render with the raw
+/// state string. A subsequent ticket will amend `main_window.slint` to
+/// render a per-kind `LockTile` model directly.
+///
+/// `pending` is the per-tile spinner gate added in TASK-067; see
+/// [`LightTileVM`] for the full contract.
+///
+/// # No `Vec` fields
+///
+/// Per the TASK-103 audit lesson, this struct stays lean: no `Vec` is
+/// allocated for fields the tile renderer never reads. PIN-policy and
+/// confirm-flag data are looked up by the dispatcher via its
+/// `lock_settings` table at dispatch time, not stored on every per-frame
+/// tile VM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockTileVM {
+    pub name: String,
+    pub state: String,
+    pub is_locked: bool,
+    pub icon_id: String,
+    pub preferred_columns: i32,
+    pub preferred_rows: i32,
+    pub placement: TilePlacement,
+    /// Per-tile spinner gate (TASK-067). Default `false`.
+    pub pending: bool,
+}
+
+// ---------------------------------------------------------------------------
 // TileVM enum
 // ---------------------------------------------------------------------------
 
@@ -626,16 +676,40 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                                     pending: false,
                                 })
                             }
-                            // Phase 4 schema adds Camera, History, Lock, Alarm
+                            // TASK-104: lock entities flow through
+                            // `LockVM::from_entity` so the per-frame derived
+                            // `is_locked` boolean is available to the bridge.
+                            // Until `main_window.slint` grows a `lock-tiles`
+                            // array property (subsequent ticket), the lock
+                            // tile renders as the generic `EntityTileVM`
+                            // fallback — but the `state` string is forwarded
+                            // verbatim so the user sees "locked" / "unlocked"
+                            // / "jammed" / "unavailable" directly. The
+                            // `LockVM` itself is exposed via
+                            // `compute_lock_tile_vm` for the per-kind
+                            // rendering path that follows when
+                            // `main_window.slint` gains the array property.
+                            WidgetKind::Lock => {
+                                let _lock_vm = crate::ui::lock::LockVM::from_entity(&entity);
+                                TileVM::Entity(EntityTileVM {
+                                    name,
+                                    state,
+                                    icon_id,
+                                    preferred_columns,
+                                    preferred_rows,
+                                    placement,
+                                    pending: false,
+                                })
+                            }
+                            // Phase 4 schema adds Camera, History, Alarm
                             // variants. Phase 6 adds MediaPlayer, Climate,
                             // PowerFlow. Until dedicated Slint tile components exist
-                            // (TASK-104..TASK-109), these are rendered as EntityTileVM —
+                            // (TASK-105..TASK-109), these are rendered as EntityTileVM —
                             // the generic entity tile covers the state display until
                             // per-kind tiles ship.
                             WidgetKind::EntityTile
                             | WidgetKind::Camera
                             | WidgetKind::History
-                            | WidgetKind::Lock
                             | WidgetKind::Alarm
                             | WidgetKind::MediaPlayer
                             | WidgetKind::Climate
@@ -2003,6 +2077,33 @@ pub mod fan_tile_slint {
 pub use fan_tile_slint::{FanTile, FanTilePlacement as SlintFanTilePlacement};
 
 // ---------------------------------------------------------------------------
+// LockTile Slint module (TASK-104)
+// ---------------------------------------------------------------------------
+//
+// `ui/slint/lock_tile.slint` is compiled by `build.rs` (TASK-104) to a
+// separate generated Rust file exposed via the `HANUI_LOCK_TILE_INCLUDE`
+// env var — the same pattern as `fan_tile.slint` (TASK-103),
+// `cover_tile.slint` (TASK-102), `pin_entry.slint` (TASK-100),
+// `view_switcher.slint` (TASK-086), and `gesture_test_window.slint`
+// (TASK-060). This module picks it up via `include!` so the generated
+// `LockTile`, `LockTileVM`, and `LockTilePlacement` types are available
+// for the `compute_lock_tile_vm` projection function below without
+// polluting the production `slint_ui` namespace (which would clash with
+// the same-named Rust struct declared earlier in this file).
+//
+// Future work: once `main_window.slint` grows a `lock-tiles` array
+// property, this module's types will be re-exported through the
+// production `slint_ui` namespace instead. The separate compile is the
+// minimal-blast path that satisfies TASK-104's "Slint compile gate"
+// acceptance criterion (lock_tile.slint must be in the build graph)
+// without amending any of the protected `must_not_touch` Slint files.
+pub mod lock_tile_slint {
+    include!(env!("HANUI_LOCK_TILE_INCLUDE"));
+}
+
+pub use lock_tile_slint::{LockTile, LockTilePlacement as SlintLockTilePlacement};
+
+// ---------------------------------------------------------------------------
 // compute_cover_tile_vm (TASK-102)
 // ---------------------------------------------------------------------------
 
@@ -2129,6 +2230,60 @@ pub fn compute_fan_tile_vm(
         is_on: fan_vm.is_on,
         current_speed: current_speed_value,
         has_current_speed,
+        icon_id,
+        preferred_columns,
+        preferred_rows,
+        placement,
+        pending: false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// compute_lock_tile_vm (TASK-104)
+// ---------------------------------------------------------------------------
+
+/// Project a typed Rust [`LockTileVM`] from a live entity snapshot, threading
+/// through [`crate::ui::lock::LockVM::from_entity`] for the per-frame derived
+/// `is_locked` boolean.
+///
+/// # Hot-path discipline
+///
+/// Called at entity-change time (NOT per render). The result is a typed
+/// `LockTileVM` Rust struct; the further `String -> SharedString` /
+/// `icon_id -> Image` conversions are deferred to a follow-up ticket once
+/// `main_window.slint` declares the `lock-tiles` array property.
+///
+/// # No `Vec` allocation
+///
+/// Per the TASK-103 audit lesson: this projection allocates only the
+/// scalar `state`/`name`/`icon_id` strings the tile actually renders. PIN
+/// policy and confirmation flag are NOT read here — they are dispatcher
+/// concerns, looked up via the dispatcher's per-widget `lock_settings`
+/// table at dispatch time. The tile VM stays lean.
+///
+/// # Naming
+///
+/// Returns the Rust [`LockTileVM`] (defined earlier in this file). The
+/// Slint-shape projection (`SlintLockTileVM` from
+/// [`lock_tile_slint::LockTileVM`]) is not built here because there is
+/// no `lock-tiles` `MainWindow` property to write into yet — that
+/// shape conversion lives next to the `set_lock_tiles` call site once
+/// it exists.
+#[must_use]
+pub fn compute_lock_tile_vm(
+    name: String,
+    icon_id: String,
+    preferred_columns: i32,
+    preferred_rows: i32,
+    placement: TilePlacement,
+    entity: &crate::ha::entity::Entity,
+) -> LockTileVM {
+    let lock_vm = crate::ui::lock::LockVM::from_entity(entity);
+
+    LockTileVM {
+        name,
+        state: entity.state.as_ref().to_owned(),
+        is_locked: lock_vm.is_locked,
         icon_id,
         preferred_columns,
         preferred_rows,
@@ -7014,5 +7169,197 @@ mod tests {
         assert!(!rows.iter().any(|r| r.key == "preset_mode"));
         assert!(!rows.iter().any(|r| r.key == "oscillating"));
         assert!(!rows.iter().any(|r| r.key == "direction"));
+    }
+
+    // -----------------------------------------------------------------------
+    // LockTileVM / compute_lock_tile_vm tests (TASK-104)
+    // -----------------------------------------------------------------------
+
+    /// `compute_lock_tile_vm` produces the typed Rust [`LockTileVM`] from
+    /// an entity, threading the lock-state derivation through
+    /// `LockVM::from_entity`. Sanity-check the output for a locked door.
+    #[test]
+    fn compute_lock_tile_vm_locked_state() {
+        let entity = make_test_entity("lock.front_door", "locked");
+        let vm = compute_lock_tile_vm(
+            "Front Door".to_owned(),
+            "mdi:lock".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.name, "Front Door");
+        assert_eq!(vm.state, "locked");
+        assert!(vm.is_locked, "locked state must produce is_locked=true");
+        assert!(!vm.pending);
+    }
+
+    /// `compute_lock_tile_vm` for an unlocked door sets `is_locked=false`.
+    #[test]
+    fn compute_lock_tile_vm_unlocked_state() {
+        let entity = make_test_entity("lock.front_door", "unlocked");
+        let vm = compute_lock_tile_vm(
+            "Front Door".to_owned(),
+            "mdi:lock-open".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.state, "unlocked");
+        assert!(!vm.is_locked);
+    }
+
+    /// `compute_lock_tile_vm` forwards the canonical `"jammed"` HA state
+    /// verbatim. The Slint tile branches on this string for the
+    /// jammed-tint render — the bridge does not muddy the state.
+    #[test]
+    fn compute_lock_tile_vm_jammed_state() {
+        let entity = make_test_entity("lock.front_door", "jammed");
+        let vm = compute_lock_tile_vm(
+            "Front Door".to_owned(),
+            "mdi:lock-alert".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.state, "jammed", "state forwarded verbatim");
+        assert!(!vm.is_locked, "jammed is not locked");
+    }
+
+    /// `compute_lock_tile_vm` for `"locking"` / `"unlocking"` colours
+    /// with the destination state.
+    #[test]
+    fn compute_lock_tile_vm_locking_colors_locked() {
+        let entity = make_test_entity("lock.front_door", "locking");
+        let vm = compute_lock_tile_vm(
+            "Front Door".to_owned(),
+            "mdi:lock".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.state, "locking");
+        assert!(
+            vm.is_locked,
+            "locking colours with destination (is_locked=true)"
+        );
+    }
+
+    /// `build_tiles` for a `WidgetKind::Lock` widget exercises the
+    /// `LockVM::from_entity` path and produces an `EntityTileVM` with the
+    /// raw HA state forwarded verbatim. This confirms the bridge dispatches
+    /// the lock state-change through the LockVM per TASK-104 AC #8.
+    #[test]
+    fn build_tiles_lock_widget_forwards_state_verbatim() {
+        use crate::ha::store::MemoryStore;
+
+        let store = MemoryStore::load(vec![make_test_entity("lock.front_door", "locked")])
+            .expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("lock.front_door", WidgetKind::Lock);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1);
+        match &tiles[0] {
+            TileVM::Entity(vm) => {
+                assert_eq!(
+                    vm.state, "locked",
+                    "lock state forwarded verbatim (no enrichment)"
+                );
+            }
+            other => panic!("expected EntityTileVM (Lock fallback), got {other:?}"),
+        }
+    }
+
+    /// `build_tiles` for a `WidgetKind::Lock` widget routes a `"jammed"`
+    /// entity through the bridge without altering the state string.
+    #[test]
+    fn build_tiles_lock_widget_jammed_state_passes_through() {
+        use crate::ha::store::MemoryStore;
+
+        let store = MemoryStore::load(vec![make_test_entity("lock.front_door", "jammed")])
+            .expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("lock.front_door", WidgetKind::Lock);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1);
+        match &tiles[0] {
+            TileVM::Entity(vm) => {
+                assert_eq!(vm.state, "jammed");
+            }
+            other => panic!("expected EntityTileVM (Lock fallback), got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // LockBody more-info richer impl (TASK-104)
+    // -----------------------------------------------------------------------
+
+    /// `LockBody::render_rows` emits a `battery` row when the entity has
+    /// the `battery_level` attribute.
+    #[test]
+    fn lock_body_emits_battery_row_when_attribute_present() {
+        use crate::ui::more_info::{LockBody, MoreInfoBody};
+        let entity = entity_with_attr("locked", "battery_level", "78");
+        let entity = Entity {
+            id: EntityId::from("lock.front_door"),
+            ..entity
+        };
+        let rows = LockBody::new().render_rows(&entity);
+        assert!(rows.iter().any(|r| r.key == "state" && r.value == "locked"));
+        assert!(
+            rows.iter().any(|r| r.key == "battery" && r.value == "78%"),
+            "LockBody must emit a battery row when battery_level is set; got {rows:?}"
+        );
+    }
+
+    /// `LockBody::render_rows` emits a `jammed=true` row when the entity
+    /// state is `"jammed"`. HA exposes the jammed signal via the state
+    /// itself (no separate attribute).
+    #[test]
+    fn lock_body_emits_jammed_row_when_state_is_jammed() {
+        use crate::ui::more_info::{LockBody, MoreInfoBody};
+        let entity = make_test_entity("lock.front_door", "jammed");
+        let rows = LockBody::new().render_rows(&entity);
+        assert!(
+            rows.iter().any(|r| r.key == "jammed" && r.value == "true"),
+            "LockBody must emit a jammed row when state=jammed; got {rows:?}"
+        );
+    }
+
+    /// `LockBody::render_rows` emits a `code_format` row when the string
+    /// attribute is present.
+    #[test]
+    fn lock_body_emits_code_format_row_when_attribute_present() {
+        use crate::ui::more_info::{LockBody, MoreInfoBody};
+        let entity = entity_with_attr("locked", "code_format", "\"number\"");
+        let entity = Entity {
+            id: EntityId::from("lock.front_door"),
+            ..entity
+        };
+        let rows = LockBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "code_format" && r.value == "number"),
+            "LockBody must emit a code_format row when set; got {rows:?}"
+        );
+    }
+
+    /// `LockBody::render_rows` skips optional rows when their attributes
+    /// are absent.
+    #[test]
+    fn lock_body_skips_optional_rows_when_attributes_absent() {
+        use crate::ui::more_info::{LockBody, MoreInfoBody};
+        let entity = make_test_entity("lock.front_door", "locked");
+        let rows = LockBody::new().render_rows(&entity);
+        // state row is always emitted.
+        assert!(rows.iter().any(|r| r.key == "state"));
+        // optional rows must be absent.
+        assert!(!rows.iter().any(|r| r.key == "battery"));
+        assert!(!rows.iter().any(|r| r.key == "jammed"));
+        assert!(!rows.iter().any(|r| r.key == "code_format"));
     }
 }
