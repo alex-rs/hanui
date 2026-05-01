@@ -464,7 +464,7 @@ fn run_with_live_store(
 
     // Load, parse, and validate the YAML config. Errors produce the fullscreen
     // error screen in Phase 4; for now surface them via anyhow.
-    let dashboard: Dashboard = loader::load(&dashboard_path, &config)
+    let dashboard: Dashboard = loader::load(&dashboard_path, &config, profile)
         .with_context(|| format!("load dashboard config from {}", dashboard_path.display()))?;
     info!(
         views = dashboard.views.len(),
