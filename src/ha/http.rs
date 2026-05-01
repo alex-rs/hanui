@@ -17,9 +17,10 @@
 //! - **TTL eviction**: entries older than `DeviceProfile.http_cache_ttl_s` seconds
 //!   are treated as stale and re-fetched on next access.
 //! - **Per-host rate limit**: token-bucket limiter; excess requests wait up to
-//!   `HTTP_REQUEST_TIMEOUT_MS` or return [`HttpError::RateLimited`].
+//!   `DeviceProfile.http_request_timeout_ms` or return [`HttpError::RateLimited`].
 //! - **Retry budget**: failed requests are retried with exponential backoff + jitter
-//!   up to `HTTP_RETRY_BUDGET` times, total time bounded by `HTTP_REQUEST_TIMEOUT_MS`.
+//!   up to `DeviceProfile.http_retry_budget` times, total time bounded by
+//!   `DeviceProfile.http_request_timeout_ms`.
 //!
 //! # Cache key
 //!
@@ -62,29 +63,8 @@ use crate::dashboard::profiles::DeviceProfile;
 use crate::platform::config::Config;
 
 // ---------------------------------------------------------------------------
-// Per-client rate-limit and retry constants
+// Backoff constants (not profile-bound — uniform across all devices)
 // ---------------------------------------------------------------------------
-
-/// Maximum number of retries per request (exponential-backoff with jitter).
-///
-/// Phase 4 plan references `DeviceProfile.http_retry_budget`. Until that field
-/// is added to `DeviceProfile`, this constant is the implementation-level
-/// default. TASK-097 acceptance specifies that retry count is bounded by this
-/// value.
-pub const HTTP_RETRY_BUDGET: u32 = 3;
-
-/// Total per-request timeout in milliseconds (includes retries + backoff).
-///
-/// Phase 4 plan references `DeviceProfile.http_request_timeout_ms`. This
-/// constant provides the implementation-level default pending that field.
-pub const HTTP_REQUEST_TIMEOUT_MS: u64 = 10_000;
-
-/// Maximum per-host requests-per-second (token-bucket capacity).
-///
-/// Phase 4 plan references `DeviceProfile.http_rate_limit_per_host_qps`.
-/// This constant provides the implementation-level default: 10 QPS is
-/// conservative for HA's REST API on a local LAN.
-pub const HTTP_RATE_LIMIT_QPS: u32 = 10;
 
 /// Minimum backoff before the first retry (milliseconds).
 const BACKOFF_BASE_MS: u64 = 100;
@@ -400,8 +380,8 @@ impl HaHttpClient {
     ///
     /// - `config`: shared HA config (provides Bearer token).
     /// - `profile`: active device profile (provides cache size, TTL, max
-    ///   image dimension). Rate-limit QPS and retry budget use built-in
-    ///   constants until `DeviceProfile` exposes those fields.
+    ///   image dimension, retry budget, request timeout, and per-host QPS
+    ///   rate limit).
     pub fn new(config: Arc<Config>, profile: &DeviceProfile) -> Self {
         let user_agent = format!(
             "hanui/{} (+https://github.com/org/hanui)",
@@ -421,7 +401,7 @@ impl HaHttpClient {
             max_cache_bytes: profile.http_cache_bytes,
             cache_ttl: Duration::from_secs(profile.http_cache_ttl_s as u64),
             max_image_px: profile.max_image_px,
-            rate_limit_qps: HTTP_RATE_LIMIT_QPS,
+            rate_limit_qps: profile.http_rate_limit_per_host_qps,
         };
 
         HaHttpClient {
@@ -429,8 +409,8 @@ impl HaHttpClient {
             client: OnceLock::new(),
             client_user_agent: user_agent,
             inner: Mutex::new(inner),
-            retry_budget: HTTP_RETRY_BUDGET,
-            request_timeout: Duration::from_millis(HTTP_REQUEST_TIMEOUT_MS),
+            retry_budget: profile.http_retry_budget,
+            request_timeout: Duration::from_millis(profile.http_request_timeout_ms),
         }
     }
 
@@ -469,9 +449,9 @@ impl HaHttpClient {
     /// Rate limiting is enforced per host. If the per-host QPS budget is
     /// exhausted, returns [`HttpError::RateLimited`] immediately.
     ///
-    /// Transient errors are retried up to `HTTP_RETRY_BUDGET` times with
-    /// exponential backoff + jitter. The total request time is bounded by
-    /// `HTTP_REQUEST_TIMEOUT_MS`.
+    /// Transient errors are retried up to `DeviceProfile.http_retry_budget`
+    /// times with exponential backoff + jitter. The total request time is
+    /// bounded by `DeviceProfile.http_request_timeout_ms`.
     ///
     /// # Errors
     ///
@@ -1226,6 +1206,77 @@ mod tests {
         assert!(
             matches!(result, Err(HttpError::ImageDecode { .. })),
             "gigapixel header must be rejected as ImageDecode, got: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Profile field threading — TASK-128 F13
+    //
+    // Verify that HaHttpClient::new reads retry_budget, request_timeout, and
+    // rate_limit_qps from DeviceProfile rather than from module-level constants.
+    // -----------------------------------------------------------------------
+
+    /// Desktop profile sets retry_budget=3; HaHttpClient must reflect that.
+    #[test]
+    fn new_reads_retry_budget_from_profile() {
+        let client = HaHttpClient::new(test_config(), &PROFILE_DESKTOP);
+        assert_eq!(
+            client.retry_budget, PROFILE_DESKTOP.http_retry_budget,
+            "retry_budget must be sourced from DeviceProfile, not a constant"
+        );
+    }
+
+    /// Desktop profile sets request_timeout=5_000 ms; HaHttpClient must reflect that.
+    #[test]
+    fn new_reads_request_timeout_from_profile() {
+        let client = HaHttpClient::new(test_config(), &PROFILE_DESKTOP);
+        assert_eq!(
+            client.request_timeout,
+            Duration::from_millis(PROFILE_DESKTOP.http_request_timeout_ms),
+            "request_timeout must be sourced from DeviceProfile, not a constant"
+        );
+    }
+
+    /// Desktop profile sets rate_limit_per_host_qps=10; Inner must reflect that.
+    #[test]
+    fn new_reads_rate_limit_qps_from_profile() {
+        let client = HaHttpClient::new(test_config(), &PROFILE_DESKTOP);
+        let inner = client.inner.lock().unwrap();
+        assert_eq!(
+            inner.rate_limit_qps, PROFILE_DESKTOP.http_rate_limit_per_host_qps,
+            "rate_limit_qps must be sourced from DeviceProfile, not a constant"
+        );
+    }
+
+    /// SBC profile (rpi4) has different values than desktop; constructing with
+    /// the rpi4 profile must produce a client with rpi4-sourced values, proving
+    /// the fields are not hard-coded.
+    #[test]
+    fn new_with_rpi4_profile_uses_rpi4_values() {
+        use crate::dashboard::profiles::PROFILE_RPI4;
+        let client = HaHttpClient::new(test_config(), &PROFILE_RPI4);
+        assert_eq!(
+            client.retry_budget, PROFILE_RPI4.http_retry_budget,
+            "retry_budget must match rpi4 profile"
+        );
+        assert_eq!(
+            client.request_timeout,
+            Duration::from_millis(PROFILE_RPI4.http_request_timeout_ms),
+            "request_timeout must match rpi4 profile"
+        );
+        let inner = client.inner.lock().unwrap();
+        assert_eq!(
+            inner.rate_limit_qps, PROFILE_RPI4.http_rate_limit_per_host_qps,
+            "rate_limit_qps must match rpi4 profile"
+        );
+        // Confirm rpi4 differs from desktop so the test is not vacuous.
+        assert_ne!(
+            PROFILE_RPI4.http_request_timeout_ms, PROFILE_DESKTOP.http_request_timeout_ms,
+            "test precondition: rpi4 and desktop timeout values must differ"
+        );
+        assert_ne!(
+            PROFILE_RPI4.http_rate_limit_per_host_qps, PROFILE_DESKTOP.http_rate_limit_per_host_qps,
+            "test precondition: rpi4 and desktop QPS values must differ"
         );
     }
 
