@@ -742,7 +742,7 @@ pub fn split_tile_vms(
 // ---------------------------------------------------------------------------
 
 /// Wire a typed `&[TileVM]` slice into the three array properties on
-/// [`MainWindow`], and write the two `AnimationBudget` globals from the
+/// [`MainWindow`], and write the `AnimationBudget` globals from the
 /// active [`DeviceProfile`].
 ///
 /// `profile` is the [`DeviceProfile`] selected at startup by
@@ -804,6 +804,32 @@ pub fn wire_window(
 
     budget.set_framerate_cap(cap_i32);
     budget.set_max_simultaneous(max_i32);
+
+    // F11 (TASK-126): stepped spinner on SBC profiles.
+    //
+    // `tick-hz-sbc` controls the Timer step rate for the pending spinner:
+    //   * 0  → desktop mode; the spinner uses animation-tick() per-frame.
+    //   * 12 → SBC mode; a discrete Timer fires 12 × per second, cutting
+    //          spinner cos/sin evaluations from 60 × to 12 × per second
+    //          on software-rendered rpi4/opi_zero3 targets.
+    //
+    // SBC profiles are identified by animation_framerate_cap <= 30 fps
+    // (rpi4: 30, opi_zero3: 20; desktop: 60). The 12 Hz step rate is
+    // deliberately lower than the SBC framerate cap (20–30 fps) to
+    // ensure each step is visible as a discrete position.
+    //
+    // `sbc-spinner-cap` is set to `max_simultaneous_animations` for SBC
+    // profiles (additional guard on top of `max-simultaneous`) and 0 for
+    // desktop (unbounded by this cap). Both caps coexist;
+    // `at-capacity` ORs them in the Slint global.
+    let tick_hz: i32 = if profile.animation_framerate_cap <= 30 {
+        12
+    } else {
+        0
+    };
+    let sbc_cap: i32 = if tick_hz > 0 { max_i32 } else { 0 };
+    budget.set_tick_hz_sbc(tick_hz);
+    budget.set_sbc_spinner_cap(sbc_cap);
 
     // GestureConfigGlobal — Slint-side mirror of `GestureConfig` (TASK-059).
     // Phase 3 wires the default values; Phase 4 `DeviceProfile.timing_overrides`
@@ -3102,6 +3128,88 @@ mod tests {
             "wire_window must propagate PROFILE_OPI_ZERO3.max_simultaneous_animations \
              (2) to AnimationBudget.max-simultaneous; a regression to the desktop \
              default (8) would fail here",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-126 F11: stepped spinner — tick_hz_sbc + sbc_spinner_cap wiring
+    // -----------------------------------------------------------------------
+
+    /// Desktop profile → tick-hz-sbc must be 0 (continuous mode, no Timer)
+    /// and sbc-spinner-cap must be 0 (unbounded).
+    #[test]
+    fn wire_window_desktop_sets_tick_hz_sbc_zero_and_sbc_spinner_cap_zero() {
+        install_test_platform_once_per_thread();
+        ensure_icons_init();
+        let window = MainWindow::new().expect("MainWindow::new under headless test platform");
+
+        wire_window(&window, &[], &PROFILE_DESKTOP)
+            .expect("wire_window with PROFILE_DESKTOP must succeed");
+
+        let budget = window.global::<AnimationBudget>();
+        assert_eq!(
+            budget.get_tick_hz_sbc(),
+            0,
+            "PROFILE_DESKTOP (60 fps) must yield tick-hz-sbc == 0 (continuous mode)",
+        );
+        assert_eq!(
+            budget.get_sbc_spinner_cap(),
+            0,
+            "PROFILE_DESKTOP must yield sbc-spinner-cap == 0 (unbounded)",
+        );
+    }
+
+    /// OPI Zero 3 profile (20 fps cap) → tick-hz-sbc must be 12 (stepped SBC
+    /// mode) and sbc-spinner-cap must equal max_simultaneous_animations (2).
+    #[test]
+    fn wire_window_opi_zero3_sets_tick_hz_sbc_12_and_sbc_spinner_cap() {
+        use crate::dashboard::profiles::PROFILE_OPI_ZERO3;
+
+        install_test_platform_once_per_thread();
+        ensure_icons_init();
+        let window = MainWindow::new().expect("MainWindow::new under headless test platform");
+
+        wire_window(&window, &[], &PROFILE_OPI_ZERO3)
+            .expect("wire_window with PROFILE_OPI_ZERO3 must succeed");
+
+        let budget = window.global::<AnimationBudget>();
+        assert_eq!(
+            budget.get_tick_hz_sbc(),
+            12,
+            "PROFILE_OPI_ZERO3 (20 fps cap <= 30) must yield tick-hz-sbc == 12",
+        );
+        assert_eq!(
+            budget.get_sbc_spinner_cap(),
+            i32::try_from(PROFILE_OPI_ZERO3.max_simultaneous_animations)
+                .expect("PROFILE_OPI_ZERO3 max_simultaneous fits in i32"),
+            "PROFILE_OPI_ZERO3 must yield sbc-spinner-cap == max_simultaneous_animations (2)",
+        );
+    }
+
+    /// RPI4 profile (30 fps cap) → tick-hz-sbc must be 12 (stepped SBC mode)
+    /// and sbc-spinner-cap must equal max_simultaneous_animations (3).
+    #[test]
+    fn wire_window_rpi4_sets_tick_hz_sbc_12_and_sbc_spinner_cap() {
+        use crate::dashboard::profiles::PROFILE_RPI4;
+
+        install_test_platform_once_per_thread();
+        ensure_icons_init();
+        let window = MainWindow::new().expect("MainWindow::new under headless test platform");
+
+        wire_window(&window, &[], &PROFILE_RPI4)
+            .expect("wire_window with PROFILE_RPI4 must succeed");
+
+        let budget = window.global::<AnimationBudget>();
+        assert_eq!(
+            budget.get_tick_hz_sbc(),
+            12,
+            "PROFILE_RPI4 (30 fps cap <= 30) must yield tick-hz-sbc == 12",
+        );
+        assert_eq!(
+            budget.get_sbc_spinner_cap(),
+            i32::try_from(PROFILE_RPI4.max_simultaneous_animations)
+                .expect("PROFILE_RPI4 max_simultaneous fits in i32"),
+            "PROFILE_RPI4 must yield sbc-spinner-cap == max_simultaneous_animations (3)",
         );
     }
 

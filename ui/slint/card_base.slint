@@ -60,6 +60,9 @@ import { GestureConfigGlobal } from "gesture_config.slint";
 //   3. Incrementing `active-count` when a tile begins an animation and
 //      decrementing on completion. Tiles read `active-count >= max-simultaneous`
 //      to decide whether to animate or snap to the end-state.
+//   4. (TASK-126 F11) Setting `tick-hz-sbc` to 12 for SBC profiles and 0 for
+//      desktop; and `sbc-spinner-cap` to the profile's max_simultaneous_animations
+//      for SBC profiles (0 for desktop = unbounded by this cap).
 //
 // All three are `in-out` so the bridge can write them and Slint expressions
 // (here and in the tile components from TASK-013) can read and mutate them.
@@ -80,10 +83,24 @@ export global AnimationBudget {
     // animation completion. Initialised to 0 by the bridge at startup.
     in-out property <int> active-count: 0;
 
+    // Step rate for SBC profiles (frames per second for discrete spinner steps).
+    // 0 means use continuous per-frame animation-tick() (desktop mode).
+    // Set to 12 by Rust wire_window for rpi4/opi_zero3; 0 for desktop.
+    // TASK-126 F11: stepped spinner on SBC profiles.
+    in property <int> tick-hz-sbc: 0;
+
+    // Maximum simultaneously active spinners for SBC profiles.
+    // 0 means unbounded (desktop). Set to profile.max_simultaneous_animations
+    // for SBC profiles; 0 for desktop (unbounded).
+    // TASK-126 F11: hard cap on simultaneously active spinners on SBC.
+    in property <int> sbc-spinner-cap: 0;
+
     // Convenience: true when a new animation should be skipped because the
     // concurrent-animation budget is exhausted. Tiles read this to choose
     // between an animated transition (150 ms) and an immediate snap (0 ms).
-    out property <bool> at-capacity: active-count >= max-simultaneous;
+    // TASK-126 F11: also gated by sbc-spinner-cap when non-zero.
+    out property <bool> at-capacity: (active-count >= max-simultaneous)
+        || (sbc-spinner-cap > 0 && active-count >= sbc-spinner-cap);
 }
 
 // CardBase — chrome wrapper + gesture-detection state machine used by every
@@ -309,7 +326,7 @@ export component CardBase inherits Rectangle {
         }
     }
 
-    // ── Pending spinner overlay (TASK-067) ──────────────────────────────────
+    // ── Pending spinner overlay (TASK-067, TASK-126 F11) ────────────────────
     // Small spinner anchored in the top-right corner. Visible only while
     // `root.pending == true`, which is bound to
     // `LiveStore::pending_for_widget` — the cross-owner read API from
@@ -318,26 +335,27 @@ export component CardBase inherits Rectangle {
     // `pending == false` so the renderer does no extra work on the
     // steady-state path.
     //
-    // Animation: `animation-tick()` is Slint's monotonic clock — a
-    // `<duration>` value that increases continuously from a baseline at
-    // load. Deriving `phase` as `(animation-tick() / 1200ms) * 360deg`
-    // mod 360deg gives a free-running angle that loops every 1.2 s
-    // without any per-property animation declaration. This is the
-    // idiomatic Slint pattern for infinite rotations and avoids the
-    // `animate` "from-prev-value" pitfall (a property declared at
-    // 360deg with `animate { ... }` interpolates from 360deg to 360deg
-    // — visibly stuck on first paint).
+    // Animation modes (TASK-126 F11):
+    //   * Desktop (AnimationBudget.tick-hz-sbc == 0): continuous per-frame
+    //     phase via animation-tick(). cos/sin are evaluated every render
+    //     frame, which is acceptable on 60 fps desktop targets.
+    //   * SBC (AnimationBudget.tick-hz-sbc > 0, e.g. 12 for rpi4/opi_zero3):
+    //     a stepped Timer advances a discrete `step` counter (8 positions,
+    //     one per 45 deg) at the requested Hz. cos/sin are evaluated only
+    //     on Timer tick — 12 times per second instead of 60, cutting
+    //     spinner CPU cost on the software renderer.
     //
-    // A small marker dot's `x` / `y` are derived from `cos(phase)` /
-    // `sin(phase)` around the ring centre, producing a visible orbit.
-    // The ring outline behind the dot is a stationary Rectangle with a
-    // thick accent border.
-    //
-    // Performance contract: when `AnimationBudget.at-capacity` is true,
-    // the marker dot snaps to a fixed phase (`0deg`) so the renderer
-    // does not redraw the dot every animation tick — preserving the
-    // global concurrent-animation budget. The dot remains visible (the
-    // spinner still indicates "pending"), it just does not orbit.
+    // Performance contracts:
+    //   * animation-tick() per-frame path is guarded by `if root.pending`
+    //     so the binding is dropped entirely when the spinner is not visible.
+    //   * AnimationBudget.at-capacity (TASK-126 F11: also gated by
+    //     sbc-spinner-cap) snaps the phase to 0deg; the dot stays visible
+    //     but does not orbit, preserving the global animation budget.
+    //   * The SBC Timer carries `running: root.pending && !AnimationBudget.at-capacity
+    //     && AnimationBudget.tick-hz-sbc > 0` so it stops automatically when
+    //     the spinner is hidden or the budget is exhausted.
+    //   * Timer interval is (1000 / max(1, tick-hz-sbc)) ms, capped at
+    //     DEFAULT_PROFILE.animation_framerate_cap per PHASES.md § Perf budgets.
     //
     // Why a marker-dot orbit rather than a `rotation-angle` property:
     // Slint's `rotation-angle` exists on `Image` only (not on
@@ -346,7 +364,7 @@ export component CardBase inherits Rectangle {
     // software backend (no SVG / image asset).
     //
     // When `pending` flips back to false the entire `if` subtree is
-    // removed, dropping every binding on `animation-tick()` cleanly —
+    // removed, dropping every binding and stopping the Timer cleanly —
     // there is no orphaned timer.
     if root.pending : Rectangle {
         // Anchored top-right with `space-2` inset.
@@ -355,14 +373,41 @@ export component CardBase inherits Rectangle {
         width: 16px;
         height: 16px;
 
-        // Free-running phase angle. `animation-tick()` returns a
-        // monotonic `<duration>`; dividing by the period and
-        // multiplying by 360deg gives the current rotation angle.
-        // The expression is re-evaluated every animation frame so the
-        // dot's position updates without an explicit `animate` block.
+        // SBC stepped mode: discrete step counter (0–7), one step per Timer
+        // tick. Only meaningful when AnimationBudget.tick-hz-sbc > 0.
+        // Animation capped at DEFAULT_PROFILE.animation_framerate_cap per
+        // PHASES.md § Performance budgets (TASK-126 F11).
+        property <int> step: 0;
+
+        // Phase angle. Two paths:
+        //   Desktop (tick-hz-sbc == 0): continuous animation-tick() binding.
+        //     cos/sin re-evaluated every frame.
+        //   SBC (tick-hz-sbc > 0): discrete step index mapped to one of 8
+        //     evenly-spaced angles (45 deg apart). cos/sin only recomputed
+        //     when step increments — 12 × per second instead of 60 ×.
+        //   at-capacity: phase snaps to 0 deg; dot is visible but stationary.
         property <angle> phase: AnimationBudget.at-capacity
             ? 0deg
-            : (mod(animation-tick() / 1ms, 1200) / 1200) * 360deg;
+            : AnimationBudget.tick-hz-sbc > 0
+                ? (self.step * 360 / 8) * 1deg
+                : (mod(animation-tick() / 1ms, 1200) / 1200) * 360deg;
+
+        // SBC stepped timer — advances the step counter at tick-hz-sbc Hz.
+        // Disabled on desktop (tick-hz-sbc == 0) via both `running` guard
+        // and a large sentinel interval so no timer wakeup occurs.
+        // Animation capped at DEFAULT_PROFILE.animation_framerate_cap per
+        // PHASES.md § Performance budgets (TASK-126 F11).
+        Timer {
+            interval: AnimationBudget.tick-hz-sbc > 0
+                ? (1000 / max(1, AnimationBudget.tick-hz-sbc)) * 1ms
+                : 99999ms;
+            running: root.pending
+                && !AnimationBudget.at-capacity
+                && AnimationBudget.tick-hz-sbc > 0;
+            triggered => {
+                parent.step = mod(parent.step + 1, 8);
+            }
+        }
 
         // Ring outline. A Rectangle with a thick accent border and a
         // transparent fill is the simplest stationary visual primitive
