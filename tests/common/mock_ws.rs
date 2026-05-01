@@ -250,6 +250,25 @@ impl MockWsServer {
         }
     }
 
+    /// Script `n` successful subscribe ACKs followed by one failure ACK.
+    /// Used to test FSM failure paths for each of the three subscribe phases.
+    pub async fn script_subscribe_n_acks_then_fail(&self, n: usize) {
+        for _ in 0..n {
+            self.push_reply(ScriptedReply::OnRequest {
+                match_type: "subscribe_events".to_owned(),
+                body: r#"{"type":"result","id":{{ID}},"success":true,"result":null}"#.to_owned(),
+                forward_id: true,
+            })
+            .await;
+        }
+        self.push_reply(ScriptedReply::OnRequest {
+            match_type: "subscribe_events".to_owned(),
+            body: r#"{"type":"result","id":{{ID}},"success":false,"error":{"code":"unknown_error","message":"subscribe failed"}}"#.to_owned(),
+            forward_id: true,
+        })
+        .await;
+    }
+
     /// Script a `get_states` reply with the given JSON entity array.
     ///
     /// `entities_json` is the literal JSON array string for the `result` field

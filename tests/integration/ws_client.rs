@@ -1560,3 +1560,94 @@ async fn high_irrelevance_event_ratio_reduces_parse_bytes() {
         "the single state_changed event must be applied to its target entity"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Subscribe-phase failure paths (TASK-123 F7 coverage)
+// ---------------------------------------------------------------------------
+
+/// First subscribe ACK fails → client must transition to Failed immediately.
+#[tokio::test]
+async fn scenario_subscribe_state_changed_fail_transitions_to_failed() {
+    let server = MockWsServer::start().await;
+    server.script_auth_ok().await;
+    server.script_subscribe_n_acks_then_fail(0).await;
+
+    let config = make_config(&server.ws_url, "tok-sub-fail-1");
+    let (mut state_rx, handle) = spawn_client(config, None);
+
+    assert!(
+        wait_for_state(
+            &mut state_rx,
+            ConnectionState::Failed,
+            Duration::from_secs(5)
+        )
+        .await,
+        "state_changed subscribe failure must transition to Failed"
+    );
+    let result = tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("client must finish")
+        .expect("task join ok");
+    assert!(
+        matches!(result, Err(ClientError::AuthInvalid { .. })),
+        "expected AuthInvalid on subscribe failure; got: {result:?}"
+    );
+}
+
+/// First two subscribe ACKs succeed, third (service_registered) fails → Failed.
+#[tokio::test]
+async fn scenario_subscribe_service_reg_fail_transitions_to_failed() {
+    let server = MockWsServer::start().await;
+    server.script_auth_ok().await;
+    server.script_subscribe_n_acks_then_fail(1).await;
+
+    let config = make_config(&server.ws_url, "tok-sub-fail-2");
+    let (mut state_rx, handle) = spawn_client(config, None);
+
+    assert!(
+        wait_for_state(
+            &mut state_rx,
+            ConnectionState::Failed,
+            Duration::from_secs(5)
+        )
+        .await,
+        "service_registered subscribe failure must transition to Failed"
+    );
+    let result = tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("client must finish")
+        .expect("task join ok");
+    assert!(
+        matches!(result, Err(ClientError::AuthInvalid { .. })),
+        "expected AuthInvalid on subscribe failure; got: {result:?}"
+    );
+}
+
+/// First two ACKs succeed, third (service_removed) fails → Failed.
+#[tokio::test]
+async fn scenario_subscribe_service_rem_fail_transitions_to_failed() {
+    let server = MockWsServer::start().await;
+    server.script_auth_ok().await;
+    server.script_subscribe_n_acks_then_fail(2).await;
+
+    let config = make_config(&server.ws_url, "tok-sub-fail-3");
+    let (mut state_rx, handle) = spawn_client(config, None);
+
+    assert!(
+        wait_for_state(
+            &mut state_rx,
+            ConnectionState::Failed,
+            Duration::from_secs(5)
+        )
+        .await,
+        "service_removed subscribe failure must transition to Failed"
+    );
+    let result = tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("client must finish")
+        .expect("task join ok");
+    assert!(
+        matches!(result, Err(ClientError::AuthInvalid { .. })),
+        "expected AuthInvalid on subscribe failure; got: {result:?}"
+    );
+}
