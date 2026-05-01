@@ -106,7 +106,7 @@ serde = { version = "1", features = ["derive"] }
 # crate — that crate was archived in 2024 and is explicitly unmaintained. See
 # locked_decisions.serde_yaml_crate_choice in docs/plans/2026-04-29-phase-4-layout.md.
 serde_yaml_ng = "0.10"
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 anyhow = "1"
 thiserror = "1"
