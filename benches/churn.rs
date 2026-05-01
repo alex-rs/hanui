@@ -67,6 +67,7 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
+use hanui::dashboard::profiles::PROFILE_DESKTOP;
 use hanui::dashboard::schema::{
     Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
 };
@@ -275,7 +276,7 @@ async fn churn_1000_entities_50_evs_holds_flush_cadence() {
 
     // Spawn WsClient; it owns the state sender.
     let (state_tx, mut state_rx) = status::channel();
-    let client = WsClient::new(config, state_tx)
+    let client = WsClient::new(config, state_tx, &PROFILE_DESKTOP)
         .with_store(store.clone() as Arc<dyn hanui::ha::client::SnapshotApplier>);
     let _client_handle = tokio::spawn(async move {
         let mut c = client;

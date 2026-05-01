@@ -22,10 +22,13 @@
 //!
 //! State-changed events that arrive while `get_states` is in flight are
 //! buffered in a bounded ring of capacity
-//! `PROFILE_DESKTOP.snapshot_buffer_events` (10 000).  After the snapshot
-//! reply arrives the buffered events are replayed before the FSM transitions
-//! to `Live`.  On ring overflow the connection is dropped; 3 overflows within
-//! 60 s trip the circuit-breaker and transition to `Failed`.
+//! `DeviceProfile.snapshot_buffer_events` (10 000 on the desktop preset; lower
+//! on SBC presets).  After the snapshot reply arrives the buffered events are
+//! replayed before the FSM transitions to `Live`.  On ring overflow the
+//! connection is dropped; 3 overflows within 60 s trip the circuit-breaker
+//! and transition to `Failed`.  TASK-120b F4 threaded the active profile
+//! through [`WsClient::new`] so this cap follows the dashboard YAML's
+//! `device_profile` field.
 //!
 //! # Reconnect exponential backoff
 //!
@@ -58,9 +61,12 @@
 //! # Payload cap
 //!
 //! `tokio-tungstenite` is configured with `max_message_size` and
-//! `max_frame_size` from `PROFILE_DESKTOP.ws_payload_cap`.  A message exceeding
-//! the cap causes the transport to return an error; the FSM treats this as a
-//! transport error and drops the connection for a full resync.
+//! `max_frame_size` from `DeviceProfile.ws_payload_cap` (16 MiB on the
+//! desktop preset; 8 MiB on the OPI Zero 3 preset).  A message exceeding
+//! the cap causes the transport to return an error; the FSM treats this as
+//! a transport error and drops the connection for a full resync.  TASK-120b
+//! F4 threaded the active profile through [`WsClient::new`] so this cap
+//! follows the dashboard YAML's `device_profile` field.
 //!
 //! # Phase 4
 //!
@@ -82,6 +88,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::dashboard::profiles::DeviceProfile;
+#[cfg(test)]
 use crate::dashboard::profiles::PROFILE_DESKTOP;
 use crate::ha::entity::{Entity, EntityId};
 use crate::ha::live_store::LiveStore;
@@ -438,7 +446,10 @@ pub(crate) enum Phase {
     Snapshotting {
         get_states_id: u32,
         /// Ring buffer of state-changed events arriving during snapshot fetch.
-        /// Capacity: `PROFILE_DESKTOP.snapshot_buffer_events`.
+        /// Capacity: `DeviceProfile.snapshot_buffer_events` (selected at
+        /// startup; see the [`WsClient`] `profile` field). TASK-120b F4
+        /// threaded the active profile through `WsClient::new` so this cap
+        /// follows the dashboard YAML's `device_profile`.
         event_buffer: Vec<InboundMsg>,
     },
     /// Snapshot applied; `get_services` in flight.
@@ -680,6 +691,22 @@ impl IdCounter {
 pub struct WsClient {
     config: Config,
     state_tx: watch::Sender<ConnectionState>,
+    /// Selected device profile (TASK-120b F4).
+    ///
+    /// Threaded through from `src/lib.rs::run` after the bootstrap pre-flight
+    /// in `early_load_profile` resolves the dashboard YAML's `device_profile`
+    /// field. Read sites:
+    ///
+    /// - [`WsClient::run`] uses `profile.ws_payload_cap` to size the
+    ///   `WebSocketConfig.max_message_size` and `max_frame_size` caps.
+    /// - The `Phase::Snapshotting` arm of [`WsClient::handle_message`] uses
+    ///   `profile.snapshot_buffer_events` as the overflow threshold for the
+    ///   pre-snapshot event buffer.
+    ///
+    /// The reference is `&'static` because all production profile constants
+    /// live in `static` storage (`PROFILE_DESKTOP`, `PROFILE_OPI_ZERO3`,
+    /// `PROFILE_RPI4`); the bootstrap selector returns one of those statics.
+    profile: &'static DeviceProfile,
     id_counter: IdCounter,
     /// Map from request id to the oneshot sender awaiting the result.
     ///
@@ -784,10 +811,21 @@ impl WsClient {
     ///
     /// The `state_tx` watch sender is updated on every FSM transition so
     /// external observers (e.g. the status banner) can react.
-    pub fn new(config: Config, state_tx: watch::Sender<ConnectionState>) -> Self {
+    ///
+    /// `profile` is the [`DeviceProfile`] selected at startup by
+    /// `src/lib.rs::run` from the dashboard YAML's `device_profile` field
+    /// (TASK-120b F4). It governs the WS payload caps and the pre-snapshot
+    /// event-buffer overflow threshold; SBC profiles use lower values than
+    /// the desktop default to fit a Pi/OPI-class memory budget.
+    pub fn new(
+        config: Config,
+        state_tx: watch::Sender<ConnectionState>,
+        profile: &'static DeviceProfile,
+    ) -> Self {
         WsClient {
             config,
             state_tx,
+            profile,
             id_counter: IdCounter::new(),
             pending: HashMap::new(),
             pending_ack: HashMap::new(),
@@ -800,6 +838,16 @@ impl WsClient {
             services: ServiceRegistry::new_handle(),
             command_rx: None,
         }
+    }
+
+    /// Return the [`DeviceProfile`] the client was constructed with (TASK-120b F4).
+    ///
+    /// Used by integration tests to assert the profile was threaded through
+    /// from `src/lib.rs::run` correctly. Production code reads `self.profile`
+    /// directly via the `WsClient::run` and `handle_message` paths; callers
+    /// outside the FSM should rely on this accessor.
+    pub fn profile(&self) -> &'static DeviceProfile {
+        self.profile
     }
 
     /// Return a clone of the shared [`ServiceRegistryHandle`].
@@ -1101,8 +1149,8 @@ impl WsClient {
         tracing::info!(url = %self.config.url, "connecting to HA");
 
         let ws_config = WebSocketConfig {
-            max_message_size: Some(PROFILE_DESKTOP.ws_payload_cap),
-            max_frame_size: Some(PROFILE_DESKTOP.ws_payload_cap),
+            max_message_size: Some(self.profile.ws_payload_cap),
+            max_frame_size: Some(self.profile.ws_payload_cap),
             ..Default::default()
         };
 
@@ -1348,9 +1396,9 @@ impl WsClient {
                 },
                 InboundMsg::Event(event_payload),
             ) => {
-                if event_buffer.len() >= PROFILE_DESKTOP.snapshot_buffer_events {
+                if event_buffer.len() >= self.profile.snapshot_buffer_events {
                     tracing::warn!(
-                        cap = PROFILE_DESKTOP.snapshot_buffer_events,
+                        cap = self.profile.snapshot_buffer_events,
                         "snapshot event buffer overflow; dropping connection"
                     );
                     let tripped = self.overflow_breaker.record_overflow();
@@ -1819,7 +1867,7 @@ mod tests {
         }
         let config = Config::from_env().expect("test config");
         let (tx, rx) = status::channel();
-        let client = WsClient::new(config, tx);
+        let client = WsClient::new(config, tx, &PROFILE_DESKTOP);
         (client, rx)
     }
 
@@ -2230,7 +2278,7 @@ mod tests {
             }
             let config = Config::from_env().unwrap();
             let (tx, _rx) = status::channel();
-            (WsClient::new(config, tx), MockSink::new())
+            (WsClient::new(config, tx, &PROFILE_DESKTOP), MockSink::new())
         };
         let plaintext_token = "UNIQUE_PLAINTEXT_TOKEN_XYZ987ABC";
         let (mut sink, _sent) = _sink_sent;
@@ -3277,7 +3325,7 @@ mod tests {
             }
             let config = Config::from_env().unwrap();
             let (tx, rx) = status::channel();
-            (WsClient::new(config, tx), rx)
+            (WsClient::new(config, tx, &PROFILE_DESKTOP), rx)
         };
         let (mut sink, _sent) = MockSink::new();
 

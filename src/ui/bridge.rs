@@ -45,8 +45,9 @@
 //!     element into the Slint-generated VM struct (resolving `icon_id` via
 //!     [`crate::assets::icons::resolve`]), wraps each per-variant `Vec` in a
 //!     `slint::ModelRc<...>`, and writes the three array properties on
-//!     `MainWindow`. Also writes the two `AnimationBudget` globals from
-//!     [`crate::dashboard::profiles::PROFILE_DESKTOP`].
+//!     `MainWindow`. Also writes the two `AnimationBudget` globals from the
+//!     active [`crate::dashboard::profiles::DeviceProfile`] (passed in from
+//!     `src/lib.rs::run` post TASK-120b F4).
 //!
 //! [`wire_window`] runs once per refresh cycle, not per frame. Per-frame
 //! property reads inside the Slint runtime see only `SharedString`
@@ -603,7 +604,7 @@ pub use slint_ui::{AnimationBudget, GestureConfigGlobal, MainWindow, ViewRouterG
 
 use crate::actions::timing::GestureConfig;
 use crate::assets::icons;
-use crate::dashboard::profiles::PROFILE_DESKTOP;
+use crate::dashboard::profiles::DeviceProfile;
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 /// Errors that can occur while wiring VM data into Slint properties.
@@ -612,11 +613,14 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 /// the failure path either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireError {
-    /// `PROFILE_DESKTOP.animation_framerate_cap` does not fit in `i32` (the
-    /// Slint property type for `framerate-cap`).
+    /// `DeviceProfile.animation_framerate_cap` does not fit in `i32` (the
+    /// Slint property type for `framerate-cap`). The active profile is
+    /// threaded through [`wire_window`] from `src/lib.rs::run` (TASK-120b F4).
     FramerateCapOutOfRange,
-    /// `PROFILE_DESKTOP.max_simultaneous_animations` does not fit in `i32`
-    /// (the Slint property type for `max-simultaneous`).
+    /// `DeviceProfile.max_simultaneous_animations` does not fit in `i32`
+    /// (the Slint property type for `max-simultaneous`). The active profile
+    /// is threaded through [`wire_window`] from `src/lib.rs::run`
+    /// (TASK-120b F4).
     MaxSimultaneousOutOfRange,
     /// One of the [`GestureConfig`] `*_ms` fields does not fit in `i32` (the
     /// Slint property type for the gesture-timing globals). Practical
@@ -629,10 +633,10 @@ impl std::fmt::Display for WireError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WireError::FramerateCapOutOfRange => {
-                f.write_str("PROFILE_DESKTOP.animation_framerate_cap does not fit in i32")
+                f.write_str("DeviceProfile.animation_framerate_cap does not fit in i32")
             }
             WireError::MaxSimultaneousOutOfRange => {
-                f.write_str("PROFILE_DESKTOP.max_simultaneous_animations does not fit in i32")
+                f.write_str("DeviceProfile.max_simultaneous_animations does not fit in i32")
             }
             WireError::GestureTimingOutOfRange => {
                 f.write_str("GestureConfig timing field does not fit in i32")
@@ -738,8 +742,17 @@ pub fn split_tile_vms(
 // ---------------------------------------------------------------------------
 
 /// Wire a typed `&[TileVM]` slice into the three array properties on
-/// [`MainWindow`], and write the two `AnimationBudget` globals from
-/// [`PROFILE_DESKTOP`].
+/// [`MainWindow`], and write the two `AnimationBudget` globals from the
+/// active [`DeviceProfile`].
+///
+/// `profile` is the [`DeviceProfile`] selected at startup by
+/// `src/lib.rs::run` from the dashboard YAML's `device_profile` field
+/// (TASK-120b F4). Pre-TASK-120b this function read `PROFILE_DESKTOP`
+/// directly, which broke the SBC paths: a Pi/OPI dashboard would still
+/// receive the desktop animation budget. The signature now requires the
+/// caller to pass the matching profile, so the SBC presets'
+/// `animation_framerate_cap` (20–30 Hz) and `max_simultaneous_animations`
+/// (2–3) actually reach the Slint side.
 ///
 /// This is the single public entry point used by `main.rs` (TASK-016) and by
 /// any future Phase 2 push-update path. The function runs once per refresh
@@ -757,13 +770,17 @@ pub fn split_tile_vms(
 /// # Errors
 ///
 /// Returns [`WireError::FramerateCapOutOfRange`] if
-/// `PROFILE_DESKTOP.animation_framerate_cap` does not fit in `i32`, and
+/// `profile.animation_framerate_cap` does not fit in `i32`, and
 /// [`WireError::MaxSimultaneousOutOfRange`] if
-/// `PROFILE_DESKTOP.max_simultaneous_animations` does not fit. Both are
-/// defensive: the desktop preset values (60 and 8 respectively) are well
-/// within `i32` range, but a future profile could exceed it and we want a
-/// typed failure rather than a silent truncation.
-pub fn wire_window(window: &MainWindow, tiles: &[TileVM]) -> Result<(), WireError> {
+/// `profile.max_simultaneous_animations` does not fit. Both are defensive:
+/// every shipped preset is well within `i32` range, but a future profile
+/// could exceed it and we want a typed failure rather than a silent
+/// truncation.
+pub fn wire_window(
+    window: &MainWindow,
+    tiles: &[TileVM],
+    profile: &'static DeviceProfile,
+) -> Result<(), WireError> {
     let (lights, sensors, entities) = split_tile_vms(tiles);
 
     // Wrap each Vec in a VecModel and pass via ModelRc to the Slint property.
@@ -776,12 +793,13 @@ pub fn wire_window(window: &MainWindow, tiles: &[TileVM]) -> Result<(), WireErro
     window.set_sensor_tiles(sensor_model);
     window.set_entity_tiles(entity_model);
 
-    // AnimationBudget globals — wired once at startup from PROFILE_DESKTOP.
+    // AnimationBudget globals — wired once at startup from the active
+    // DeviceProfile (TASK-120b F4).
     let budget = window.global::<AnimationBudget>();
 
-    let cap_i32 = i32::try_from(PROFILE_DESKTOP.animation_framerate_cap)
+    let cap_i32 = i32::try_from(profile.animation_framerate_cap)
         .map_err(|_| WireError::FramerateCapOutOfRange)?;
-    let max_i32 = i32::try_from(PROFILE_DESKTOP.max_simultaneous_animations)
+    let max_i32 = i32::try_from(profile.max_simultaneous_animations)
         .map_err(|_| WireError::MaxSimultaneousOutOfRange)?;
 
     budget.set_framerate_cap(cap_i32);
@@ -2010,6 +2028,7 @@ impl PinEntryHost for SlintPinHost {
 mod tests {
     use super::*;
     use crate::dashboard::fixture::fixture_dashboard;
+    use crate::dashboard::profiles::PROFILE_DESKTOP;
     use crate::ha::fixture;
 
     /// Path to the canonical Phase 1 fixture.
@@ -2965,9 +2984,9 @@ mod tests {
     #[test]
     fn wire_window_writes_animation_budget_and_default_gesture_config() {
         // Behavior contract: `wire_window` populates AnimationBudget from
-        // `PROFILE_DESKTOP` AND wires the default GestureConfig in a single
-        // call. We verify both globals end up with the documented values
-        // after one wire_window invocation.
+        // the supplied `DeviceProfile` AND wires the default GestureConfig in
+        // a single call. We verify both globals end up with the documented
+        // desktop-preset values after one wire_window invocation.
         install_test_platform_once_per_thread();
         ensure_icons_init();
         let window = MainWindow::new().expect("MainWindow::new under headless test platform");
@@ -2976,7 +2995,8 @@ mod tests {
         // any per-tile rendering — the property models are still populated
         // (as empty VecModels) and the AnimationBudget + GestureConfig
         // globals are still written.
-        wire_window(&window, &[]).expect("wire_window with empty tiles must succeed");
+        wire_window(&window, &[], &PROFILE_DESKTOP)
+            .expect("wire_window with empty tiles must succeed");
 
         let budget = window.global::<AnimationBudget>();
         assert_eq!(
@@ -3000,6 +3020,64 @@ mod tests {
         assert_eq!(gesture.get_double_tap_max_gap_ms(), 300);
         assert!(gesture.get_double_tap_enabled());
         assert!(gesture.get_arm_double_tap_timer());
+    }
+
+    /// TASK-120b F4: a non-desktop profile must reach the Slint
+    /// `AnimationBudget` globals through `wire_window` (the read sites
+    /// post-TASK-120b are `profile.animation_framerate_cap` and
+    /// `profile.max_simultaneous_animations`). Pre-TASK-120b every dashboard
+    /// — desktop or SBC — silently ran with the desktop animation budget;
+    /// this test rejects a regression to that behaviour.
+    ///
+    /// We use OPI Zero 3 (20 fps cap, 2 simultaneous animations) because
+    /// every distinguishing field differs from `PROFILE_DESKTOP` (60 fps,
+    /// 8 simultaneous), so the assertions cannot pass by coincidence.
+    #[test]
+    fn wire_window_propagates_opi_zero3_animation_budget_to_globals() {
+        use crate::dashboard::profiles::PROFILE_OPI_ZERO3;
+
+        // Pre-condition: OPI Zero 3 differs from Desktop on both threaded
+        // animation fields. If a future profile-table edit aligned them,
+        // this test would pass trivially; the asserts below would then
+        // need a different distinguishing profile.
+        assert_ne!(
+            PROFILE_OPI_ZERO3.animation_framerate_cap, PROFILE_DESKTOP.animation_framerate_cap,
+            "PROFILE_OPI_ZERO3.animation_framerate_cap must differ from \
+             PROFILE_DESKTOP so this test rejects a regression to the \
+             desktop default",
+        );
+        assert_ne!(
+            PROFILE_OPI_ZERO3.max_simultaneous_animations,
+            PROFILE_DESKTOP.max_simultaneous_animations,
+            "PROFILE_OPI_ZERO3.max_simultaneous_animations must differ from \
+             PROFILE_DESKTOP so this test rejects a regression to the \
+             desktop default",
+        );
+
+        install_test_platform_once_per_thread();
+        ensure_icons_init();
+        let window = MainWindow::new().expect("MainWindow::new under headless test platform");
+
+        wire_window(&window, &[], &PROFILE_OPI_ZERO3)
+            .expect("wire_window with PROFILE_OPI_ZERO3 must succeed");
+
+        let budget = window.global::<AnimationBudget>();
+        assert_eq!(
+            budget.get_framerate_cap(),
+            i32::try_from(PROFILE_OPI_ZERO3.animation_framerate_cap)
+                .expect("PROFILE_OPI_ZERO3 framerate_cap fits in i32"),
+            "wire_window must propagate PROFILE_OPI_ZERO3.animation_framerate_cap \
+             (20) to AnimationBudget.framerate-cap; a regression to the desktop \
+             default (60) would fail here",
+        );
+        assert_eq!(
+            budget.get_max_simultaneous(),
+            i32::try_from(PROFILE_OPI_ZERO3.max_simultaneous_animations)
+                .expect("PROFILE_OPI_ZERO3 max_simultaneous fits in i32"),
+            "wire_window must propagate PROFILE_OPI_ZERO3.max_simultaneous_animations \
+             (2) to AnimationBudget.max-simultaneous; a regression to the desktop \
+             default (8) would fail here",
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4982,7 +5060,7 @@ mod tests {
     // and `touch_input: false` respectively via direct struct construction.
     // No new builder method (`with_touch_input`) is added.
 
-    use crate::dashboard::profiles::{Density, DeviceProfile, PROFILE_DESKTOP};
+    use crate::dashboard::profiles::{Density, DeviceProfile};
     use crate::dashboard::schema::{Layout, View as DashView};
 
     /// Build a minimal two-view `Dashboard` for testing.
