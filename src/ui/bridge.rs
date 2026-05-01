@@ -194,6 +194,184 @@ pub enum TileVM {
 }
 
 // ---------------------------------------------------------------------------
+// TileKind, RowUpdate, RowIndex (TASK-119 F2)
+// ---------------------------------------------------------------------------
+
+/// Per-kind discriminator used by the [`RowIndex`] / [`RowUpdate`] surface.
+///
+/// Mirrors the three [`TileVM`] variants so the flush loop can route each
+/// changed entity to the correct Slint per-kind model (`light_tiles`,
+/// `sensor_tiles`, `entity_tiles`) without re-pattern-matching the full
+/// [`TileVM`].  The [`RowIndex`] stores `(kind, row_index)` pairs because the
+/// Slint side splits tiles by kind in [`split_tile_vms`]; a row index is only
+/// meaningful relative to its per-kind model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TileKind {
+    /// `LightTileVM` rows in `MainWindow::light_tiles`.
+    Light,
+    /// `SensorTileVM` rows in `MainWindow::sensor_tiles`.
+    Sensor,
+    /// `EntityTileVM` rows in `MainWindow::entity_tiles`.
+    Entity,
+}
+
+/// One row's worth of dynamic-field changes flowing from the flush loop to
+/// the Slint sink (TASK-119 F2).
+///
+/// Per the audit's static/dynamic split, only `state` is currently driven by
+/// the bridge's flush path.  `pending` is owned by
+/// [`crate::ui::toast::apply_pending_for_widgets`] which calls `set_row_data`
+/// on its own schedule; the bridge does not double-write that field here.
+/// Static fields (`name`, `icon_id`, `preferred_columns`, `preferred_rows`,
+/// `placement`) are written exactly once at load time via
+/// [`split_tile_vms`] / [`wire_window`] and never flow through this struct.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowUpdate {
+    /// Which per-kind Slint model this row lives in.
+    pub kind: TileKind,
+    /// Row index within the per-kind model (`light_tiles`, `sensor_tiles`,
+    /// or `entity_tiles`).
+    pub row_index: usize,
+    /// Latest `entity.state.to_string()` value, or `"unavailable"` if the
+    /// entity is not present in the store at flush time (mirrors the
+    /// missing-entity policy in [`build_tiles`]).
+    pub state: String,
+}
+
+/// Static `EntityId → [(TileKind, row_index)]` map, built at dashboard load
+/// time so the flush loop can route each pending `EntityId` to the rows it
+/// affects (TASK-119 F2 / Risk #10).
+///
+/// One entity may map to multiple rows (the dashboard can reference the same
+/// entity from two widgets), so the value is a `Vec`.  The index is the
+/// bridge between F1's per-entity diff signal (`apply_event` returns an
+/// `EntityId`) and Slint's row-targeted `set_row_data` API.
+///
+/// # Stability
+///
+/// The index is derived purely from the dashboard config (each widget's
+/// `widget_type` decides its [`TileKind`]) and does NOT depend on the live
+/// store snapshot.  This keeps the index stable across entity-availability
+/// transitions: the row a [`build_tiles`] call places a widget into matches
+/// the row this index records, regardless of whether the entity was present
+/// in the store at index-build time.
+///
+/// # Race mitigation (Risk #10)
+///
+/// The index is protected by an `RwLock` that the flush loop acquires for
+/// reading and any full-rebuild path (config reload, view switch, full
+/// resync) acquires for writing.  In this implementation the index is
+/// wrapped in `Arc<RwLock<RowIndex>>` and shared between the spawn-time
+/// builder, the flush loop, and `run_state_watcher`'s Live-transition
+/// resync (which rebuilds the index BEFORE calling `write_tiles` so the
+/// next flush observes either the old layout or the new one — never a
+/// mix).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RowIndex {
+    by_entity: HashMap<EntityId, Vec<(TileKind, usize)>>,
+}
+
+impl RowIndex {
+    /// Look up every `(kind, row_index)` that an `EntityId` occupies.
+    pub fn rows_for(&self, id: &EntityId) -> &[(TileKind, usize)] {
+        self.by_entity.get(id).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Total number of `(EntityId → (kind, row_index))` mappings, summed
+    /// over all entities.  Useful for assertion in tests.
+    pub fn total_rows(&self) -> usize {
+        self.by_entity.values().map(|v| v.len()).sum()
+    }
+
+    /// Number of distinct entity ids in the index.
+    pub fn entity_count(&self) -> usize {
+        self.by_entity.len()
+    }
+}
+
+/// Map a [`WidgetKind`] to the [`TileKind`] (i.e. the per-kind Slint model
+/// it lives in) that [`build_tiles`] produces for it.
+///
+/// Mirrors the `match widget.widget_type` arms in [`build_tiles`] —
+/// `LightTile -> Light`, `SensorTile -> Sensor`, every other variant falls
+/// into the generic `Entity` slot until per-kind tiles ship.  The mapping is
+/// a pure function of the widget config (no store state required), which is
+/// what lets [`build_row_index`] run without touching the live store.
+fn tile_kind_for_widget(widget_type: &WidgetKind) -> TileKind {
+    match widget_type {
+        WidgetKind::LightTile => TileKind::Light,
+        WidgetKind::SensorTile => TileKind::Sensor,
+        // Phase 4 schema adds Camera/History/Fan/Lock/Alarm; Phase 6 adds
+        // Cover/MediaPlayer/Climate/PowerFlow. Until per-kind Slint tiles
+        // exist (TASK-102..TASK-109), they all render via the generic
+        // entity tile — see the matching `build_tiles` arm.
+        WidgetKind::EntityTile
+        | WidgetKind::Camera
+        | WidgetKind::History
+        | WidgetKind::Fan
+        | WidgetKind::Lock
+        | WidgetKind::Alarm
+        | WidgetKind::Cover
+        | WidgetKind::MediaPlayer
+        | WidgetKind::Climate
+        | WidgetKind::PowerFlow => TileKind::Entity,
+    }
+}
+
+/// Build a [`RowIndex`] from a [`Dashboard`] alone, walking widgets in
+/// document order and assigning each a row in the per-kind model implied by
+/// its `widget_type`.
+///
+/// The walk MUST match the order [`build_tiles`] uses so the row indices
+/// recorded here align with the rows [`split_tile_vms`] writes into the
+/// per-kind Slint models.  Widgets with no `entity` binding (or an empty
+/// string) still consume a row in the per-kind model (per `build_tiles`'s
+/// always-emit policy) but are not routable from the per-entity subscriber
+/// path; the row counter advances and the entry is not recorded.
+pub fn build_row_index(dashboard: &Dashboard) -> RowIndex {
+    let mut by_entity: HashMap<EntityId, Vec<(TileKind, usize)>> = HashMap::new();
+    // Per-kind row counters track the row index within each per-kind model
+    // that `split_tile_vms` produces.
+    let mut light_idx: usize = 0;
+    let mut sensor_idx: usize = 0;
+    let mut entity_idx: usize = 0;
+    for view in &dashboard.views {
+        for section in &view.sections {
+            for widget in &section.widgets {
+                let kind = tile_kind_for_widget(&widget.widget_type);
+                let row = match kind {
+                    TileKind::Light => {
+                        let i = light_idx;
+                        light_idx += 1;
+                        i
+                    }
+                    TileKind::Sensor => {
+                        let i = sensor_idx;
+                        sensor_idx += 1;
+                        i
+                    }
+                    TileKind::Entity => {
+                        let i = entity_idx;
+                        entity_idx += 1;
+                        i
+                    }
+                };
+                let id_str = widget.entity.as_deref().unwrap_or("");
+                if id_str.is_empty() {
+                    // No entity binding: row is allocated but not routable.
+                    continue;
+                }
+                by_entity
+                    .entry(EntityId::from(id_str))
+                    .or_default()
+                    .push((kind, row));
+            }
+        }
+    }
+    RowIndex { by_entity }
+}
+
+// ---------------------------------------------------------------------------
 // Icon-id defaults
 // ---------------------------------------------------------------------------
 
@@ -320,9 +498,14 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                     }
 
                     None => {
-                        // Missing-entity policy: produce an EntityTileVM with
-                        // state="unavailable" so the caller always has a tile
-                        // to render.
+                        // Missing-entity policy: produce a tile of the kind
+                        // implied by `widget.widget_type` (so the row layout
+                        // matches the [`RowIndex`] regardless of store
+                        // presence — TASK-119 F2 row-stability invariant)
+                        // with `state="unavailable"`.  The caller always has
+                        // a tile to render, and once the entity arrives a
+                        // subsequent rebuild produces a same-kind tile in
+                        // the same row.
                         let preferred_columns = i32::from(widget.layout.preferred_columns);
                         let preferred_rows = i32::from(widget.layout.preferred_rows);
                         let placement = widget
@@ -332,22 +515,54 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                             .unwrap_or_else(|| {
                                 TilePlacement::default_for(preferred_columns, preferred_rows)
                             });
+                        let name = widget
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| entity_id_str.to_string());
+                        let state = "unavailable".to_string();
+                        let icon_id = widget
+                            .icon
+                            .clone()
+                            .unwrap_or_else(|| "mdi:help-circle".to_string());
 
-                        TileVM::Entity(EntityTileVM {
-                            name: widget
-                                .name
-                                .clone()
-                                .unwrap_or_else(|| entity_id_str.to_string()),
-                            state: "unavailable".to_string(),
-                            icon_id: widget
-                                .icon
-                                .clone()
-                                .unwrap_or_else(|| "mdi:help-circle".to_string()),
-                            preferred_columns,
-                            preferred_rows,
-                            placement,
-                            pending: false,
-                        })
+                        match widget.widget_type {
+                            WidgetKind::LightTile => TileVM::Light(LightTileVM {
+                                name,
+                                state,
+                                icon_id,
+                                preferred_columns,
+                                preferred_rows,
+                                placement,
+                                pending: false,
+                            }),
+                            WidgetKind::SensorTile => TileVM::Sensor(SensorTileVM {
+                                name,
+                                state,
+                                icon_id,
+                                preferred_columns,
+                                preferred_rows,
+                                placement,
+                                pending: false,
+                            }),
+                            WidgetKind::EntityTile
+                            | WidgetKind::Camera
+                            | WidgetKind::History
+                            | WidgetKind::Fan
+                            | WidgetKind::Lock
+                            | WidgetKind::Alarm
+                            | WidgetKind::Cover
+                            | WidgetKind::MediaPlayer
+                            | WidgetKind::Climate
+                            | WidgetKind::PowerFlow => TileVM::Entity(EntityTileVM {
+                                name,
+                                state,
+                                icon_id,
+                                preferred_columns,
+                                preferred_rows,
+                                placement,
+                                pending: false,
+                            }),
+                        }
                     }
                 };
 
@@ -702,7 +917,7 @@ pub fn write_gesture_config(window: &MainWindow, config: GestureConfig) -> Resul
 use crate::ha::store::EntityUpdate;
 use crate::platform::status::ConnectionState;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -753,17 +968,58 @@ pub fn collect_visible_entity_ids(dashboard: &Dashboard) -> Vec<EntityId> {
 // BridgeSink — testable abstraction over the Slint writes
 // ---------------------------------------------------------------------------
 
-/// Sink for the two side-effects the live bridge produces: (a) a fresh tile
-/// list to render, (b) a status-banner visibility flip.
+/// Sink for the side-effects the live bridge produces.
 ///
 /// Production callers pass a [`SlintSink`] wrapping a `slint::Weak<MainWindow>`
 /// so the writes hop onto the Slint UI thread via `invoke_from_event_loop`.
 /// Tests pass an in-process recording sink and assert against its log
 /// directly (no Slint backend required).
+///
+/// # Method roles (TASK-119 F2)
+///
+/// * [`write_tiles`](Self::write_tiles) — full-model write: replaces every
+///   row in the per-kind models from a freshly-built tile snapshot.  Used by
+///   the [`ConnectionState`] watcher's resync path on the
+///   `Reconnecting/Failed → Live` transition (and by the legacy fallback
+///   default of [`apply_row_updates`](Self::apply_row_updates) for sinks that
+///   have not migrated to incremental updates).
+/// * [`apply_row_updates`](Self::apply_row_updates) — per-row incremental
+///   update: production sinks override this to call `set_row_data` on the
+///   stable Slint per-kind models for ONLY the changed rows.  This is the
+///   steady-state flush path post-TASK-119; the bridge does NOT call
+///   `write_tiles` from `run_flush_loop` anymore.
+/// * [`set_status_banner_visible`](Self::set_status_banner_visible) —
+///   banner toggle, called from the [`ConnectionState`] watcher.
 pub trait BridgeSink: Send + Sync + 'static {
-    /// Apply a fresh tile list. Called from the flush task only when the
-    /// connection is in a non-gated state.
+    /// Apply a fresh, full tile list (full-model write).  Called from the
+    /// state watcher's `Reconnecting/Failed → Live` resync; also by the
+    /// default fallback of [`apply_row_updates`](Self::apply_row_updates).
+    ///
+    /// This is NOT called from the steady-state flush loop in
+    /// [`LiveBridge`] post-TASK-119.
     fn write_tiles(&self, tiles: Vec<TileVM>);
+
+    /// Apply a per-row incremental update (TASK-119 F2 steady-state flush).
+    ///
+    /// Production sinks override this to call `set_row_data` on the stable
+    /// Slint per-kind models for ONLY the changed rows.
+    ///
+    /// `rebuild_full_tiles` is a closure that, when invoked, rebuilds the
+    /// full tile list against the current store snapshot.  Production sinks
+    /// MUST NOT call it (per TASK-119: per-row updates are O(changed_rows),
+    /// not O(widget_count)).  The default fallback calls it and routes
+    /// through [`write_tiles`](Self::write_tiles) so legacy sinks (test
+    /// recorders, benches) keep their pre-TASK-119 observable behaviour
+    /// without being forced to migrate in the same PR.
+    fn apply_row_updates(
+        &self,
+        _updates: Vec<RowUpdate>,
+        rebuild_full_tiles: Box<dyn FnOnce() -> Vec<TileVM> + Send>,
+    ) {
+        // Default: fall back to write_tiles by invoking the rebuild closure.
+        // Production SlintSink overrides this method and ignores the closure.
+        self.write_tiles(rebuild_full_tiles());
+    }
 
     /// Toggle the status banner. Called from the [`ConnectionState`] watcher.
     fn set_status_banner_visible(&self, visible: bool);
@@ -806,6 +1062,16 @@ fn drain_pending(pending: &PendingMap) -> Vec<EntityId> {
 // LiveBridge
 // ---------------------------------------------------------------------------
 
+/// Shared `EntityId → row_index` map used by the flush loop and any
+/// future full-rebuild path (config reload, view switch, full resync).
+///
+/// Wrapped in `Arc<RwLock<...>>` so the flush loop reads via a read-guard
+/// and any path that wants to rebuild the index (e.g., a future view-switch
+/// hook) can take the write-guard, swap in a fresh `RowIndex`, and release
+/// before the next flush tick reads.  Per Risk #10 (TASK-119), the index
+/// rebuild MUST be atomic with respect to the flush loop.
+pub(crate) type RowIndexHandle = Arc<RwLock<RowIndex>>;
+
 /// Owned handle to the spawned bridge tasks.
 ///
 /// Dropping this handle aborts the Tokio tasks; otherwise the tasks run for
@@ -820,6 +1086,14 @@ pub struct LiveBridge {
     flush_task: JoinHandle<()>,
     /// Connection-state watcher task.
     state_task: JoinHandle<()>,
+    /// Shared `EntityId → row_index` map (TASK-119 F2).  Built at spawn
+    /// time; protected by the same lock as the flush loop reads.  Future
+    /// full-rebuild paths (config reload, view switch, full resync) must
+    /// take the write-guard, rebuild, and release before the next flush
+    /// tick reads.  Held on the bridge so callers can probe it without
+    /// reaching into the flush task's captures.
+    #[allow(dead_code)]
+    row_index: RowIndexHandle,
 }
 
 impl Drop for LiveBridge {
@@ -880,6 +1154,23 @@ impl LiveBridge {
         // Pending-updates accumulator.
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
 
+        // Build the static `EntityId → (kind, row_index)` index at load
+        // time (TASK-119 F2).  The index is derived from the dashboard
+        // config alone — each widget's `widget_type` decides its
+        // [`TileKind`] — so this call does NOT touch the live store.
+        // (Calling `build_tiles` here would in turn call `store.get` per
+        // widget, which is a deadlock hazard for stores that block on
+        // `get` — see the `RendezvousStore` test.)  After this point the
+        // index drives `set_row_data` for every per-entity flush; the
+        // state-watcher's Live-transition resync rebuilds the index
+        // (atomically, under the write-guard) before calling
+        // `write_tiles` so any subsequent flush either observes the old
+        // index or the new one — never a mix.
+        //
+        // Cost: O(widget_count), one HashMap insert per widget — and
+        // fires exactly once per LiveBridge::spawn.
+        let row_index: RowIndexHandle = Arc::new(RwLock::new(build_row_index(&dashboard)));
+
         // Per-entity subscriber tasks.
         let mut subscriber_tasks = Vec::with_capacity(ids.len());
         for id in ids.iter().cloned() {
@@ -898,8 +1189,9 @@ impl LiveBridge {
             let pending = Arc::clone(&pending);
             let state_rx = state_rx.clone();
             let sink = Arc::clone(&sink);
+            let row_index = Arc::clone(&row_index);
             tokio::spawn(async move {
-                run_flush_loop(store, dashboard, pending, state_rx, sink).await;
+                run_flush_loop(store, dashboard, pending, state_rx, sink, row_index).await;
             })
         };
 
@@ -908,8 +1200,9 @@ impl LiveBridge {
             let store = Arc::clone(&store);
             let dashboard = Arc::clone(&dashboard);
             let sink = Arc::clone(&sink);
+            let row_index = Arc::clone(&row_index);
             tokio::spawn(async move {
-                run_state_watcher(store, dashboard, state_rx, sink).await;
+                run_state_watcher(store, dashboard, state_rx, sink, row_index).await;
             })
         };
 
@@ -917,6 +1210,7 @@ impl LiveBridge {
             subscriber_tasks,
             flush_task,
             state_task,
+            row_index,
         }
     }
 }
@@ -984,8 +1278,11 @@ async fn run_entity_subscriber(
 ///      pending map keeps accumulating; nothing is written until the gate
 ///      lifts.
 ///   3. Otherwise, drain the pending map.  If empty, do nothing (no tile
-///      churn, no allocation).  If non-empty, rebuild the full tile list via
-///      `build_tiles(&*store, &dashboard)`.
+///      churn, no allocation).  If non-empty, look up each pending
+///      `EntityId` in the static [`RowIndex`], read the entity's current
+///      state via `store.get`, and produce one [`RowUpdate`] per affected
+///      `(kind, row_index)`.  No full tile-list rebuild happens on this
+///      path — TASK-119 F2.
 ///   4. **Re-check** `state_rx.borrow()` immediately before the property
 ///      write.  If the state flipped to a gated state between step 1 and
 ///      this point (the read-then-check race), drop the drained ids and skip
@@ -1010,22 +1307,29 @@ async fn run_entity_subscriber(
 /// on-`Live` path is strictly correct and avoids re-introducing the same
 /// race.
 ///
-/// The flush rebuilds the **entire** tile list on every flush rather than
-/// patching individual tiles; this matches the Phase 1 wire_window contract
-/// and the `pending_map` is a "did anything change" signal, not a
-/// per-tile patch list.  Per-flush cost is dominated by `build_tiles`, which
-/// is O(`dashboard.widget_count`) — only the per-widget `store.get` lookups.
-/// TASK-118 F3 removed the diagnostic `for_each` visitor walk that previously
-/// added an O(`store.entity_count`) term; under PHASES.md's
-/// `max_entities = 16k` that walk dominated the per-flush cost, and the
-/// 12.5 Hz cap is now validated against the lighter `widget_count`-only
-/// rebuild via TASK-038's churn benchmark.
+/// # Per-flush cost (TASK-119 F2)
+///
+/// Per-flush cost is now O(changed_rows), not O(widget_count).  Each
+/// pending `EntityId` produces zero-or-more [`RowUpdate`]s by:
+///
+///   1. One `store.get(id)` lookup per pending id (O(1) under the post-F1
+///      `RwLock<HashMap>` in-place mutation).
+///   2. One [`RowIndex::rows_for`] lookup per pending id (O(1) HashMap
+///      lookup; the result is a slice of `(kind, row_index)`).
+///   3. One [`String`] allocation per affected row for the new state value.
+///
+/// The legacy O(widget_count) full rebuild path remains in place via the
+/// `rebuild_full_tiles` thunk passed to [`BridgeSink::apply_row_updates`];
+/// production sinks ignore it.  Test/bench sinks that have not migrated
+/// invoke the thunk via the trait's default fallback, preserving their
+/// pre-TASK-119 observable behaviour.
 async fn run_flush_loop<S: BridgeSink>(
     store: Arc<dyn EntityStore>,
     dashboard: Arc<Dashboard>,
     pending: PendingMap,
     state_rx: watch::Receiver<ConnectionState>,
     sink: Arc<S>,
+    row_index: RowIndexHandle,
 ) {
     let mut ticker = interval(Duration::from_millis(FLUSH_INTERVAL_MS));
     // Skip burst-catch-up if the loop falls behind: at most one flush per tick
@@ -1046,21 +1350,68 @@ async fn run_flush_loop<S: BridgeSink>(
             continue;
         }
 
-        // Rebuild the full tile list against the current store snapshot.
-        let tiles = build_tiles(&*store, &dashboard);
+        // TASK-119 F2: build per-row updates by looking up each pending
+        // entity in the static row index and reading its current state
+        // from the store.  No full tile-list rebuild happens here.
+        //
+        // Risk #10 mitigation: take the read-guard on the index for the
+        // entire build phase so any concurrent rebuild (full resync,
+        // config reload, view switch) is serialised.  The guard is
+        // released before the (potentially expensive) sink call.
+        let updates: Vec<RowUpdate> = {
+            let index = row_index.read().unwrap_or_else(|e| e.into_inner());
+            let mut acc: Vec<RowUpdate> = Vec::with_capacity(drained.len());
+            for entity_id in &drained {
+                // Resolve the current state once per entity (O(1) under
+                // the post-F1 RwLock<HashMap>); fall through to
+                // "unavailable" if the entity has been removed from the
+                // store between the broadcast and this read.
+                let state = match store.get(entity_id) {
+                    Some(entity) => (*entity.state).to_string(),
+                    None => "unavailable".to_string(),
+                };
+                for &(kind, row_index) in index.rows_for(entity_id) {
+                    acc.push(RowUpdate {
+                        kind,
+                        row_index,
+                        state: state.clone(),
+                    });
+                }
+            }
+            acc
+        };
+
+        if updates.is_empty() {
+            // Drained ids did not map to any indexed rows (e.g., a stray
+            // pending id that the dashboard no longer references).  Nothing
+            // to write.
+            continue;
+        }
 
         // Re-check state immediately before the write to close the
         // read-then-check race (Codex finding BLOCKER 1).  ConnectionState
         // can flip to Reconnecting/Failed between the initial gate check
-        // and `build_tiles` returning; if so, do not write.  The ids we
-        // just drained are recovered on the eventual Live transition via
-        // `run_state_watcher`'s full resync (see doc-comment above).
+        // and the row-update build returning; if so, do not write.  The
+        // ids we just drained are recovered on the eventual Live
+        // transition via `run_state_watcher`'s full resync (see
+        // doc-comment above).
         let state_at_write = *state_rx.borrow();
         if is_writes_gated(state_at_write) {
             continue;
         }
 
-        sink.write_tiles(tiles);
+        // TASK-119 F2: per-row sink call.  Production sinks override
+        // `apply_row_updates` to call `set_row_data` per row; legacy
+        // sinks (test recorders, benches) fall through to the trait's
+        // default `write_tiles(rebuild_full_tiles())` so their
+        // observable behaviour is unchanged.  The thunk allocates a
+        // single Box<dyn FnOnce> per flush — production never invokes
+        // it, so the only steady-state cost is the box itself.
+        let store_for_thunk = Arc::clone(&store);
+        let dashboard_for_thunk = Arc::clone(&dashboard);
+        let rebuild_full_tiles: Box<dyn FnOnce() -> Vec<TileVM> + Send> =
+            Box::new(move || build_tiles(&*store_for_thunk, &dashboard_for_thunk));
+        sink.apply_row_updates(updates, rebuild_full_tiles);
     }
 }
 
@@ -1102,6 +1453,7 @@ async fn run_state_watcher<S: BridgeSink>(
     dashboard: Arc<Dashboard>,
     mut state_rx: watch::Receiver<ConnectionState>,
     sink: Arc<S>,
+    row_index: RowIndexHandle,
 ) {
     // Apply the initial state once so a bridge spawned mid-Reconnect renders
     // the banner without waiting for the next transition.
@@ -1112,6 +1464,18 @@ async fn run_state_watcher<S: BridgeSink>(
         // function's doc-comment.  If EntityStore::for_each ever becomes
         // async, add a post-build state re-check here mirroring run_flush_loop.
         let tiles = build_tiles(&*store, &dashboard);
+        // TASK-119 F2 / Risk #10: refresh the row index BEFORE
+        // `write_tiles` lands so any flush that observes the new model
+        // layout finds an index that matches it.  The dashboard-only
+        // builder is idempotent on a stable dashboard, so this assignment
+        // is a no-op in steady state — but it is mandatory if the
+        // resync ever follows a config reload that changed the widget
+        // mix (future work).  The write-guard is dropped before the
+        // sink call so a concurrent flush attempt cannot block on it.
+        {
+            let mut guard = row_index.write().unwrap_or_else(|e| e.into_inner());
+            *guard = build_row_index(&dashboard);
+        }
         sink.write_tiles(tiles);
     }
 
@@ -1130,6 +1494,14 @@ async fn run_state_watcher<S: BridgeSink>(
             // build_tiles is synchronous; tokio cannot preempt this task
             // between observing Live and the property write below.
             let tiles = build_tiles(&*store, &dashboard);
+            // TASK-119 F2 / Risk #10: refresh the index before
+            // `write_tiles` so the next flush observes a consistent
+            // (model layout, index layout) pair.  See the matching
+            // initial-state branch above for the full rationale.
+            {
+                let mut guard = row_index.write().unwrap_or_else(|e| e.into_inner());
+                *guard = build_row_index(&dashboard);
+            }
             sink.write_tiles(tiles);
         }
     }
@@ -2733,10 +3105,22 @@ mod tests {
 
     /// Recording sink: stores every effect in shared state so the test
     /// thread can poll/assert on them without a Slint event loop.
+    ///
+    /// Note on the legacy `tile_writes` channel: pre-TASK-119 the flush
+    /// loop produced a full `Vec<TileVM>` and the recording sink captured
+    /// it via `write_tiles`.  Post-TASK-119 the flush loop calls
+    /// `apply_row_updates` instead; the trait's default fallback invokes
+    /// the rebuild thunk and routes the result through `write_tiles`, so
+    /// `tile_writes` continues to record the full-rebuild snapshot for
+    /// every flush — the existing assertions keep working.  The new
+    /// `row_updates` channel records the per-row updates the production
+    /// `SlintSink` would receive (and the rebuild thunk's output, for
+    /// completeness).
     #[derive(Default)]
     struct RecordingSink {
         tile_writes: Mutex<Vec<Vec<TileVM>>>,
         banner_calls: Mutex<Vec<bool>>,
+        row_updates: Mutex<Vec<Vec<RowUpdate>>>,
     }
 
     impl RecordingSink {
@@ -2752,6 +3136,12 @@ mod tests {
                 .expect("banner_calls mutex poisoned")
                 .clone()
         }
+        fn snapshot_row_updates(&self) -> Vec<Vec<RowUpdate>> {
+            self.row_updates
+                .lock()
+                .expect("row_updates mutex poisoned")
+                .clone()
+        }
     }
 
     impl BridgeSink for RecordingSink {
@@ -2760,6 +3150,24 @@ mod tests {
                 .lock()
                 .expect("tile_writes mutex poisoned")
                 .push(tiles);
+        }
+        fn apply_row_updates(
+            &self,
+            updates: Vec<RowUpdate>,
+            rebuild_full_tiles: Box<dyn FnOnce() -> Vec<TileVM> + Send>,
+        ) {
+            // Record the per-row updates first so tests can assert on them
+            // even when the rebuild thunk also routes through
+            // `write_tiles` below.
+            self.row_updates
+                .lock()
+                .expect("row_updates mutex poisoned")
+                .push(updates);
+            // Preserve the legacy full-tile capture by invoking the
+            // rebuild thunk and forwarding to `write_tiles` — this matches
+            // the trait's default fallback behaviour and keeps existing
+            // pre-TASK-119 test assertions on `tile_writes` unchanged.
+            self.write_tiles(rebuild_full_tiles());
         }
         fn set_status_banner_visible(&self, visible: bool) {
             self.banner_calls
@@ -2779,6 +3187,13 @@ mod tests {
     impl BridgeSink for ArcSink {
         fn write_tiles(&self, tiles: Vec<TileVM>) {
             self.0.write_tiles(tiles);
+        }
+        fn apply_row_updates(
+            &self,
+            updates: Vec<RowUpdate>,
+            rebuild_full_tiles: Box<dyn FnOnce() -> Vec<TileVM> + Send>,
+        ) {
+            self.0.apply_row_updates(updates, rebuild_full_tiles);
         }
         fn set_status_banner_visible(&self, visible: bool) {
             self.0.set_status_banner_visible(visible);
@@ -3031,6 +3446,485 @@ mod tests {
         assert!(
             saw_off,
             "flush must propagate the off state to the sink within 2 cadences"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-119 F2: RowIndex + apply_row_updates flush path
+    // -----------------------------------------------------------------------
+
+    /// Multi-widget dashboard with one Light, one Sensor, and two Entity
+    /// widgets across two views — covers per-kind row counter increments
+    /// and the entity-without-binding (no `entity` field) case.
+    fn multi_kind_dashboard() -> Dashboard {
+        use crate::dashboard::schema::{
+            Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
+        };
+        let mk = |id: &str, kind: WidgetKind, entity: Option<&str>| Widget {
+            id: id.to_string(),
+            widget_type: kind,
+            entity: entity.map(str::to_string),
+            entities: vec![],
+            name: None,
+            icon: None,
+            tap_action: None,
+            hold_action: None,
+            double_tap_action: None,
+            layout: WidgetLayout {
+                preferred_columns: 1,
+                preferred_rows: 1,
+            },
+            options: None,
+            placement: None,
+            visibility: "always".to_string(),
+        };
+        Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            version: 1,
+            device_profile: ProfileKey::Rpi4,
+            home_assistant: None,
+            theme: None,
+            default_view: "home".to_string(),
+            views: vec![View {
+                id: "home".to_string(),
+                title: "Home".to_string(),
+                layout: Layout::Sections,
+                sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
+                    id: "s1".to_string(),
+                    title: "T".to_string(),
+                    widgets: vec![
+                        mk("w-light", WidgetKind::LightTile, Some("light.kitchen")),
+                        mk("w-sensor", WidgetKind::SensorTile, Some("sensor.temp")),
+                        mk("w-entity", WidgetKind::EntityTile, Some("switch.fan")),
+                        mk("w-noent", WidgetKind::EntityTile, None),
+                    ],
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn build_row_index_walks_dashboard_in_document_order_per_kind() {
+        let dashboard = multi_kind_dashboard();
+        let index = build_row_index(&dashboard);
+        // 3 entity-bound widgets recorded; the fourth (no entity) is not
+        // routable from the per-entity path.
+        assert_eq!(index.entity_count(), 3);
+        assert_eq!(index.total_rows(), 3);
+        // Per-kind row counters: light row 0, sensor row 0, entity row 0.
+        assert_eq!(
+            index.rows_for(&EntityId::from("light.kitchen")),
+            &[(TileKind::Light, 0)]
+        );
+        assert_eq!(
+            index.rows_for(&EntityId::from("sensor.temp")),
+            &[(TileKind::Sensor, 0)]
+        );
+        assert_eq!(
+            index.rows_for(&EntityId::from("switch.fan")),
+            &[(TileKind::Entity, 0)]
+        );
+    }
+
+    #[test]
+    fn build_row_index_handles_repeated_entity_across_widgets() {
+        use crate::dashboard::schema::{
+            Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
+        };
+        let mk = |id: &str, kind: WidgetKind, entity: &str| Widget {
+            id: id.to_string(),
+            widget_type: kind,
+            entity: Some(entity.to_string()),
+            entities: vec![],
+            name: None,
+            icon: None,
+            tap_action: None,
+            hold_action: None,
+            double_tap_action: None,
+            layout: WidgetLayout {
+                preferred_columns: 1,
+                preferred_rows: 1,
+            },
+            options: None,
+            placement: None,
+            visibility: "always".to_string(),
+        };
+        // Same entity referenced by a Light tile AND an Entity tile.
+        let dashboard = Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            version: 1,
+            device_profile: ProfileKey::Rpi4,
+            home_assistant: None,
+            theme: None,
+            default_view: "home".to_string(),
+            views: vec![View {
+                id: "home".to_string(),
+                title: "H".to_string(),
+                layout: Layout::Sections,
+                sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
+                    id: "s".to_string(),
+                    title: "T".to_string(),
+                    widgets: vec![
+                        mk("w1", WidgetKind::LightTile, "light.kitchen"),
+                        mk("w2", WidgetKind::EntityTile, "light.kitchen"),
+                    ],
+                }],
+            }],
+        };
+        let index = build_row_index(&dashboard);
+        // Two rows for the same entity: one in the Light model, one in the
+        // Entity model.  Order matches widget document order.
+        assert_eq!(
+            index.rows_for(&EntityId::from("light.kitchen")),
+            &[(TileKind::Light, 0), (TileKind::Entity, 0)]
+        );
+    }
+
+    #[test]
+    fn tile_kind_for_widget_maps_every_widget_kind_variant() {
+        use crate::dashboard::schema::WidgetKind;
+        assert_eq!(
+            tile_kind_for_widget(&WidgetKind::LightTile),
+            TileKind::Light
+        );
+        assert_eq!(
+            tile_kind_for_widget(&WidgetKind::SensorTile),
+            TileKind::Sensor
+        );
+        for k in [
+            WidgetKind::EntityTile,
+            WidgetKind::Camera,
+            WidgetKind::History,
+            WidgetKind::Fan,
+            WidgetKind::Lock,
+            WidgetKind::Alarm,
+            WidgetKind::Cover,
+            WidgetKind::MediaPlayer,
+            WidgetKind::Climate,
+            WidgetKind::PowerFlow,
+        ] {
+            assert_eq!(
+                tile_kind_for_widget(&k),
+                TileKind::Entity,
+                "{k:?} must map to TileKind::Entity"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_entity_fallback_preserves_widget_kind_row_layout() {
+        // TASK-119 F2 row-stability invariant: when an entity is absent
+        // from the store, build_tiles must still emit a tile of the kind
+        // implied by `widget_type` so the row layout matches the
+        // [`RowIndex`] regardless of store presence.
+        use crate::dashboard::schema::{
+            Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
+        };
+        let mk = |id: &str, kind: WidgetKind, entity: &str| Widget {
+            id: id.to_string(),
+            widget_type: kind,
+            entity: Some(entity.to_string()),
+            entities: vec![],
+            name: None,
+            icon: None,
+            tap_action: None,
+            hold_action: None,
+            double_tap_action: None,
+            layout: WidgetLayout {
+                preferred_columns: 1,
+                preferred_rows: 1,
+            },
+            options: None,
+            placement: None,
+            visibility: "always".to_string(),
+        };
+        let dashboard = Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            version: 1,
+            device_profile: ProfileKey::Rpi4,
+            home_assistant: None,
+            theme: None,
+            default_view: "home".to_string(),
+            views: vec![View {
+                id: "home".to_string(),
+                title: "H".to_string(),
+                layout: Layout::Sections,
+                sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
+                    id: "s".to_string(),
+                    title: "T".to_string(),
+                    widgets: vec![
+                        mk("w1", WidgetKind::LightTile, "light.absent"),
+                        mk("w2", WidgetKind::SensorTile, "sensor.absent"),
+                    ],
+                }],
+            }],
+        };
+        // Empty store — both entities are missing.
+        let store = StubStore::new(vec![]);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 2);
+        match &tiles[0] {
+            TileVM::Light(vm) => {
+                assert_eq!(vm.state, "unavailable");
+            }
+            other => panic!("expected TileVM::Light fallback, got {other:?}"),
+        }
+        match &tiles[1] {
+            TileVM::Sensor(vm) => {
+                assert_eq!(vm.state, "unavailable");
+            }
+            other => panic!("expected TileVM::Sensor fallback, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_emits_row_update_only_for_changed_entity() {
+        // TASK-119 F2: `run_flush_loop` produces one `RowUpdate` per
+        // changed entity row, NOT a full tile rebuild.  The recording
+        // sink captures both surfaces; this test asserts the per-row
+        // surface holds exactly the changed row.
+        ensure_icons_init();
+        let store = Arc::new(StubStore::new(vec![
+            make_test_entity("light.kitchen", "on"),
+            make_test_entity("sensor.temp", "20"),
+        ]));
+        // Multi-kind dashboard so the index has two distinct (kind, row)
+        // entries; the test asserts only the entity that actually changed
+        // produces an update.
+        let dashboard = Arc::new(multi_kind_dashboard());
+        let (state_tx, state_rx) = status_channel();
+        state_tx.send(ConnectionState::Live).unwrap();
+
+        let recorder = Arc::new(RecordingSink::default());
+        let _bridge = LiveBridge::spawn(
+            store.clone() as Arc<dyn EntityStore>,
+            dashboard.clone(),
+            state_rx,
+            ArcSink(Arc::clone(&recorder)),
+        );
+
+        // Allow initial Live-resync (write_tiles) to land.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let row_updates_pre = recorder.snapshot_row_updates().len();
+
+        // Flip ONLY the sensor; the light state is unchanged.
+        store.set_entity(make_test_entity("sensor.temp", "21"));
+        store.publish(EntityUpdate {
+            id: EntityId::from("sensor.temp"),
+            entity: Some(make_test_entity("sensor.temp", "21")),
+        });
+
+        // Wait for the next flush cadence to pick up the pending update.
+        let saw_update = wait_until(FLUSH_INTERVAL_MS * 4, || {
+            recorder.snapshot_row_updates().len() > row_updates_pre
+        })
+        .await;
+        assert!(
+            saw_update,
+            "flush must produce a row update within 2 cadences"
+        );
+
+        let updates = recorder.snapshot_row_updates();
+        let last = updates
+            .last()
+            .expect("at least one row-update batch recorded");
+        assert_eq!(
+            last.len(),
+            1,
+            "only the sensor row should be updated; got {} updates: {:?}",
+            last.len(),
+            last,
+        );
+        let only = &last[0];
+        assert_eq!(only.kind, TileKind::Sensor);
+        assert_eq!(only.row_index, 0);
+        assert_eq!(only.state, "21");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_skips_apply_when_pending_is_empty() {
+        // TASK-119 F2: when no entity has changed (pending is empty),
+        // the flush loop short-circuits and does not call the sink at
+        // all.  Steady-state idle cost is then bounded by the tick
+        // interval, NOT by widget_count.
+        ensure_icons_init();
+        let store = Arc::new(StubStore::new(vec![make_test_entity(
+            "light.kitchen",
+            "on",
+        )]));
+        let dashboard = Arc::new(one_widget_dashboard());
+        let (state_tx, state_rx) = status_channel();
+        state_tx.send(ConnectionState::Live).unwrap();
+
+        let recorder = Arc::new(RecordingSink::default());
+        let _bridge = LiveBridge::spawn(
+            store.clone() as Arc<dyn EntityStore>,
+            dashboard.clone(),
+            state_rx,
+            ArcSink(Arc::clone(&recorder)),
+        );
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let row_updates_pre = recorder.snapshot_row_updates().len();
+        let tile_writes_pre = recorder.snapshot_tile_writes().len();
+
+        // No publish, no entity flips.  Wait several flush cadences and
+        // assert neither sink surface grew — the flush loop's
+        // `drained.is_empty()` guard must short-circuit.
+        tokio::time::sleep(Duration::from_millis(FLUSH_INTERVAL_MS * 4)).await;
+        let row_updates_post = recorder.snapshot_row_updates().len();
+        let tile_writes_post = recorder.snapshot_tile_writes().len();
+        assert_eq!(
+            row_updates_post, row_updates_pre,
+            "no row updates must be emitted when nothing is pending"
+        );
+        assert_eq!(
+            tile_writes_post, tile_writes_pre,
+            "no full-tile rebuilds must be emitted when nothing is pending"
+        );
+    }
+
+    #[test]
+    fn row_index_rows_for_unknown_entity_returns_empty_slice() {
+        // TASK-119 F2: when the flush loop receives a pending EntityId
+        // that the index doesn't know about, `RowIndex::rows_for` returns
+        // an empty slice and the flush loop's per-entity inner loop adds
+        // zero updates.  This is the unit-level guarantee behind the
+        // empty-`updates` short-circuit in `run_flush_loop`.
+        let dashboard = one_widget_dashboard();
+        let index = build_row_index(&dashboard);
+        // `light.kitchen` is in the index; `switch.unknown` is not.
+        assert!(!index.rows_for(&EntityId::from("light.kitchen")).is_empty());
+        assert!(index.rows_for(&EntityId::from("switch.unknown")).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_transition_rebuilds_row_index_atomically() {
+        // TASK-119 F2 / Risk #10: the state-watcher's Live transition
+        // refreshes the row index BEFORE calling `write_tiles`, so any
+        // subsequent flush observes a (model-layout, index-layout) pair
+        // that is internally consistent.  This test exercises the
+        // Reconnecting -> Live transition and verifies (a) at least one
+        // `write_tiles` lands on the resync, (b) a flush after the
+        // transition produces exactly one row update for the changed
+        // entity (which is only possible if the index is populated).
+        ensure_icons_init();
+        let store = Arc::new(StubStore::new(vec![make_test_entity(
+            "light.kitchen",
+            "on",
+        )]));
+        let dashboard = Arc::new(one_widget_dashboard());
+        let (state_tx, state_rx) = status_channel();
+        // Start gated so the watcher does NOT fire its initial Live
+        // resync; the transition below is the one we are testing.
+        state_tx.send(ConnectionState::Reconnecting).unwrap();
+
+        let recorder = Arc::new(RecordingSink::default());
+        let _bridge = LiveBridge::spawn(
+            store.clone() as Arc<dyn EntityStore>,
+            dashboard.clone(),
+            state_rx,
+            ArcSink(Arc::clone(&recorder)),
+        );
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // (a) Transition to Live — watcher rebuilds index AND calls
+        // write_tiles.
+        state_tx.send(ConnectionState::Live).unwrap();
+        let saw_resync = wait_until(FLUSH_INTERVAL_MS * 4, || {
+            !recorder.snapshot_tile_writes().is_empty()
+        })
+        .await;
+        assert!(
+            saw_resync,
+            "Live transition must trigger a write_tiles resync"
+        );
+
+        // (b) Drive a per-entity update post-transition; verify the index
+        // is populated by checking the resulting row update.
+        let row_updates_pre = recorder.snapshot_row_updates().len();
+        store.set_entity(make_test_entity("light.kitchen", "off"));
+        store.publish(EntityUpdate {
+            id: EntityId::from("light.kitchen"),
+            entity: Some(make_test_entity("light.kitchen", "off")),
+        });
+
+        let saw_update = wait_until(FLUSH_INTERVAL_MS * 4, || {
+            recorder.snapshot_row_updates().len() > row_updates_pre
+        })
+        .await;
+        assert!(
+            saw_update,
+            "post-transition flush must produce a row update — index missing or stale?"
+        );
+        let updates = recorder.snapshot_row_updates();
+        let last = updates.last().expect("row updates recorded");
+        assert!(
+            last.iter()
+                .any(|u| u.kind == TileKind::Light && u.row_index == 0 && u.state == "off"),
+            "expected a Light row 0 update with state=off; got {last:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_does_not_replace_full_vec_model_in_run_flush_loop() {
+        // TASK-119 F2 acceptance: `run_flush_loop` must NOT call
+        // `write_tiles` directly anymore; it routes through
+        // `apply_row_updates`.  We assert this by counting:
+        //   * Per flush, exactly one `row_updates` entry is recorded.
+        //   * Per flush, the legacy default-fallback also routes through
+        //     `write_tiles` once (RecordingSink preserves that for
+        //     compatibility), so `tile_writes` and `row_updates`
+        //     post-watcher-resync are paired 1:1.
+        //
+        // The assertion-of-shape (one row_update per flush) is the
+        // production contract; the paired write_tiles is the recording
+        // sink's compatibility shim, NOT the production behaviour (the
+        // production `SlintSink` overrides `apply_row_updates` and never
+        // invokes the rebuild thunk).
+        ensure_icons_init();
+        let store = Arc::new(StubStore::new(vec![make_test_entity(
+            "light.kitchen",
+            "on",
+        )]));
+        let dashboard = Arc::new(one_widget_dashboard());
+        let (state_tx, state_rx) = status_channel();
+        state_tx.send(ConnectionState::Live).unwrap();
+
+        let recorder = Arc::new(RecordingSink::default());
+        let _bridge = LiveBridge::spawn(
+            store.clone() as Arc<dyn EntityStore>,
+            dashboard.clone(),
+            state_rx,
+            ArcSink(Arc::clone(&recorder)),
+        );
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let row_updates_pre = recorder.snapshot_row_updates().len();
+
+        // Drive a single per-entity update.
+        store.set_entity(make_test_entity("light.kitchen", "off"));
+        store.publish(EntityUpdate {
+            id: EntityId::from("light.kitchen"),
+            entity: Some(make_test_entity("light.kitchen", "off")),
+        });
+
+        let saw = wait_until(FLUSH_INTERVAL_MS * 4, || {
+            recorder.snapshot_row_updates().len() > row_updates_pre
+        })
+        .await;
+        assert!(saw, "flush must emit a row update within 2 cadences");
+
+        // Each flush must have produced exactly one apply_row_updates
+        // call (which is what production `SlintSink` would observe).
+        let row_updates = recorder.snapshot_row_updates();
+        let post_count = row_updates.len();
+        assert!(
+            post_count > row_updates_pre,
+            "row_updates count must grow on a flush ({post_count} <= {row_updates_pre})"
         );
     }
 

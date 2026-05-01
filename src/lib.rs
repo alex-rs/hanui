@@ -611,6 +611,15 @@ impl SlintSink {
 
 impl ui::bridge::BridgeSink for SlintSink {
     fn write_tiles(&self, tiles: Vec<ui::bridge::TileVM>) {
+        // Full-model write path. Used by:
+        //   * the state watcher's Reconnecting/Failed → Live transition
+        //     resync (per `run_state_watcher`'s contract)
+        //   * the legacy default fallback of `apply_row_updates` for
+        //     non-production sinks (test recorders, benches)
+        //
+        // The steady-state flush loop in `run_flush_loop` does NOT call
+        // this method post-TASK-119 — see `apply_row_updates` below.
+        //
         // We deliberately do NOT call `wire_window` here — `wire_window` also
         // writes the `AnimationBudget` globals, which the Phase 1 contract
         // mandates be set exactly once at startup (in `run_with_memory_store` /
@@ -635,6 +644,81 @@ impl ui::bridge::BridgeSink for SlintSink {
             }
         }) {
             tracing::debug!(error = %e, "invoke_from_event_loop failed in write_tiles (event loop shut down?)");
+        }
+    }
+
+    fn apply_row_updates(
+        &self,
+        updates: Vec<ui::bridge::RowUpdate>,
+        _rebuild_full_tiles: Box<dyn FnOnce() -> Vec<ui::bridge::TileVM> + Send>,
+    ) {
+        // TASK-119 F2: per-row incremental update.  Skips the
+        // `rebuild_full_tiles` thunk entirely — production never falls
+        // back to `write_tiles` from the steady-state flush.  Each update
+        // is applied via `set_row_data` on the existing per-kind Slint
+        // model instance (installed once at startup by `wire_window`),
+        // updating only the dynamic `state` field.  Static fields
+        // (name, icon, placement) remain whatever `wire_window` wrote —
+        // changing those would require a full rebuild path.
+        //
+        // `ModelRc<T>` is `Rc`-backed and not `Send`, so the per-row
+        // writes must happen on the Slint UI thread.  The `Vec<RowUpdate>`
+        // is `Send` and crosses freely.
+        //
+        // Per-row read-modify-write pattern: `row_data(idx)` returns a
+        // clone of the current Slint VM struct; we mutate the `state`
+        // field; `set_row_data(idx, vm)` writes it back, which fires the
+        // model-changed notification Slint uses to repaint only the
+        // affected row.  This mirrors `apply_pending_for_widgets` in
+        // `src/ui/toast.rs`.
+        let window = self.window.clone();
+        if let Err(e) = slint::invoke_from_event_loop(move || {
+            use slint::Model;
+            let Some(w) = window.upgrade() else {
+                // Window torn down; nothing to update.
+                return;
+            };
+            // Snapshot the per-kind models once; subsequent set_row_data
+            // calls go through the ModelRc, which forwards to the
+            // underlying VecModel and fires per-row change notifications.
+            let lights = w.get_light_tiles();
+            let sensors = w.get_sensor_tiles();
+            let entities = w.get_entity_tiles();
+            for update in updates {
+                match update.kind {
+                    ui::bridge::TileKind::Light => {
+                        if let Some(mut row) = lights.row_data(update.row_index) {
+                            // Only write if the value actually changed,
+                            // matching `apply_pending_for_widgets`'s
+                            // pattern: avoids spurious repaint
+                            // notifications when the bridge re-asserts a
+                            // value that already matches.
+                            if row.state.as_str() != update.state {
+                                row.state = update.state.into();
+                                lights.set_row_data(update.row_index, row);
+                            }
+                        }
+                    }
+                    ui::bridge::TileKind::Sensor => {
+                        if let Some(mut row) = sensors.row_data(update.row_index) {
+                            if row.state.as_str() != update.state {
+                                row.state = update.state.into();
+                                sensors.set_row_data(update.row_index, row);
+                            }
+                        }
+                    }
+                    ui::bridge::TileKind::Entity => {
+                        if let Some(mut row) = entities.row_data(update.row_index) {
+                            if row.state.as_str() != update.state {
+                                row.state = update.state.into();
+                                entities.set_row_data(update.row_index, row);
+                            }
+                        }
+                    }
+                }
+            }
+        }) {
+            tracing::debug!(error = %e, "invoke_from_event_loop failed in apply_row_updates (event loop shut down?)");
         }
     }
 
@@ -999,6 +1083,44 @@ mod tests {
         let _sink = SlintSink::new(weak);
         // Reaching here without panicking is the assertion.  Trait-shape
         // coverage lives in src/ui/bridge.rs (test module's RecordingSink).
+    }
+
+    /// `SlintSink::apply_row_updates` (TASK-119 F2) routes per-row updates
+    /// through `slint::invoke_from_event_loop`; without a running event
+    /// loop the invoke fails and the error is logged (NOT propagated as a
+    /// panic).  We exercise the no-event-loop path here to lock in the
+    /// graceful-degradation contract: if the Slint event loop is shut
+    /// down between the bridge's flush call and this method body, the
+    /// sink must NOT panic.
+    #[test]
+    fn slint_sink_apply_row_updates_without_event_loop_does_not_panic() {
+        use ui::bridge::{BridgeSink, RowUpdate, TileKind};
+        let weak: slint::Weak<MainWindow> = slint::Weak::default();
+        let sink = SlintSink::new(weak);
+        let updates = vec![
+            RowUpdate {
+                kind: TileKind::Light,
+                row_index: 0,
+                state: "on".to_string(),
+            },
+            RowUpdate {
+                kind: TileKind::Sensor,
+                row_index: 1,
+                state: "21".to_string(),
+            },
+            RowUpdate {
+                kind: TileKind::Entity,
+                row_index: 2,
+                state: "off".to_string(),
+            },
+        ];
+        // Rebuild thunk MUST NOT be invoked by SlintSink — it is a
+        // production-side override that ignores the thunk entirely.
+        let thunk: Box<dyn FnOnce() -> Vec<ui::bridge::TileVM> + Send> =
+            Box::new(|| panic!("SlintSink::apply_row_updates must not invoke the rebuild thunk"));
+        sink.apply_row_updates(updates, thunk);
+        // Reaching here without panicking is the assertion: the
+        // event-loop-down branch must log and continue, NOT panic.
     }
 
     /// `build_ws_client_with_store` wires the `WsClient` and the `LiveStore`
