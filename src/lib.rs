@@ -1146,17 +1146,18 @@ mod tests {
         use ui::bridge::slint_ui::{EntityTileVM, LightTileVM, SensorTileVM};
         use ui::bridge::{RowUpdate, TileKind};
 
-        let mut light = LightTileVM::default();
-        light.state = "off".into();
-        let lights: ModelRc<LightTileVM> = ModelRc::new(VecModel::from(vec![light]));
-
-        let mut sensor = SensorTileVM::default();
-        sensor.state = "20".into();
-        let sensors: ModelRc<SensorTileVM> = ModelRc::new(VecModel::from(vec![sensor]));
-
-        let mut entity = EntityTileVM::default();
-        entity.state = "unavailable".into();
-        let entities: ModelRc<EntityTileVM> = ModelRc::new(VecModel::from(vec![entity]));
+        let lights: ModelRc<LightTileVM> = ModelRc::new(VecModel::from(vec![LightTileVM {
+            state: "off".into(),
+            ..Default::default()
+        }]));
+        let sensors: ModelRc<SensorTileVM> = ModelRc::new(VecModel::from(vec![SensorTileVM {
+            state: "20".into(),
+            ..Default::default()
+        }]));
+        let entities: ModelRc<EntityTileVM> = ModelRc::new(VecModel::from(vec![EntityTileVM {
+            state: "unavailable".into(),
+            ..Default::default()
+        }]));
 
         write_row_updates(
             &[
@@ -1194,9 +1195,10 @@ mod tests {
         use ui::bridge::slint_ui::LightTileVM;
         use ui::bridge::{RowUpdate, TileKind};
 
-        let mut light = LightTileVM::default();
-        light.state = "on".into();
-        let lights: ModelRc<LightTileVM> = ModelRc::new(VecModel::from(vec![light]));
+        let lights: ModelRc<LightTileVM> = ModelRc::new(VecModel::from(vec![LightTileVM {
+            state: "on".into(),
+            ..Default::default()
+        }]));
         let empty_sensors =
             ModelRc::new(VecModel::<ui::bridge::slint_ui::SensorTileVM>::from(vec![]));
         let empty_entities =
