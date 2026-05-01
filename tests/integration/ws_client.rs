@@ -1295,55 +1295,83 @@ async fn scenario_service_removed_event_evicts_from_registry() {
 }
 
 // ---------------------------------------------------------------------------
-// TASK-049: subscribe-all preserves the existing subscribe-ACK ordering
-// invariant.
+// TASK-123 (F7): three filtered subscriptions, ACK-gate preserved.
 //
-// The ACK gate must still be a real gate — the FSM cannot send `get_states`
-// before the single `subscribe_events` ACK has left the mock.  Codex's audit
-// (TASK-046 finding 6) introduced the wall-clock proof for the previous
-// `state_changed`-filtered subscription; with TASK-049 changing to
-// subscribe-all (no `event_type` field), the same invariant must continue to
-// hold.  This test is the regression boundary: it pins both
-//   (a) that the subscribe_events frame OMITS `event_type` (subscribe-all),
-//   (b) that get_states still arrives strictly AFTER the ACK send completes,
-//   (c) that exactly ONE subscribe_events frame is sent (not three).
+// Pre-TASK-123 the client subscribed with a wildcard `event_type: None`
+// (TASK-049's design choice).  Audit TASK-115 measured ~10x unnecessary
+// inbound bytes from `automation_triggered`, `call_service`,
+// `recorder_5min_statistics_generated`, etc. — events the FSM dispatch
+// silently dropped after parsing.
+//
+// TASK-123 replaces the wildcard with three sequential filtered subscribes
+// (`state_changed`, `service_registered`, `service_removed`).  HA never
+// forwards the unsubscribed event types over the wire, so the parse-bytes
+// reduction is real, not just internal-dispatch-side.
+//
+// This test is the regression boundary.  It pins:
+//   (a) Exactly THREE `subscribe_events` frames are sent — one per filter.
+//   (b) Each subscribe frame carries an explicit `event_type`; no frame
+//       OMITS the field (no regression to wildcard).  Order is fixed:
+//       state_changed → service_registered → service_removed.
+//   (c) The ACK-gate ordering invariant (TASK-046 finding 6) is preserved:
+//       `get_states` is sent strictly after the LAST subscribe ACK has
+//       left the mock — same wall-clock comparison as
+//       `scenario_subscribe_ack_before_snapshot_ordering`.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn scenario_subscribe_all_preserves_ack_gate_and_omits_event_type() {
+async fn scenario_three_filtered_subscribes_preserve_ack_gate() {
     let server = MockWsServer::start().await;
     server.script_auth_ok().await;
     server.script_subscribe_ack().await;
     server.script_get_states_reply("[]").await;
     server.script_get_services_reply("{}").await;
 
-    let config = make_config(&server.ws_url, "tok-task-049-subscribe-all");
+    let config = make_config(&server.ws_url, "tok-task-123-filtered-subscribes");
     let (mut state_rx, _handle) = spawn_client(config, None);
 
     assert!(wait_for_state(&mut state_rx, ConnectionState::Live, Duration::from_secs(5)).await);
 
     let recorded = server.recorded_requests().await;
-    let sub_frame = recorded
-        .iter()
-        .find(|r| r.kind == "subscribe_events")
-        .expect("subscribe_events must be recorded");
 
-    // (a) Wire-level guarantee: the frame must omit `event_type`.  HA's WS
-    // API treats absence (not `null`) as "subscribe to all events"; the
-    // serializer's `skip_serializing_if = "Option::is_none"` enforces this
-    // — this assertion pins it against accidental regression to a `null`
-    // value or a hard-coded "state_changed".
-    let sub_v: serde_json::Value = serde_json::from_str(&sub_frame.body)
-        .expect("subscribe_events frame body must be valid JSON");
-    assert!(
-        sub_v.get("event_type").is_none(),
-        "TASK-049: subscribe_events frame must omit `event_type` (subscribe-all); got: {sub_v}"
+    // (a) Exactly three subscribe_events frames in order.  Capture them
+    // from the recorded log preserving FIFO order so we can assert filter
+    // values position-by-position.
+    let sub_frames: Vec<&_> = recorded
+        .iter()
+        .filter(|r| r.kind == "subscribe_events")
+        .collect();
+    assert_eq!(
+        sub_frames.len(),
+        3,
+        "TASK-123: exactly THREE subscribe_events frames (state_changed, \
+         service_registered, service_removed); got: {}",
+        sub_frames.len()
     );
 
-    // (b) ACK-gate ordering invariant (TASK-046 finding 6) preserved under
-    // subscribe-all.  Same wall-clock comparison as
-    // `scenario_subscribe_ack_before_snapshot_ordering` — proves the FSM
-    // really waits for the ACK before sending get_states.
+    // (b) Each frame must carry `event_type`; the three filters must
+    // appear in the documented order.  Pinning order is what protects the
+    // sequencing-gate proof in (c) from a future refactor that fires the
+    // three subscribes concurrently — concurrent subscribes break the
+    // single-ACK-stream invariant the FSM relies on.
+    let expected_filters = ["state_changed", "service_registered", "service_removed"];
+    for (i, expected) in expected_filters.iter().enumerate() {
+        let v: serde_json::Value = serde_json::from_str(&sub_frames[i].body)
+            .expect("subscribe_events frame body must be valid JSON");
+        let event_type = v.get("event_type").and_then(|x| x.as_str()).unwrap_or("");
+        assert_eq!(
+            event_type, *expected,
+            "TASK-123: subscribe_events frame #{} must filter on `{expected}`; \
+             got body: {v}",
+            i
+        );
+    }
+
+    // (c) ACK-gate ordering invariant: `get_states` arrives strictly after
+    // the LAST subscribe ACK was sent by the mock.  `subscribe_ack_sent_at`
+    // is overwritten on each subscribe ACK send, so by the time the test
+    // observes `Live` it holds the timestamp of the THIRD ACK send — which
+    // is the gate `get_states` must wait for.
     let snap_frame = recorded
         .iter()
         .find(|r| r.kind == "get_states")
@@ -1354,22 +1382,181 @@ async fn scenario_subscribe_all_preserves_ack_gate_and_omits_event_type() {
         .expect("mock must have recorded a subscribe_ack send by the time Live is reached");
     assert!(
         snap_frame.received_at > ack_sent_at,
-        "TASK-049 regression: get_states received_at ({:?}) is NOT strictly AFTER \
-         subscribe_events ACK sent_at ({:?}); the single ACK gate is no longer real",
+        "TASK-123 regression: get_states received_at ({:?}) is NOT strictly AFTER \
+         the LAST subscribe_events ACK sent_at ({:?}); the three-ACK gate is no longer real",
         snap_frame.received_at,
         ack_sent_at,
     );
+}
 
-    // (c) Single subscribe_events frame — subscribe-all means one
-    // subscription, not three.  Pins the design choice (option b in the PR
-    // body) against accidental regression to multi-subscription.
-    let sub_count = recorded
+// ---------------------------------------------------------------------------
+// TASK-123 (F7): high-irrelevance event ratio — defence-in-depth.
+//
+// The TASK-115 audit measured ~10x unnecessary inbound bytes from event
+// types the client subscribes to but ignores (automation_triggered,
+// call_service, recorder_5min_statistics_generated, etc.).  TASK-123 fixes
+// the wire-level subscription so HA never forwards those event types.
+//
+// The actual byte-savings claim — "the client subscribes only to
+// state_changed / service_registered / service_removed" — is the load-
+// bearing wire-level invariant proven by
+// `scenario_three_filtered_subscribes_preserve_ack_gate` above (asserts the
+// recorded subscribe frames carry exactly those three filters in order).
+// THIS test does NOT independently prove byte savings — `MockWsServer`
+// cannot enforce HA's subscription filter (it blindly forwards every
+// injected frame), so this binary cannot directly observe HA-side drop
+// behaviour.
+//
+// Instead, this test pins the COMPLEMENTARY defence-in-depth invariant: if
+// a misbehaving HA instance (or a buggy proxy) forwarded an
+// `automation_triggered` event the client never subscribed to, the FSM's
+// `EventVariant::Other` arm silently ignores it in `Phase::Live` and the
+// LiveStore stays clean.  Without this property a wire-level filter
+// regression that re-introduced wildcard subscribe-all would still produce
+// only `state_changed` entity mutations — making the byte-savings claim
+// undetectable on the consumer side.  The two tests together (filter +
+// drop) bracket the savings claim from both sides.
+//
+// Mix injected: 9 automation_triggered to 1 state_changed.  After the
+// burst, exactly ONE entity reflects the new state and zero
+// `automation.noise_*` entities exist.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn high_irrelevance_event_ratio_reduces_parse_bytes() {
+    // Build an automation_triggered frame.  Local helper because
+    // `tests/common/mock_ws.rs` is outside this task's allowlist.  HA's
+    // `automation_triggered` frame shape is documented at
+    // <https://www.home-assistant.io/docs/automation/yaml/#trigger-data> —
+    // the relevant fields here are `event_type` and the wrapping `event`
+    // envelope; the client's `EventVariant::Other` arm only inspects
+    // `event_type` so the inner `data` shape is irrelevant.
+    fn automation_triggered_event_json(subscription_id: u32, name: &str) -> String {
+        format!(
+            r#"{{"type":"event","id":{subscription_id},"event":{{"event_type":"automation_triggered","data":{{"name":"{name}","entity_id":"automation.{name}","source":"time"}},"origin":"LOCAL","time_fired":"2024-04-01T12:00:00.000000+00:00"}}}}"#
+        )
+    }
+
+    let server = MockWsServer::start().await;
+    server.script_auth_ok().await;
+    server.script_subscribe_ack().await;
+    // Empty initial snapshot — we want to observe the post-Live event flow,
+    // not pre-populated state.
+    server.script_get_states_reply("[]").await;
+    server.script_get_services_reply("{}").await;
+
+    let store = Arc::new(LiveStore::new());
+    let store_for_ws: Arc<dyn hanui::ha::client::SnapshotApplier> = store.clone();
+    let config = make_config(&server.ws_url, "tok-task-123-irrelevance-ratio");
+    let (mut state_rx, _handle) = spawn_client(config, Some(store_for_ws));
+
+    assert!(
+        wait_for_state(&mut state_rx, ConnectionState::Live, Duration::from_secs(5)).await,
+        "client must reach Live before the irrelevance burst can be evaluated"
+    );
+
+    // Layer 1: structural belt-and-braces.  Verify the three subscribe
+    // frames each carry an explicit `event_type` filter — i.e. a real HA
+    // server would not forward `automation_triggered` to us.  The
+    // load-bearing assertion of this property is in
+    // `scenario_three_filtered_subscribes_preserve_ack_gate`; this block
+    // re-asserts it so this test stands on its own and a wire-filter
+    // regression cannot escape this binary.
+    let recorded = server.recorded_requests().await;
+    let sub_frames: Vec<&_> = recorded
         .iter()
         .filter(|r| r.kind == "subscribe_events")
-        .count();
+        .collect();
     assert_eq!(
-        sub_count, 1,
-        "TASK-049 design: exactly ONE subscribe_events frame (subscribe-all), \
-         not three filtered subscriptions; got {sub_count}"
+        sub_frames.len(),
+        3,
+        "subscribe_events count must be exactly 3 (one per filter); got: {}",
+        sub_frames.len()
+    );
+    for frame in &sub_frames {
+        let v: serde_json::Value = serde_json::from_str(&frame.body)
+            .expect("subscribe_events frame body must be valid JSON");
+        let et = v.get("event_type").and_then(|x| x.as_str()).unwrap_or("");
+        assert!(
+            matches!(
+                et,
+                "state_changed" | "service_registered" | "service_removed"
+            ),
+            "subscribe_events frame must filter on a known event type; got: {et} (body: {v})"
+        );
+        // Bytes-saved invariant: NONE of the three filters subscribes to
+        // `automation_triggered` (or any other noisy event type).
+        assert_ne!(
+            et, "automation_triggered",
+            "regression: client must NOT subscribe to automation_triggered"
+        );
+    }
+
+    // Layer 2: defence-in-depth.  Inject the 9:1 noise:signal mix.  Even
+    // if a buggy HA forwarded the automation events, only the single
+    // state_changed must surface in the LiveStore.
+    for i in 0..9 {
+        server
+            .inject_event(automation_triggered_event_json(1, &format!("noise_{i}")))
+            .await;
+    }
+    server
+        .inject_event(state_changed_event_json(
+            1,
+            "light.signal",
+            Some((
+                "on",
+                "2024-04-01T12:00:00+00:00",
+                "2024-04-01T12:00:00+00:00",
+            )),
+            None,
+        ))
+        .await;
+
+    // Spin until the signal arrives in the store.  The 9 automation events
+    // either do not enter the store at all (real HA: subscription filter
+    // drops them) OR enter as `EventVariant::Other` and are silently
+    // ignored by the FSM's Live event arm (mock HA: defence-in-depth).
+    let store_for_wait = store.clone();
+    let observed = wait_until(
+        move || {
+            store_for_wait
+                .get(&hanui::ha::entity::EntityId::from("light.signal"))
+                .is_some()
+        },
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(
+        observed,
+        "the single state_changed event must surface in the LiveStore within 2s"
+    );
+
+    // Negative co-assertion: the noise events MUST NOT have produced any
+    // `automation.noise_*` entities in the store.  This is the structural
+    // proof that the byte savings translate to no behavioural change in
+    // the store.  An automation entity is the LiveStore's first observable
+    // side-effect of a parsed event; if any of the 9 noise frames had been
+    // mistakenly parsed as `state_changed`, the dispatcher would have
+    // applied an entity update for `automation.noise_<i>` — which would
+    // be visible here.
+    for i in 0..9 {
+        let id = format!("automation.noise_{i}");
+        assert!(
+            store
+                .get(&hanui::ha::entity::EntityId::from(id.as_str()))
+                .is_none(),
+            "automation_triggered must NOT produce an entity update; \
+             unexpected entity {id} present in store"
+        );
+    }
+    assert_eq!(
+        store
+            .get(&hanui::ha::entity::EntityId::from("light.signal"))
+            .expect("checked above")
+            .state
+            .as_ref(),
+        "on",
+        "the single state_changed event must be applied to its target entity"
     );
 }
