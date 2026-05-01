@@ -1,0 +1,201 @@
+// fan_tile.slint — Phase 6 Wave 2 (TASK-103) tile for `type: fan`.
+//
+// Renders a Home Assistant fan entity (ceiling fans, exhaust fans, smart
+// purifiers, etc.) with a three-state visual: idle (off), active (on at
+// some speed), and unavailable. The Rust bridge produces a `FanTileVM`
+// per fan widget via `crate::ui::fan::FanVM::from_entity` followed by a
+// Slint-shape projection in `src/ui/bridge.rs::compute_fan_tile_vm`.
+//
+// All colors come from theme tokens; no inline hex literals (CI hex-color
+// gate, .github/workflows/ci.yml § Gate 1). Visual primitives only — no
+// SVG-based icons in the tile body itself; the icon image is resolved by
+// the Rust asset layer (TASK-010) and bound via `FanTileVM.icon`.
+//
+// View-model contract (see `src/ui/bridge.rs::FanTileVM`):
+//   * The struct shape is mirrored 1:1 in Rust by the bridge. The Slint
+//     compiler generates a Rust struct named `FanTileVM` whose fields
+//     match these names with kebab→snake conversion.
+//   * `state` is the canonical HA state string: `"on"`, `"off"`, `"auto"`,
+//     `"unavailable"`. Anything else is treated as unavailable by the
+//     colour fallback.
+//   * `is-on` is precomputed by `FanVM::from_entity` so the Slint side
+//     does not branch on the state-string vocabulary.
+//   * `speed-pct` is in 0..=100; rendered as a label only (the speed
+//     picker lives in the more-info modal per
+//     `locked_decisions.fan_speed_set_vocabulary`).
+//   * `has-speed-pct` gates the percentage label; fans that don't expose
+//     `percentage` show only the state name (and preset mode if set).
+//   * `current-speed` is the active preset mode name (e.g. "Low",
+//     "High"), surfaced as a secondary label when `has-current-speed`.
+//   * `placement` is a NESTED struct (`FanTilePlacement`) for 1:1
+//     mapping with `dashboard::schema::Placement` in Rust.
+//
+// Three-state render (per Phase 6 plan acceptance):
+//   * idle (state == "off")           — text-secondary icon tint, full opacity.
+//   * active (is-on == true)          — accent icon tint, full opacity.
+//   * unavailable                     — state-unavailable tint, reduced opacity (0.5).
+//
+// AnimationBudget integration:
+//   * Press feedback inherited from CardBase. Active-count mutation
+//     deferred to Phase 3 (no specific ticket yet); the bridge will
+//     wire increment/decrement around the press timer it owns. See
+//     ui/slint/light_tile.slint:23-32 for the canonical deferral
+//     rationale.
+//
+// Out of scope (TASK-099 dispatcher wiring):
+//   * On/off toggle dispatch — landed by the Phase 3 dispatcher wiring
+//     through CardBase's tap/hold callbacks; this tile renders state
+//     only and forwards gestures to CardBase (no tile-level TouchArea).
+//   * Speed picker visual design — owned by `FanBody` more-info modal
+//     (TASK-103 acceptance #4); the tile shows the current preset/percent
+//     as labels only.
+
+import { Theme } from "theme.slint";
+import { CardBase } from "card_base.slint";
+
+// Computed grid placement, mirrors `dashboard::schema::Placement` in Rust.
+// Re-declared per tile file for self-documentation; identical to
+// `LightTilePlacement` / `SensorTilePlacement` / `EntityTilePlacement` /
+// `CoverTilePlacement`.
+export struct FanTilePlacement {
+    col: int,
+    row: int,
+    span-cols: int,
+    span-rows: int,
+}
+
+// Typed view-model for a fan tile.
+//
+// Field semantics:
+//   * name              — user-visible entity label (friendly_name fallback to id).
+//   * state             — canonical HA state string (`"on"`, `"off"`,
+//                         `"auto"`, `"unavailable"`).
+//   * speed-pct         — current speed 0..=100. Meaningful only when
+//                         `has-speed-pct == true`; otherwise the bridge sets
+//                         it to 0.
+//   * has-speed-pct     — whether the fan entity exposes `percentage`.
+//   * is-on             — derived: true for `"on"` / `"auto"`.
+//   * current-speed     — active preset mode name, when reported.
+//   * has-current-speed — whether the fan entity exposes `preset_mode`.
+//   * icon-id           — design-token id (e.g. "mdi:fan"); resolved
+//                         to bytes by the asset layer (TASK-010).
+//   * icon              — resolved Slint image written by the bridge (TASK-015).
+//   * preferred-columns / preferred-rows — author intent from YAML, used
+//                         by the grid packer (TASK-014).
+//   * placement         — packed grid coordinates and span. Static this phase.
+//   * pending           — true while an OptimisticEntry exists for this tile's
+//                         entity. Drives the per-tile spinner overlay on
+//                         CardBase (TASK-067), bound from
+//                         `LiveStore::pending_for_widget(widget_id)`.
+export struct FanTileVM {
+    name: string,
+    state: string,
+    speed-pct: int,
+    has-speed-pct: bool,
+    is-on: bool,
+    current-speed: string,
+    has-current-speed: bool,
+    icon-id: string,
+    icon: image,
+    preferred-columns: int,
+    preferred-rows: int,
+    placement: FanTilePlacement,
+    pending: bool,
+}
+
+// FanTile — wraps CardBase with the fan-specific content layout.
+//
+// Press feedback and gesture detection both live on CardBase (TASK-060):
+// the single TouchArea inside CardBase captures pointer events for the
+// whole tile and exposes `pressed` as an out-property this tile reads
+// for visual feedback. Tile-level TouchAreas were removed to avoid
+// double-capture (Risk #4).
+export component FanTile inherits Rectangle {
+    in property <FanTileVM> view-model;
+
+    // Resolved state colour. Branches on the precomputed boolean first
+    // (active) and falls back to the state-string match for the
+    // remaining cases. No inline hex literals; every branch picks a token
+    // from `Theme`.
+    property <color> state-color:
+        view-model.state == "unavailable" ? Theme.state-unavailable
+        : view-model.is-on ? Theme.state-on
+        : Theme.state-off;
+
+    // Reduce opacity for the unavailable visual state (Phase 6 plan
+    // three-state render acceptance). Idle and active render at full
+    // opacity; only unavailable dims.
+    opacity: view-model.state == "unavailable" ? 0.5 : 1.0;
+
+    base := CardBase {
+        // Bind the per-tile pending-spinner gate (TASK-067). The Rust
+        // bridge writes `view-model.pending` from
+        // `LiveStore::pending_for_widget` (TASK-064 read API) on each
+        // refresh; this property feeds the spinner overlay declared on
+        // CardBase. Slint MUST read only this property — there is no
+        // parallel pending-state path (Risk #14).
+        pending: view-model.pending;
+
+        VerticalLayout {
+            spacing: Theme.space-2;
+
+            // Header row: icon + entity name. Icon is tinted with the
+            // resolved state colour so a glance at the tile reveals
+            // on/off/auto status.
+            HorizontalLayout {
+                spacing: Theme.space-2;
+                alignment: start;
+
+                Image {
+                    source: view-model.icon;
+                    width: Theme.font-xl;
+                    height: Theme.font-xl;
+                    colorize: state-color;
+                }
+
+                Text {
+                    text: view-model.name;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-medium;
+                    vertical-alignment: center;
+                }
+            }
+
+            // State value, displayed in the state colour for redundancy
+            // with the icon tint (accessibility: do not rely on colour
+            // alone). Fan state strings are short ("on", "off", "auto")
+            // so font-lg is the right hero size — sensor-tile-like
+            // font-xxl would push the speed labels off the card.
+            Text {
+                text: view-model.state;
+                color: state-color;
+                font-size: Theme.font-lg;
+                font-weight: Theme.font-weight-bold;
+            }
+
+            // Speed percentage label, shown only when the fan exposes
+            // `percentage`. Rendered as `"NN%"` — the speed picker
+            // visual is owned by the more-info modal (`FanBody`) per
+            // `locked_decisions.fan_speed_set_vocabulary`, not the tile
+            // itself.
+            if view-model.has-speed-pct : Text {
+                text: view-model.speed-pct + "%";
+                color: Theme.text-secondary;
+                font-size: Theme.font-sm;
+                font-weight: Theme.font-weight-regular;
+            }
+
+            // Current preset mode label, shown only when the fan exposes
+            // `preset_mode`. Both labels coexist when the entity reports
+            // both — preset modes and percentages are not mutually
+            // exclusive in Home Assistant.
+            if view-model.has-current-speed : Text {
+                text: view-model.current-speed;
+                color: Theme.text-secondary;
+                font-size: Theme.font-sm;
+                font-weight: Theme.font-weight-regular;
+            }
+        }
+    }
+}

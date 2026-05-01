@@ -240,4 +240,41 @@ fn main() {
         "cargo:rustc-env=HANUI_COVER_TILE_INCLUDE={}",
         cover_tile_output.display()
     );
+
+    // FanTile component (TASK-103) — Phase 6 Wave 2 fan tile.
+    //
+    // Compiles `ui/slint/fan_tile.slint` to a separate output file so
+    // the bridge's `fan_tile_slint` submodule can reference the generated
+    // `FanTile`, `FanTileVM`, and `FanTilePlacement` types without
+    // pulling in the full production `MainWindow` symbol set. This mirrors
+    // the pattern used by `gesture_test_window.slint` (TASK-060),
+    // `view_switcher.slint` (TASK-086), `pin_entry.slint` (TASK-100),
+    // and `cover_tile.slint` (TASK-102).
+    //
+    // This compile puts `fan_tile.slint` in the build graph: `cargo build`
+    // fails if the component has a syntax or type error (satisfying the
+    // "Slint component compile gate" acceptance criterion in TASK-103).
+    //
+    // The generated types are accessible to `src/ui/bridge.rs` via
+    // `include!(env!("HANUI_FAN_TILE_INCLUDE"))` inside the
+    // `fan_tile_slint` submodule. Future work (when `main_window.slint` is
+    // amended in a subsequent ticket) will swap to the production import
+    // chain and this separate compile will become test-only.
+    let fan_tile_input = manifest_dir.join("ui/slint/fan_tile.slint");
+    let fan_tile_output = out_dir.join("fan_tile.rs");
+
+    let fan_tile_deps = slint_build::compile_with_output_path(
+        &fan_tile_input,
+        &fan_tile_output,
+        slint_build::CompilerConfiguration::default(),
+    )
+    .expect("compile ui/slint/fan_tile.slint with slint-build");
+
+    for dep in fan_tile_deps {
+        println!("cargo:rerun-if-changed={}", dep.display());
+    }
+    println!(
+        "cargo:rustc-env=HANUI_FAN_TILE_INCLUDE={}",
+        fan_tile_output.display()
+    );
 }

@@ -224,6 +224,49 @@ pub struct CoverTileVM {
 }
 
 // ---------------------------------------------------------------------------
+// FanTileVM (TASK-103)
+// ---------------------------------------------------------------------------
+
+/// View-model for a `FanTile` widget, mirroring the Slint `FanTileVM`
+/// struct in `ui/slint/fan_tile.slint`.
+///
+/// Built by [`compute_fan_tile_vm`], which threads through
+/// [`crate::ui::fan::FanVM::from_entity`] to derive the `is_on` boolean
+/// and surface the percentage / preset-mode attributes.
+///
+/// The `icon: image` Slint field is absent here; it is written by the
+/// Slint bridge during property wiring (the same pattern used for
+/// `LightTileVM` / `SensorTileVM` / `EntityTileVM` / `CoverTileVM`).
+///
+/// Note (TASK-103 scope): the `MainWindow` Slint component does not yet
+/// declare a `fan-tiles` array property — `ui/slint/main_window.slint`
+/// is in this ticket's `must_not_touch` list. `compute_fan_tile_vm` is
+/// invoked indirectly via [`build_tiles`] so fan entities exercise the
+/// `FanVM::from_entity` path on every state change, and the result
+/// flows into the existing fallback `EntityTileVM` render with a richer
+/// state string. A subsequent ticket will amend `main_window.slint` to
+/// render a per-kind `FanTile` model directly.
+///
+/// `pending` is the per-tile spinner gate added in TASK-067; see
+/// [`LightTileVM`] for the full contract.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FanTileVM {
+    pub name: String,
+    pub state: String,
+    pub speed_pct: i32,
+    pub has_speed_pct: bool,
+    pub is_on: bool,
+    pub current_speed: String,
+    pub has_current_speed: bool,
+    pub icon_id: String,
+    pub preferred_columns: i32,
+    pub preferred_rows: i32,
+    pub placement: TilePlacement,
+    /// Per-tile spinner gate (TASK-067). Default `false`.
+    pub pending: bool,
+}
+
+// ---------------------------------------------------------------------------
 // TileVM enum
 // ---------------------------------------------------------------------------
 
@@ -547,16 +590,51 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                                     pending: false,
                                 })
                             }
-                            // Phase 4 schema adds Camera, History, Fan, Lock, Alarm
+                            // TASK-103: fan entities flow through
+                            // `FanVM::from_entity` so the per-frame derived
+                            // state (is_on / speed_pct / current_speed) is
+                            // available to the bridge. Until `main_window.slint`
+                            // grows a `fan-tiles` array property (subsequent
+                            // ticket), the fan tile renders as the generic
+                            // `EntityTileVM` fallback — but the `state` string
+                            // is enriched with the speed percentage or preset
+                            // mode so the user sees "on 75%" / "on Low" / "off"
+                            // without losing information. The `FanVM` itself is
+                            // exposed via `compute_fan_tile_vm` for the
+                            // per-kind rendering path that follows when
+                            // `main_window.slint` gains the array property.
+                            WidgetKind::Fan => {
+                                let fan_vm = crate::ui::fan::FanVM::from_entity(&entity);
+                                let raw_state = entity.state.as_ref();
+                                // Prefer percentage when present (numeric is
+                                // unambiguous); fall back to preset mode
+                                // string when only that is reported.
+                                let state = if let Some(pct) = fan_vm.speed_pct {
+                                    format!("{raw_state} {pct}%")
+                                } else if let Some(speed) = fan_vm.current_speed.as_deref() {
+                                    format!("{raw_state} {speed}")
+                                } else {
+                                    raw_state.to_owned()
+                                };
+                                TileVM::Entity(EntityTileVM {
+                                    name,
+                                    state,
+                                    icon_id,
+                                    preferred_columns,
+                                    preferred_rows,
+                                    placement,
+                                    pending: false,
+                                })
+                            }
+                            // Phase 4 schema adds Camera, History, Lock, Alarm
                             // variants. Phase 6 adds MediaPlayer, Climate,
                             // PowerFlow. Until dedicated Slint tile components exist
-                            // (TASK-103..TASK-109), these are rendered as EntityTileVM —
+                            // (TASK-104..TASK-109), these are rendered as EntityTileVM —
                             // the generic entity tile covers the state display until
                             // per-kind tiles ship.
                             WidgetKind::EntityTile
                             | WidgetKind::Camera
                             | WidgetKind::History
-                            | WidgetKind::Fan
                             | WidgetKind::Lock
                             | WidgetKind::Alarm
                             | WidgetKind::MediaPlayer
@@ -1898,6 +1976,33 @@ pub mod cover_tile_slint {
 pub use cover_tile_slint::{CoverTile, CoverTilePlacement as SlintCoverTilePlacement};
 
 // ---------------------------------------------------------------------------
+// FanTile Slint module (TASK-103)
+// ---------------------------------------------------------------------------
+//
+// `ui/slint/fan_tile.slint` is compiled by `build.rs` (TASK-103) to a
+// separate generated Rust file exposed via the `HANUI_FAN_TILE_INCLUDE`
+// env var — the same pattern as `cover_tile.slint` (TASK-102),
+// `pin_entry.slint` (TASK-100), `view_switcher.slint` (TASK-086), and
+// `gesture_test_window.slint` (TASK-060). This module picks it up via
+// `include!` so the generated `FanTile`, `FanTileVM`, and
+// `FanTilePlacement` types are available for the `compute_fan_tile_vm`
+// projection function below without polluting the production `slint_ui`
+// namespace (which would clash with the same-named Rust struct declared
+// earlier in this file).
+//
+// Future work: once `main_window.slint` grows a `fan-tiles` array
+// property, this module's types will be re-exported through the
+// production `slint_ui` namespace instead. The separate compile is the
+// minimal-blast path that satisfies TASK-103's "Slint compile gate"
+// acceptance criterion (fan_tile.slint must be in the build graph)
+// without amending any of the protected `must_not_touch` Slint files.
+pub mod fan_tile_slint {
+    include!(env!("HANUI_FAN_TILE_INCLUDE"));
+}
+
+pub use fan_tile_slint::{FanTile, FanTilePlacement as SlintFanTilePlacement};
+
+// ---------------------------------------------------------------------------
 // compute_cover_tile_vm (TASK-102)
 // ---------------------------------------------------------------------------
 
@@ -1960,6 +2065,70 @@ pub fn compute_cover_tile_vm(
         has_tilt,
         is_open: cover_vm.is_open,
         is_moving: cover_vm.is_moving,
+        icon_id,
+        preferred_columns,
+        preferred_rows,
+        placement,
+        pending: false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// compute_fan_tile_vm (TASK-103)
+// ---------------------------------------------------------------------------
+
+/// Project a typed Rust [`FanTileVM`] from a live entity snapshot, threading
+/// through [`crate::ui::fan::FanVM::from_entity`] for the per-frame derived
+/// state (`is_on` / `speed_pct` / `current_speed`).
+///
+/// # Hot-path discipline
+///
+/// Called at entity-change time (NOT per render). The result is a typed
+/// `FanTileVM` Rust struct; the further `String -> SharedString` /
+/// `icon_id -> Image` conversions are deferred to a follow-up ticket once
+/// `main_window.slint` declares the `fan-tiles` array property.
+///
+/// # Speed-pct / current-speed fallback
+///
+/// `has_speed_pct` is derived from the presence of a numeric, in-range
+/// `percentage` attribute (out-of-range or non-numeric values count as
+/// "not present" — matching the fall-through logic in `FanVM::from_entity`).
+/// `has_current_speed` is derived from the presence of a string-typed
+/// `preset_mode` attribute. The Slint tile gates the matching labels
+/// behind these booleans (`if view-model.has-speed-pct : Text { ... }`).
+///
+/// # Naming
+///
+/// Returns the Rust [`FanTileVM`] (defined earlier in this file). The
+/// Slint-shape projection (`SlintFanTileVM` from
+/// [`fan_tile_slint::FanTileVM`]) is not built here because there is
+/// no `fan-tiles` `MainWindow` property to write into yet — that
+/// shape conversion lives next to the `set_fan_tiles` call site once
+/// it exists.
+#[must_use]
+pub fn compute_fan_tile_vm(
+    name: String,
+    icon_id: String,
+    preferred_columns: i32,
+    preferred_rows: i32,
+    placement: TilePlacement,
+    entity: &crate::ha::entity::Entity,
+) -> FanTileVM {
+    let fan_vm = crate::ui::fan::FanVM::from_entity(entity);
+
+    let has_speed_pct = fan_vm.speed_pct.is_some();
+    let speed_pct_value = i32::from(fan_vm.speed_pct.unwrap_or(0));
+    let has_current_speed = fan_vm.current_speed.is_some();
+    let current_speed_value = fan_vm.current_speed.unwrap_or_default();
+
+    FanTileVM {
+        name,
+        state: fan_vm.state,
+        speed_pct: speed_pct_value,
+        has_speed_pct,
+        is_on: fan_vm.is_on,
+        current_speed: current_speed_value,
+        has_current_speed,
         icon_id,
         preferred_columns,
         preferred_rows,
@@ -6601,5 +6770,249 @@ mod tests {
                 .any(|r| r.key == "supported_features" && r.value == "11"),
             "CoverBody must emit a supported_features row when present; got {rows:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // FanTileVM / compute_fan_tile_vm tests (TASK-103)
+    // -----------------------------------------------------------------------
+
+    /// `compute_fan_tile_vm` produces the typed Rust [`FanTileVM`] from
+    /// an entity, threading the fan-state derivation through
+    /// `FanVM::from_entity`. Sanity-check the output for an off fan.
+    #[test]
+    fn compute_fan_tile_vm_off_state_no_attributes() {
+        let entity = make_test_entity("fan.bedroom", "off");
+        let vm = compute_fan_tile_vm(
+            "Bedroom".to_owned(),
+            "mdi:fan".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.name, "Bedroom");
+        assert_eq!(vm.state, "off");
+        assert!(!vm.is_on);
+        assert!(
+            !vm.has_speed_pct,
+            "no percentage attribute → has_speed_pct=false"
+        );
+        assert!(!vm.has_current_speed);
+        assert_eq!(vm.speed_pct, 0, "off default speed");
+        assert!(vm.current_speed.is_empty());
+        assert!(!vm.pending);
+    }
+
+    /// `compute_fan_tile_vm` reads `percentage` and exposes it as the
+    /// `speed_pct` field with `has_speed_pct=true`.
+    #[test]
+    fn compute_fan_tile_vm_on_with_percentage_attribute() {
+        let entity = entity_with_attr("on", "percentage", "75");
+        let entity = Entity {
+            id: EntityId::from("fan.living_room"),
+            ..entity
+        };
+        let vm = compute_fan_tile_vm(
+            "Living Room".to_owned(),
+            "mdi:fan".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.state, "on");
+        assert!(vm.is_on);
+        assert!(vm.has_speed_pct, "percentage present → has_speed_pct=true");
+        assert_eq!(vm.speed_pct, 75);
+    }
+
+    /// `compute_fan_tile_vm` reads `preset_mode` and exposes
+    /// `has_current_speed=true` with the preset name populated.
+    #[test]
+    fn compute_fan_tile_vm_on_with_preset_mode_attribute() {
+        let entity = entity_with_attr("on", "preset_mode", "\"High\"");
+        let entity = Entity {
+            id: EntityId::from("fan.kitchen"),
+            ..entity
+        };
+        let vm = compute_fan_tile_vm(
+            "Kitchen".to_owned(),
+            "mdi:fan".to_owned(),
+            1,
+            1,
+            TilePlacement::default_for(1, 1),
+            &entity,
+        );
+        assert!(
+            vm.has_current_speed,
+            "preset_mode present → has_current_speed=true"
+        );
+        assert_eq!(vm.current_speed, "High");
+    }
+
+    /// `compute_fan_tile_vm` for an `auto` fan sets is_on=true.
+    #[test]
+    fn compute_fan_tile_vm_auto_state_is_on() {
+        let entity = make_test_entity("fan.attic", "auto");
+        let vm = compute_fan_tile_vm(
+            "Attic".to_owned(),
+            "mdi:fan-auto".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.state, "auto");
+        assert!(vm.is_on, "auto colors as on");
+    }
+
+    /// `build_tiles` for a `WidgetKind::Fan` widget with a `percentage`
+    /// attribute produces an `EntityTileVM` whose `state` string is
+    /// enriched with the percentage. This confirms the bridge dispatches
+    /// the fan state-change through `FanVM::from_entity` per TASK-103
+    /// AC #7.
+    #[test]
+    fn build_tiles_fan_widget_includes_percentage_in_state_when_attribute_present() {
+        use crate::ha::store::MemoryStore;
+
+        let entity = entity_with_attr("on", "percentage", "42");
+        let entity = Entity {
+            id: EntityId::from("fan.bedroom"),
+            ..entity
+        };
+        let store = MemoryStore::load(vec![entity]).expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("fan.bedroom", WidgetKind::Fan);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1);
+        match &tiles[0] {
+            TileVM::Entity(vm) => {
+                assert_eq!(
+                    vm.state, "on 42%",
+                    "fan state must be enriched with percentage"
+                );
+            }
+            other => panic!("expected EntityTileVM (Fan fallback), got {other:?}"),
+        }
+    }
+
+    /// `build_tiles` for a fan entity with only a `preset_mode` attribute
+    /// renders the preset name in the enriched state.
+    #[test]
+    fn build_tiles_fan_widget_includes_preset_mode_in_state_when_percentage_absent() {
+        use crate::ha::store::MemoryStore;
+
+        let entity = entity_with_attr("on", "preset_mode", "\"Low\"");
+        let entity = Entity {
+            id: EntityId::from("fan.bedroom"),
+            ..entity
+        };
+        let store = MemoryStore::load(vec![entity]).expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("fan.bedroom", WidgetKind::Fan);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1);
+        match &tiles[0] {
+            TileVM::Entity(vm) => {
+                assert_eq!(vm.state, "on Low", "fan state must include preset mode");
+            }
+            other => panic!("expected EntityTileVM (Fan fallback), got {other:?}"),
+        }
+    }
+
+    /// `build_tiles` for a fan entity WITHOUT speed attributes keeps the
+    /// raw HA state string (no spurious suffix).
+    #[test]
+    fn build_tiles_fan_widget_without_speed_keeps_raw_state() {
+        use crate::ha::store::MemoryStore;
+
+        let store = MemoryStore::load(vec![make_test_entity("fan.bedroom", "off")])
+            .expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("fan.bedroom", WidgetKind::Fan);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1);
+        match &tiles[0] {
+            TileVM::Entity(vm) => {
+                assert_eq!(vm.state, "off", "no speed attribute → no suffix");
+            }
+            other => panic!("expected EntityTileVM, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // FanBody more-info richer impl (TASK-103)
+    // -----------------------------------------------------------------------
+
+    /// `FanBody::render_rows` emits a `speed` row when the entity has
+    /// the `percentage` attribute.
+    #[test]
+    fn fan_body_emits_speed_row_when_percentage_attribute_present() {
+        use crate::ui::more_info::{FanBody, MoreInfoBody};
+        let entity = entity_with_attr("on", "percentage", "60");
+        let rows = FanBody::new().render_rows(&entity);
+        assert!(rows.iter().any(|r| r.key == "state" && r.value == "on"));
+        assert!(
+            rows.iter().any(|r| r.key == "speed" && r.value == "60%"),
+            "FanBody must emit a speed row when percentage is set; got {rows:?}"
+        );
+    }
+
+    /// `FanBody::render_rows` emits a `preset_mode` row when the entity
+    /// has the `preset_mode` attribute.
+    #[test]
+    fn fan_body_emits_preset_mode_row_when_attribute_present() {
+        use crate::ui::more_info::{FanBody, MoreInfoBody};
+        let entity = entity_with_attr("on", "preset_mode", "\"High\"");
+        let rows = FanBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "preset_mode" && r.value == "High"),
+            "FanBody must emit a preset_mode row when set; got {rows:?}"
+        );
+    }
+
+    /// `FanBody::render_rows` emits an `oscillating` row when the
+    /// boolean attribute is present.
+    #[test]
+    fn fan_body_emits_oscillating_row_when_attribute_present() {
+        use crate::ui::more_info::{FanBody, MoreInfoBody};
+        let entity = entity_with_attr("on", "oscillating", "true");
+        let rows = FanBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "oscillating" && r.value == "true"),
+            "FanBody must emit an oscillating row when set; got {rows:?}"
+        );
+    }
+
+    /// `FanBody::render_rows` emits a `direction` row when the string
+    /// attribute is present.
+    #[test]
+    fn fan_body_emits_direction_row_when_attribute_present() {
+        use crate::ui::more_info::{FanBody, MoreInfoBody};
+        let entity = entity_with_attr("on", "direction", "\"forward\"");
+        let rows = FanBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "direction" && r.value == "forward"),
+            "FanBody must emit a direction row when set; got {rows:?}"
+        );
+    }
+
+    /// `FanBody::render_rows` skips optional rows when their attributes
+    /// are absent.
+    #[test]
+    fn fan_body_skips_optional_rows_when_attributes_absent() {
+        use crate::ui::more_info::{FanBody, MoreInfoBody};
+        let entity = make_test_entity("fan.bedroom", "off");
+        let rows = FanBody::new().render_rows(&entity);
+        // state row is always emitted.
+        assert!(rows.iter().any(|r| r.key == "state"));
+        // optional rows must be absent.
+        assert!(!rows.iter().any(|r| r.key == "speed"));
+        assert!(!rows.iter().any(|r| r.key == "preset_mode"));
+        assert!(!rows.iter().any(|r| r.key == "oscillating"));
+        assert!(!rows.iter().any(|r| r.key == "direction"));
     }
 }
