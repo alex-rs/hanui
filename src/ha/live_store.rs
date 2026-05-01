@@ -1314,6 +1314,135 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // entity_count accessor (TASK-118 F3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn entity_count_returns_zero_on_empty_store() {
+        let store = LiveStore::new();
+        assert_eq!(
+            store.entity_count(),
+            0,
+            "fresh LiveStore must report entity_count = 0"
+        );
+    }
+
+    #[test]
+    fn entity_count_increments_on_apply_event_insert() {
+        let store = LiveStore::new();
+        store.apply_snapshot(vec![]);
+        assert_eq!(store.entity_count(), 0);
+
+        // Insert a new entity via apply_event.
+        store.apply_event(EntityUpdate {
+            id: EntityId::from("light.new"),
+            entity: Some(make_entity("light.new", "on")),
+        });
+        assert_eq!(
+            store.entity_count(),
+            1,
+            "entity_count must be 1 after inserting one new entity"
+        );
+
+        // Insert a second distinct entity.
+        store.apply_event(EntityUpdate {
+            id: EntityId::from("sensor.temp"),
+            entity: Some(make_entity("sensor.temp", "21.0")),
+        });
+        assert_eq!(
+            store.entity_count(),
+            2,
+            "entity_count must be 2 after inserting a second new entity"
+        );
+
+        // Replace an existing entity — counter must NOT change.
+        store.apply_event(EntityUpdate {
+            id: EntityId::from("light.new"),
+            entity: Some(make_entity("light.new", "off")),
+        });
+        assert_eq!(
+            store.entity_count(),
+            2,
+            "replacing an existing entity must not change entity_count"
+        );
+    }
+
+    #[test]
+    fn entity_count_decrements_on_apply_event_remove() {
+        let store = LiveStore::new();
+        store.apply_snapshot(vec![
+            make_entity("light.a", "on"),
+            make_entity("light.b", "off"),
+        ]);
+        assert_eq!(store.entity_count(), 2);
+
+        // Remove one entity.
+        store.apply_event(EntityUpdate {
+            id: EntityId::from("light.a"),
+            entity: None,
+        });
+        assert_eq!(
+            store.entity_count(),
+            1,
+            "entity_count must be 1 after removing one entity"
+        );
+
+        // Removing a non-existent entity must not underflow.
+        store.apply_event(EntityUpdate {
+            id: EntityId::from("light.missing"),
+            entity: None,
+        });
+        assert_eq!(
+            store.entity_count(),
+            1,
+            "removing a non-existent entity must not change entity_count"
+        );
+
+        // Remove the last entity.
+        store.apply_event(EntityUpdate {
+            id: EntityId::from("light.b"),
+            entity: None,
+        });
+        assert_eq!(
+            store.entity_count(),
+            0,
+            "entity_count must be 0 after removing all entities"
+        );
+    }
+
+    #[test]
+    fn entity_count_resets_on_apply_snapshot() {
+        let store = LiveStore::new();
+
+        // Start with some events to set the counter.
+        store.apply_event(EntityUpdate {
+            id: EntityId::from("light.old"),
+            entity: Some(make_entity("light.old", "on")),
+        });
+        assert_eq!(store.entity_count(), 1);
+
+        // apply_snapshot with 3 entities must reset counter to 3.
+        store.apply_snapshot(vec![
+            make_entity("sensor.a", "1"),
+            make_entity("sensor.b", "2"),
+            make_entity("sensor.c", "3"),
+        ]);
+        assert_eq!(
+            store.entity_count(),
+            3,
+            "apply_snapshot must reset entity_count to the new map size"
+        );
+
+        // apply_snapshot with empty vec must reset counter to 0.
+        store.apply_snapshot(vec![]);
+        assert_eq!(
+            store.entity_count(),
+            0,
+            "apply_snapshot with empty vec must reset entity_count to 0"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // subscribe with empty ids slice
     // -----------------------------------------------------------------------
 

@@ -3842,6 +3842,34 @@ mod tests {
         drop(enter_rx);
     }
 
+    #[test]
+    fn rendezvous_store_for_each_delegates_to_base() {
+        // Coverage: RendezvousStore::for_each must delegate to base.for_each.
+        // build_tiles no longer calls for_each (TASK-118 F3 removed that walk),
+        // but the EntityStore trait still requires the impl.  Exercise it
+        // directly so the delegation line is covered.
+        let (enter_tx, _enter_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (_release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let base = StubStore::new(vec![
+            make_test_entity("light.a", "on"),
+            make_test_entity("light.b", "off"),
+        ]);
+        let store = RendezvousStore {
+            base,
+            enter_tx,
+            release_rx: Mutex::new(release_rx),
+        };
+
+        let mut visited = 0usize;
+        store.for_each(&mut |_id, _entity| {
+            visited += 1;
+        });
+        assert_eq!(
+            visited, 2,
+            "RendezvousStore::for_each must visit all entities via base"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // IMPORTANT 3 regression: Lagged calls store.get for ALL subscribed ids
     // -----------------------------------------------------------------------
