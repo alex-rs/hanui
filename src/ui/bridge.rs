@@ -6185,36 +6185,36 @@ mod tests {
         let _rx_a = store.subscribe(&[EntityId::from("light.a")]);
         let _rx_b = store.subscribe(&[EntityId::from("light.b")]);
         // Drop the store — its Arc<Sender>s are released, closing the channels.
-        let store_dyn: Arc<dyn EntityStore> = {
-            // Create a fresh StubStore whose senders are immediately dropped.
-            let (tx_a, rx_a) = broadcast::channel::<EntityUpdate>(1);
-            let (tx_b, rx_b) = broadcast::channel::<EntityUpdate>(1);
-            drop(tx_a);
-            drop(tx_b);
-            // Wrap in a ClosedChannelStore that hands out these dead receivers.
-            struct ClosedChannelStore {
-                rxs: Mutex<Vec<broadcast::Receiver<EntityUpdate>>>,
-            }
-            impl EntityStore for ClosedChannelStore {
-                fn get(&self, _: &EntityId) -> Option<Entity> {
-                    None
+        let store_dyn: Arc<dyn EntityStore> =
+            {
+                // Create a fresh StubStore whose senders are immediately dropped.
+                let (tx_a, rx_a) = broadcast::channel::<EntityUpdate>(1);
+                let (tx_b, rx_b) = broadcast::channel::<EntityUpdate>(1);
+                drop(tx_a);
+                drop(tx_b);
+                // Wrap in a ClosedChannelStore that hands out these dead receivers.
+                struct ClosedChannelStore {
+                    rxs: Mutex<Vec<broadcast::Receiver<EntityUpdate>>>,
                 }
-                fn for_each(&self, _: &mut dyn FnMut(&EntityId, &Entity)) {}
-                fn subscribe(&self, _: &[EntityId]) -> broadcast::Receiver<EntityUpdate> {
-                    self.rxs.lock().unwrap().pop().unwrap_or_else(|| {
-                        let (_tx, rx) = broadcast::channel(1);
-                        rx
-                    })
+                impl EntityStore for ClosedChannelStore {
+                    fn get(&self, _: &EntityId) -> Option<Entity> {
+                        None
+                    }
+                    fn for_each(&self, _: &mut dyn FnMut(&EntityId, &Entity)) {}
+                    fn subscribe(&self, _: &[EntityId]) -> broadcast::Receiver<EntityUpdate> {
+                        self.rxs.lock().unwrap().pop().expect(
+                            "ClosedChannelStore: more subscribe calls than pre-built receivers",
+                        )
+                    }
                 }
-            }
-            let store = ClosedChannelStore {
-                rxs: Mutex::new(vec![rx_a, rx_b]),
+                let store = ClosedChannelStore {
+                    rxs: Mutex::new(vec![rx_a, rx_b]),
+                };
+                // Exercise get + for_each so their bodies are covered.
+                assert!(store.get(&EntityId::from("light.a")).is_none());
+                store.for_each(&mut |_, _| {});
+                Arc::new(store)
             };
-            // Exercise get + for_each so their bodies are covered.
-            assert!(store.get(&EntityId::from("light.a")).is_none());
-            store.for_each(&mut |_, _| {});
-            Arc::new(store)
-        };
 
         let ids = Arc::new(vec![EntityId::from("light.a"), EntityId::from("light.b")]);
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
