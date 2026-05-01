@@ -6157,4 +6157,52 @@ mod tests {
         setup_pin_window(&window2, slot2, false);
         assert!(!window2.get_numeric_only(), "numeric_only set to false");
     }
+
+    /// `run_entity_fan_in` with an empty id list returns immediately without
+    /// blocking — covers the early-exit branch added by TASK-125 F6.
+    #[tokio::test]
+    async fn fan_in_exits_immediately_when_ids_is_empty() {
+        let store: Arc<dyn EntityStore> = Arc::new(StubStore::new(vec![]));
+        let ids: Arc<Vec<EntityId>> = Arc::new(vec![]);
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+
+        // Should return without awaiting any receiver.
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            super::run_entity_fan_in(store, ids, pending),
+        )
+        .await
+        .expect("run_entity_fan_in with empty ids must return immediately");
+    }
+
+    /// When all broadcast senders are dropped, `run_entity_fan_in` must exit
+    /// cleanly — covers the `RecvError::Closed` arm and the loop-exit path.
+    #[tokio::test]
+    async fn fan_in_exits_when_all_receivers_closed() {
+        use std::collections::HashMap as StdHashMap;
+
+        struct ImmediateCloseStore;
+        impl EntityStore for ImmediateCloseStore {
+            fn get(&self, _id: &EntityId) -> Option<Entity> {
+                None
+            }
+            fn for_each(&self, _f: &mut dyn FnMut(&EntityId, &Entity)) {}
+            fn subscribe(&self, _ids: &[EntityId]) -> broadcast::Receiver<EntityUpdate> {
+                let (tx, rx) = broadcast::channel(1);
+                drop(tx); // closed immediately
+                rx
+            }
+        }
+
+        let store: Arc<dyn EntityStore> = Arc::new(ImmediateCloseStore);
+        let ids = Arc::new(vec![EntityId::from("light.a"), EntityId::from("light.b")]);
+        let pending: PendingMap = Arc::new(Mutex::new(StdHashMap::new()));
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            super::run_entity_fan_in(store, ids, pending),
+        )
+        .await
+        .expect("run_entity_fan_in must exit when all receivers close");
+    }
 }
