@@ -1,0 +1,175 @@
+// lock_tile.slint — Phase 6 Wave 2 (TASK-104) tile for `type: lock`.
+//
+// Renders a Home Assistant lock entity (door locks, smart deadbolts) with
+// a three-state visual: idle (locked), active (unlocked), and unavailable.
+// A fourth ad-hoc render — `"jammed"` — also exists for HA locks that can
+// report a mechanical jam; rendered with the unavailable tint plus full
+// opacity so the user notices the warning rather than dimming it out.
+//
+// The Rust bridge produces a `LockTileVM` per lock widget via
+// `crate::ui::lock::LockVM::from_entity` followed by a Slint-shape
+// projection in `src/ui/bridge.rs::compute_lock_tile_vm`.
+//
+// All colors come from theme tokens; no inline hex literals (CI hex-color
+// gate, .github/workflows/ci.yml § Gate 1). Visual primitives only — no
+// SVG-based icons in the tile body itself; the icon image is resolved by
+// the Rust asset layer (TASK-010) and bound via `LockTileVM.icon`.
+//
+// View-model contract (see `src/ui/bridge.rs::LockTileVM`):
+//   * The struct shape is mirrored 1:1 in Rust by the bridge. The Slint
+//     compiler generates a Rust struct named `LockTileVM` whose fields
+//     match these names with kebab→snake conversion.
+//   * `state` is the canonical HA state string: `"locked"`, `"unlocked"`,
+//     `"jammed"`, `"unavailable"`. Anything else is treated as unavailable
+//     by the colour fallback.
+//   * `is-locked` is precomputed by `LockVM::from_entity` so the Slint
+//     side does not branch on the state-string vocabulary.
+//   * `placement` is a NESTED struct (`LockTilePlacement`) for 1:1
+//     mapping with `dashboard::schema::Placement` in Rust.
+//
+// Three-state render (per Phase 6 plan acceptance):
+//   * idle (state == "locked")        — text-secondary icon tint, full opacity.
+//   * active (state == "unlocked")    — accent icon tint, full opacity.
+//   * jammed (state == "jammed")      — state-unavailable tint, full opacity.
+//   * unavailable                     — state-unavailable tint, reduced opacity (0.5).
+//
+// AnimationBudget integration:
+//   * Press feedback inherited from CardBase. Active-count mutation
+//     deferred to Phase 3 (no specific ticket yet); the bridge will
+//     wire increment/decrement around the press timer it owns. See
+//     ui/slint/light_tile.slint:23-32 for the canonical deferral
+//     rationale.
+//
+// PIN entry + confirm modal (per locked_decisions.pin_entry_dispatch +
+// locked_decisions.confirmation_on_lock_unlock):
+//   * The tile carries no inline PIN-entry UI and no inline confirm modal.
+//     Both flows are dispatcher-side (`src/actions/dispatcher.rs`); the
+//     dispatcher invokes `PinEntryHost::request_pin` / `ConfirmHost::confirm`
+//     when an Unlock action requires them, and only fires the
+//     `lock.unlock` service call after the user submits.
+//   * Tile gestures are forwarded through CardBase exactly like every
+//     other tile. The dispatcher decides whether the resulting
+//     `Action::Unlock` needs PIN entry or confirmation based on the
+//     `LockDispatchSettings` table populated from `WidgetOptions::Lock`.
+
+import { Theme } from "theme.slint";
+import { CardBase } from "card_base.slint";
+
+// Computed grid placement, mirrors `dashboard::schema::Placement` in Rust.
+// Re-declared per tile file for self-documentation; identical to
+// `LightTilePlacement` / `SensorTilePlacement` / `EntityTilePlacement` /
+// `CoverTilePlacement` / `FanTilePlacement`.
+export struct LockTilePlacement {
+    col: int,
+    row: int,
+    span-cols: int,
+    span-rows: int,
+}
+
+// Typed view-model for a lock tile.
+//
+// Field semantics:
+//   * name           — user-visible entity label (friendly_name fallback to id).
+//   * state          — canonical HA state string (`"locked"`, `"unlocked"`,
+//                      `"jammed"`, `"unavailable"`).
+//   * is-locked      — derived: true for `"locked"`. Drives the lock-icon
+//                      branch on the Slint side without re-matching the
+//                      state string.
+//   * icon-id        — design-token id (e.g. "mdi:lock"); resolved
+//                      to bytes by the asset layer (TASK-010).
+//   * icon           — resolved Slint image written by the bridge (TASK-015).
+//   * preferred-columns / preferred-rows — author intent from YAML, used
+//                      by the grid packer (TASK-014).
+//   * placement      — packed grid coordinates and span. Static this phase.
+//   * pending        — true while an OptimisticEntry exists for this tile's
+//                      entity. Drives the per-tile spinner overlay on
+//                      CardBase (TASK-067), bound from
+//                      `LiveStore::pending_for_widget(widget_id)`.
+export struct LockTileVM {
+    name: string,
+    state: string,
+    is-locked: bool,
+    icon-id: string,
+    icon: image,
+    preferred-columns: int,
+    preferred-rows: int,
+    placement: LockTilePlacement,
+    pending: bool,
+}
+
+// LockTile — wraps CardBase with the lock-specific content layout.
+//
+// Press feedback and gesture detection both live on CardBase (TASK-060):
+// the single TouchArea inside CardBase captures pointer events for the
+// whole tile and exposes `pressed` as an out-property this tile reads
+// for visual feedback. Tile-level TouchAreas were removed to avoid
+// double-capture (Risk #4).
+export component LockTile inherits Rectangle {
+    in property <LockTileVM> view-model;
+
+    // Resolved state colour. Branches on the precomputed `is-locked`
+    // boolean for the locked/unlocked split; falls back to the
+    // state-string match for the remaining cases (jammed, unavailable).
+    // No inline hex literals; every branch picks a token from `Theme`.
+    property <color> state-color:
+        view-model.state == "unavailable" ? Theme.state-unavailable
+        : view-model.state == "jammed" ? Theme.state-unavailable
+        : view-model.is-locked ? Theme.state-off
+        : Theme.state-on;
+
+    // Reduce opacity for the unavailable visual state (Phase 6 plan
+    // three-state render acceptance). Idle, active, and jammed render at
+    // full opacity; only unavailable dims. Jammed at full opacity is
+    // intentional — the user must notice the warning rather than have it
+    // recede visually.
+    opacity: view-model.state == "unavailable" ? 0.5 : 1.0;
+
+    base := CardBase {
+        // Bind the per-tile pending-spinner gate (TASK-067). The Rust
+        // bridge writes `view-model.pending` from
+        // `LiveStore::pending_for_widget` (TASK-064 read API) on each
+        // refresh; this property feeds the spinner overlay declared on
+        // CardBase. Slint MUST read only this property — there is no
+        // parallel pending-state path (Risk #14).
+        pending: view-model.pending;
+
+        VerticalLayout {
+            spacing: Theme.space-2;
+
+            // Header row: icon + entity name. Icon is tinted with the
+            // resolved state colour so a glance at the tile reveals
+            // locked/unlocked/jammed status.
+            HorizontalLayout {
+                spacing: Theme.space-2;
+                alignment: start;
+
+                Image {
+                    source: view-model.icon;
+                    width: Theme.font-xl;
+                    height: Theme.font-xl;
+                    colorize: state-color;
+                }
+
+                Text {
+                    text: view-model.name;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-medium;
+                    vertical-alignment: center;
+                }
+            }
+
+            // State value, displayed in the state colour for redundancy
+            // with the icon tint (accessibility: do not rely on colour
+            // alone). Lock state strings are short ("locked", "unlocked",
+            // "jammed") so font-lg is the right hero size — sensor-tile-like
+            // font-xxl would push the secondary labels off the card.
+            Text {
+                text: view-model.state;
+                color: state-color;
+                font-size: Theme.font-lg;
+                font-weight: Theme.font-weight-bold;
+            }
+        }
+    }
+}

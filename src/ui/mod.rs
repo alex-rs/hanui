@@ -16,6 +16,7 @@
 pub mod bridge;
 pub mod cover;
 pub mod fan;
+pub mod lock;
 pub mod more_info;
 pub mod toast;
 pub mod view_router;

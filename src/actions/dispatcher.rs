@@ -107,6 +107,7 @@
 //! consumes the toast channel; TASK-069 protocol test asserts the toast is
 //! observed end-to-end.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -305,6 +306,32 @@ pub enum DispatchOutcome {
     UrlAskToast {
         /// Static toast text to render (never contains the href).
         text: &'static str,
+    },
+    /// [`Action::Unlock`] with `WidgetOptions::Lock.require_confirmation_on_unlock`
+    /// set: the dispatcher invoked [`ConfirmHost::confirm`] and the actual
+    /// `lock.unlock` service call (and any subsequent PIN entry) is deferred
+    /// until the user accepts the confirm modal. The dispatcher returns
+    /// synchronously — the OutboundCommand is `try_send`'d from the
+    /// confirm callback later, NOT from this `dispatch` invocation.
+    /// Per `locked_decisions.confirmation_on_lock_unlock`, offline replay
+    /// does not show the confirm modal (the action was confirmed at
+    /// original dispatch time before queueing).
+    LockAwaitingConfirm {
+        /// Entity targeted by the deferred lock/unlock.
+        entity_id: EntityId,
+    },
+    /// [`Action::Unlock`] (or [`Action::Lock`]) with
+    /// `PinPolicy::Required`: the dispatcher invoked
+    /// [`crate::actions::pin::PinEntryHost::request_pin`] and the actual
+    /// `lock.unlock` / `lock.lock` service call is deferred until the
+    /// user submits a PIN. Per `locked_decisions.pin_entry_dispatch` the
+    /// code is consumed exactly once via FnOnce and never persisted —
+    /// the on_submit closure builds the call_service frame with the code
+    /// in `data.code` and `try_send`s the OutboundCommand on
+    /// `command_tx`.
+    LockAwaitingPinEntry {
+        /// Entity targeted by the deferred lock/unlock.
+        entity_id: EntityId,
     },
 }
 
@@ -507,6 +534,103 @@ impl std::fmt::Display for DispatchError {
 impl std::error::Error for DispatchError {}
 
 // ---------------------------------------------------------------------------
+// ConfirmHost (TASK-104)
+// ---------------------------------------------------------------------------
+
+/// Capability trait: the dispatcher calls this to show a confirmation modal
+/// before dispatching a `lock.unlock` service call when
+/// `WidgetOptions::Lock.require_confirmation_on_unlock` is set.
+///
+/// # Module placement
+///
+/// Lives here in `src/actions/dispatcher.rs` (rather than alongside
+/// [`crate::actions::pin::PinEntryHost`] in `src/actions/pin.rs`) because
+/// `src/actions/pin.rs` is in TASK-104's `must_not_touch` list. The trait
+/// shares the same `Send + Sync + Arc<dyn _>`-friendly shape as
+/// `PinEntryHost` so the dispatcher can hold both behind `Arc` clones.
+///
+/// # Contract
+///
+/// - `confirm` returns immediately; it is **not** a blocking call.
+/// - The user's accept signal is delivered asynchronously via
+///   `on_accept`, which is called exactly once when the user accepts
+///   the modal. If the user dismisses, `on_accept` is **not** called —
+///   the dispatcher treats a missing invocation as a cancelled
+///   operation and produces no service-call frame.
+///
+/// Per `locked_decisions.confirmation_on_lock_unlock` this is dispatch-time
+/// behaviour only: offline replay (`OfflineQueue::flush` on reconnect)
+/// does NOT consult the confirm host — the user's confirmation at
+/// original dispatch time is what authorises the queued action.
+pub trait ConfirmHost: Send + Sync {
+    /// Show a confirmation modal. `on_accept` fires once on user accept;
+    /// dropping the closure (cancellation) leaves no side effect.
+    fn confirm(&self, entity_id: EntityId, on_accept: Box<dyn FnOnce() + Send>);
+}
+
+// ---------------------------------------------------------------------------
+// LockOperation (TASK-104)
+// ---------------------------------------------------------------------------
+
+/// Which lock service the dispatcher should call after the modal /
+/// PIN-entry flow completes.
+///
+/// Internal to the dispatcher; the public `Action::Lock` /
+/// `Action::Unlock` variants are folded into this small enum at the
+/// dispatch entry point so the per-operation logic can branch on a
+/// closed two-variant enum rather than re-inspecting the whole `Action`
+/// shape from inside the helper functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockOperation {
+    /// `lock.lock` — engage the bolt.
+    Lock,
+    /// `lock.unlock` — retract the bolt.
+    Unlock,
+}
+
+// ---------------------------------------------------------------------------
+// LockDispatchSettings (TASK-104)
+// ---------------------------------------------------------------------------
+
+/// Per-widget Lock dispatch settings, mirroring the relevant fields of
+/// [`crate::dashboard::schema::WidgetOptions::Lock`].
+///
+/// Populated at startup by the bridge from the loaded `Dashboard` and
+/// installed on the dispatcher via [`Dispatcher::with_lock_settings`].
+/// The dispatcher reads this table during `Action::Lock` / `Action::Unlock`
+/// dispatch to decide whether to invoke the PIN entry / confirm modal
+/// flow before building the service-call frame.
+///
+/// # Why a separate type
+///
+/// The dispatcher does not depend directly on `WidgetOptions::Lock`
+/// because that variant lives in `src/dashboard/schema.rs` (in TASK-104's
+/// `must_not_touch` list). Re-using the [`PinPolicy`] re-export from
+/// `crate::dashboard::schema` is fine — only the type *shape* is
+/// imported, not modified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockDispatchSettings {
+    /// PIN policy for this widget (mirrors `WidgetOptions::Lock.pin_policy`).
+    pub pin_policy: crate::dashboard::schema::PinPolicy,
+    /// Whether to show a confirmation modal before unlocking (mirrors
+    /// `WidgetOptions::Lock.require_confirmation_on_unlock`).
+    pub require_confirmation_on_unlock: bool,
+}
+
+impl LockDispatchSettings {
+    /// Default settings: no PIN, no confirmation. Used for widgets whose
+    /// `WidgetOptions` block is absent or non-Lock — the dispatcher falls
+    /// back to a direct service-call dispatch with no modal flow.
+    #[must_use]
+    pub fn permissive() -> Self {
+        LockDispatchSettings {
+            pin_policy: crate::dashboard::schema::PinPolicy::None,
+            require_confirmation_on_unlock: false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Dispatcher
 // ---------------------------------------------------------------------------
 
@@ -585,6 +709,35 @@ pub struct Dispatcher {
     /// [`Dispatcher::with_url_spawner`] to assert call counts without
     /// launching a real process.
     url_spawner: crate::actions::url::Spawner,
+
+    /// Optional PIN entry host (TASK-104). When `Some`, the dispatcher
+    /// invokes [`PinEntryHost::request_pin`] on `Action::Lock` /
+    /// `Action::Unlock` if the widget's `LockDispatchSettings.pin_policy`
+    /// is `Required`. The on_submit closure consumes the entered code via
+    /// FnOnce and `try_send`s the OutboundCommand on `command_tx` directly
+    /// — the code is dropped at end of closure scope.
+    /// `None` means PIN entry is unwired (Phase 6 6.0 default; tests
+    /// inject a `MockPinEntryHost`).
+    pin_host: Option<Arc<dyn crate::actions::pin::PinEntryHost>>,
+
+    /// Optional confirm modal host (TASK-104). When `Some`, the dispatcher
+    /// invokes [`ConfirmHost::confirm`] on `Action::Unlock` if the
+    /// widget's `LockDispatchSettings.require_confirmation_on_unlock` is
+    /// `true`. The on_accept closure dispatches downstream (PIN entry or
+    /// service call) once the user accepts.
+    /// `None` means the confirm flow is unwired (defaults to direct
+    /// dispatch as if `require_confirmation_on_unlock` were `false`).
+    confirm_host: Option<Arc<dyn ConfirmHost>>,
+
+    /// Per-widget lock dispatch settings (TASK-104). Populated at startup
+    /// from the loaded `Dashboard`'s `WidgetOptions::Lock` blocks. The
+    /// dispatcher reads `pin_policy` + `require_confirmation_on_unlock`
+    /// at `Action::Lock` / `Action::Unlock` dispatch time. Wrapped in
+    /// `Arc<HashMap<...>>` so the dispatcher's `Clone` impl bumps a
+    /// refcount rather than copying the map for every gesture callback.
+    /// Empty by default — a missing entry resolves to
+    /// [`LockDispatchSettings::permissive`] (no PIN, no confirmation).
+    lock_settings: Arc<HashMap<WidgetId, LockDispatchSettings>>,
 }
 
 // Custom `Debug` so the `dyn ViewRouter` field (which does not implement
@@ -672,6 +825,9 @@ impl Dispatcher {
             offline: None,
             url_action_mode: UrlActionMode::Never,
             url_spawner: url::default_spawner,
+            pin_host: None,
+            confirm_host: None,
+            lock_settings: Arc::new(HashMap::new()),
         }
     }
 
@@ -692,6 +848,9 @@ impl Dispatcher {
             offline: None,
             url_action_mode: UrlActionMode::Never,
             url_spawner: url::default_spawner,
+            pin_host: None,
+            confirm_host: None,
+            lock_settings: Arc::new(HashMap::new()),
         }
     }
 
@@ -830,6 +989,81 @@ impl Dispatcher {
     #[must_use]
     pub fn with_url_spawner(mut self, spawner: crate::actions::url::Spawner) -> Self {
         self.url_spawner = spawner;
+        self
+    }
+
+    /// Attach a [`PinEntryHost`] sink for `Action::Lock` / `Action::Unlock`
+    /// dispatches that require PIN entry per the widget's
+    /// [`LockDispatchSettings.pin_policy`] (TASK-104).
+    ///
+    /// Defaults to `None`. When `None` and a Lock/Unlock action requires
+    /// PIN entry, the dispatcher returns
+    /// [`DispatchError::NotImplementedYet`] rather than building an
+    /// unprotected service-call frame — fail-closed per
+    /// `locked_decisions.pin_entry_dispatch`.
+    ///
+    /// `host` is wrapped in [`Arc`] internally so the dispatcher remains
+    /// `Clone` and the host can be shared across cloned dispatcher
+    /// instances handed to gesture callbacks.
+    ///
+    /// [`PinEntryHost`]: crate::actions::pin::PinEntryHost
+    #[must_use]
+    pub fn with_pin_host<H: crate::actions::pin::PinEntryHost + 'static>(
+        mut self,
+        host: H,
+    ) -> Self {
+        self.pin_host = Some(Arc::new(host));
+        self
+    }
+
+    /// Variant of [`Dispatcher::with_pin_host`] that accepts an existing
+    /// [`Arc<dyn PinEntryHost>`] for callers (notably tests) that want to
+    /// keep their own clone of the host for assertions.
+    ///
+    /// [`PinEntryHost`]: crate::actions::pin::PinEntryHost
+    #[must_use]
+    pub fn with_pin_host_arc(mut self, host: Arc<dyn crate::actions::pin::PinEntryHost>) -> Self {
+        self.pin_host = Some(host);
+        self
+    }
+
+    /// Attach a [`ConfirmHost`] sink for `Action::Unlock` dispatches that
+    /// require confirmation per the widget's
+    /// [`LockDispatchSettings.require_confirmation_on_unlock`] (TASK-104).
+    ///
+    /// Defaults to `None`. When `None`, the dispatcher treats every widget
+    /// as `require_confirmation_on_unlock=false` and skips the modal step.
+    /// The confirm host is consulted ONLY at original dispatch time;
+    /// offline replay (`OfflineQueue::flush`) does NOT call this host
+    /// (per `locked_decisions.confirmation_on_lock_unlock`).
+    #[must_use]
+    pub fn with_confirm_host<H: ConfirmHost + 'static>(mut self, host: H) -> Self {
+        self.confirm_host = Some(Arc::new(host));
+        self
+    }
+
+    /// Variant of [`Dispatcher::with_confirm_host`] that accepts an existing
+    /// [`Arc<dyn ConfirmHost>`] for callers (notably tests) that want to
+    /// keep their own clone of the host for assertions.
+    #[must_use]
+    pub fn with_confirm_host_arc(mut self, host: Arc<dyn ConfirmHost>) -> Self {
+        self.confirm_host = Some(host);
+        self
+    }
+
+    /// Install the per-widget lock dispatch settings table (TASK-104).
+    ///
+    /// The bridge populates this from each `WidgetOptions::Lock` block in
+    /// the loaded `Dashboard`. Widgets without an entry resolve to
+    /// [`LockDispatchSettings::permissive`] at lookup time (no PIN, no
+    /// confirmation) — matching the schema's default field values.
+    ///
+    /// The table is wrapped in `Arc<HashMap<...>>` internally so the
+    /// dispatcher's `Clone` impl bumps a refcount rather than copying the
+    /// map for every gesture callback.
+    #[must_use]
+    pub fn with_lock_settings(mut self, settings: HashMap<WidgetId, LockDispatchSettings>) -> Self {
+        self.lock_settings = Arc::new(settings);
         self
     }
 
@@ -1011,14 +1245,26 @@ impl Dispatcher {
                 what: "SetFanSpeed",
                 ticket: "TASK-108",
             }),
-            Action::Lock { .. } => Err(DispatchError::NotImplementedYet {
-                what: "Lock",
-                ticket: "TASK-102",
-            }),
-            Action::Unlock { .. } => Err(DispatchError::NotImplementedYet {
-                what: "Unlock",
-                ticket: "TASK-102",
-            }),
+            // TASK-104: lock dispatch — direct call_service to lock.lock.
+            // Per `locked_decisions.confirmation_on_lock_unlock`, only the
+            // *unlock* path consults `require_confirmation_on_unlock`. The
+            // PIN policy still applies to lock if `Required` — a lock
+            // entity that requires a PIN to LOCK is unusual but the schema
+            // allows it (PinPolicy::Required is symmetric over both
+            // operations). The Action variant carries no `confirmation`
+            // field per locked_decisions.confirmation_on_lock_unlock.
+            Action::Lock { entity_id } => self.dispatch_lock_or_unlock(
+                widget_id,
+                entry,
+                LockOperation::Lock,
+                EntityId::from(entity_id.as_str()),
+            ),
+            Action::Unlock { entity_id } => self.dispatch_lock_or_unlock(
+                widget_id,
+                entry,
+                LockOperation::Unlock,
+                EntityId::from(entity_id.as_str()),
+            ),
             Action::AlarmArm { .. } => Err(DispatchError::NotImplementedYet {
                 what: "AlarmArm",
                 ticket: "TASK-109",
@@ -1208,6 +1454,290 @@ impl Dispatcher {
         Ok(DispatchOutcome::Sent { ack_rx })
     }
 
+    // -----------------------------------------------------------------------
+    // Lock / Unlock dispatch (TASK-104)
+    // -----------------------------------------------------------------------
+
+    /// Dispatch [`Action::Lock`] or [`Action::Unlock`] (TASK-104).
+    ///
+    /// # Flow
+    ///
+    /// Per `locked_decisions.confirmation_on_lock_unlock` and
+    /// `locked_decisions.pin_entry_dispatch`:
+    ///
+    /// 1. Look up `LockDispatchSettings` for `widget_id`. Missing entries
+    ///    resolve to [`LockDispatchSettings::permissive`] (no PIN, no
+    ///    confirm).
+    /// 2. If the operation is [`LockOperation::Unlock`] AND
+    ///    `require_confirmation_on_unlock` is true AND a `ConfirmHost`
+    ///    is wired: invoke `confirm_host.confirm(...)` with an on_accept
+    ///    closure. The closure carries the rest of the flow (PIN entry
+    ///    if needed, then dispatch). Return
+    ///    [`DispatchOutcome::LockAwaitingConfirm`] synchronously.
+    /// 3. Else if `pin_policy: Required { length, code_format }` is set
+    ///    AND a `PinEntryHost` is wired: invoke
+    ///    `pin_host.request_pin(code_format, on_submit)`. The on_submit
+    ///    closure consumes the entered code via FnOnce, builds a
+    ///    `lock.lock` / `lock.unlock` `OutboundFrame` with `data.code = code`,
+    ///    and `try_send`s on `command_tx`. Return
+    ///    [`DispatchOutcome::LockAwaitingPinEntry`] synchronously. The
+    ///    code is dropped at end of the closure scope; no field stores it.
+    /// 4. Else: dispatch directly via [`dispatch_call_service`].
+    ///
+    /// # PIN code never leaks (Risk #7)
+    ///
+    /// The on_submit closure is the *only* code path that touches the
+    /// entered string. It builds a JSON object literal with the code as a
+    /// string value, hands it to `OutboundFrame.data`, and the closure
+    /// then drops. No `tracing::*` call line in this function emits the
+    /// code field — the unit test
+    /// `pin_code_not_in_tracing_spans` (in this module) installs a
+    /// capturing subscriber and asserts that the synthetic code never
+    /// appears in any captured event line.
+    ///
+    /// # Audit row (per `locked_decisions.audit_substrate_placement`)
+    ///
+    /// On PIN submit, an audit row is emitted with `event="pin.submitted"`,
+    /// `outcome="submitted"`, `scheme=None`, `error_kind=None`. The code
+    /// value, length, and format hint are intentionally NOT in the row.
+    fn dispatch_lock_or_unlock(
+        &self,
+        widget_id: &WidgetId,
+        entry: &WidgetActionEntry,
+        operation: LockOperation,
+        entity_id: EntityId,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        // Look up the per-widget lock settings; missing → permissive default.
+        let settings = self
+            .lock_settings
+            .get(widget_id)
+            .cloned()
+            .unwrap_or_else(LockDispatchSettings::permissive);
+
+        debug!(
+            widget = %widget_id,
+            entity = %entity_id,
+            ?operation,
+            "dispatch_lock_or_unlock: routing"
+        );
+
+        // Step 2: confirmation modal (Unlock only).
+        let needs_confirm =
+            matches!(operation, LockOperation::Unlock) && settings.require_confirmation_on_unlock;
+
+        if needs_confirm {
+            let Some(confirm_host) = self.confirm_host.as_ref() else {
+                // Confirmation required but no host wired — fail closed.
+                // The dispatcher must not silently skip the modal.
+                warn!(
+                    widget = %widget_id,
+                    entity = %entity_id,
+                    "lock unlock requires confirmation but no ConfirmHost is wired (fail-closed)"
+                );
+                return Err(DispatchError::NotImplementedYet {
+                    what: "Unlock-with-confirmation",
+                    ticket: "TASK-104",
+                });
+            };
+
+            // Defer PIN entry + dispatch into the on_accept closure.
+            let dispatcher = self.clone();
+            let entry_clone = entry.clone();
+            let widget_id_clone = widget_id.clone();
+            let entity_id_clone = entity_id.clone();
+            confirm_host.confirm(
+                entity_id.clone(),
+                Box::new(move || {
+                    // After accept: continue with the PIN/dispatch flow as
+                    // if confirmation had not been required. We re-enter the
+                    // helper with `require_confirmation_on_unlock=false` so
+                    // we don't re-prompt.
+                    dispatcher.continue_after_confirm(
+                        &widget_id_clone,
+                        &entry_clone,
+                        operation,
+                        entity_id_clone,
+                    );
+                }),
+            );
+
+            return Ok(DispatchOutcome::LockAwaitingConfirm { entity_id });
+        }
+
+        // Step 3 / 4: PIN-or-dispatch.
+        self.dispatch_lock_or_unlock_after_confirm(
+            widget_id, entry, operation, entity_id, &settings,
+        )
+    }
+
+    /// Continuation invoked from a `ConfirmHost::confirm` `on_accept`
+    /// closure (TASK-104). Mirrors the post-confirm path inside
+    /// `dispatch_lock_or_unlock`: looks up settings (sans the
+    /// confirmation gate) and invokes PIN entry or direct dispatch as
+    /// appropriate. Errors are logged at `warn!` level — the gesture
+    /// callback has already returned, so there is no place to bubble the
+    /// `Result` to.
+    fn continue_after_confirm(
+        &self,
+        widget_id: &WidgetId,
+        entry: &WidgetActionEntry,
+        operation: LockOperation,
+        entity_id: EntityId,
+    ) {
+        let settings = self
+            .lock_settings
+            .get(widget_id)
+            .cloned()
+            .unwrap_or_else(LockDispatchSettings::permissive);
+
+        match self.dispatch_lock_or_unlock_after_confirm(
+            widget_id,
+            entry,
+            operation,
+            entity_id.clone(),
+            &settings,
+        ) {
+            Ok(_outcome) => {}
+            Err(e) => {
+                // No code in the error log — `e`'s Display impl never
+                // includes a PIN. The PIN code, if any, never reaches
+                // this code path: it lives only inside the on_submit
+                // closure which builds the OutboundFrame directly.
+                warn!(
+                    widget = %widget_id,
+                    entity = %entity_id,
+                    error = %e,
+                    "post-confirm dispatch_lock_or_unlock_after_confirm failed"
+                );
+            }
+        }
+    }
+
+    /// Common tail for the lock/unlock flow after the confirmation
+    /// modal (if any) has been accepted (TASK-104). Branches on
+    /// `pin_policy`:
+    ///   * `Required` → invoke `PinEntryHost::request_pin` and return
+    ///     `LockAwaitingPinEntry`. The on_submit closure builds and
+    ///     `try_send`s the OutboundCommand directly.
+    ///   * `None` / `RequiredOnDisarm` → direct service-call dispatch.
+    ///     `RequiredOnDisarm` is alarm-only (validator-rejected on
+    ///     locks); we treat it as None here defensively.
+    fn dispatch_lock_or_unlock_after_confirm(
+        &self,
+        _widget_id: &WidgetId,
+        entry: &WidgetActionEntry,
+        operation: LockOperation,
+        entity_id: EntityId,
+        settings: &LockDispatchSettings,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let service = match operation {
+            LockOperation::Lock => "lock",
+            LockOperation::Unlock => "unlock",
+        };
+
+        // Branch on the pin policy.
+        match &settings.pin_policy {
+            crate::dashboard::schema::PinPolicy::Required {
+                length: _length,
+                code_format,
+            } => {
+                let Some(pin_host) = self.pin_host.as_ref() else {
+                    warn!(
+                        entity = %entity_id,
+                        "lock action requires PIN entry but no PinEntryHost is wired (fail-closed)"
+                    );
+                    return Err(DispatchError::NotImplementedYet {
+                        what: "Lock-with-PIN",
+                        ticket: "TASK-104",
+                    });
+                };
+
+                // Capture the channel for the on_submit closure. We do
+                // NOT capture `self` (which would extend the dispatcher's
+                // borrow lifetime beyond the closure's `'static` bound).
+                let command_tx = self
+                    .command_tx
+                    .clone()
+                    .ok_or(DispatchError::ChannelNotWired)?;
+                let entity_id_for_frame = entity_id.clone();
+                let code_format = *code_format;
+                let service_name = service;
+
+                pin_host.request_pin(
+                    code_format,
+                    Box::new(move |code: String| {
+                        // SECURITY (locked_decisions.pin_entry_dispatch):
+                        // `code` is consumed exactly once. No tracing call
+                        // here emits the code value. The value is moved
+                        // into `data` and the closure drops at end of
+                        // scope. `tracing-redact` provides the runtime
+                        // safety net; the structural FnOnce + scope-bound
+                        // drop is the primary control.
+                        //
+                        // We construct a `serde_json::Value` payload via
+                        // `serde_json::json!` because the OutboundFrame's
+                        // `data` field is typed as `serde_json::Value`.
+                        // `src/actions/**` is NOT gated against the JSON
+                        // crate (the Gate-2 grep covers `src/ui/**`
+                        // only); naming the path here is fine.
+                        let frame = OutboundFrame {
+                            domain: "lock".to_owned(),
+                            service: service_name.to_owned(),
+                            target: Some(serde_json::json!({
+                                "entity_id": entity_id_for_frame.as_str(),
+                            })),
+                            data: Some(serde_json::json!({ "code": code })),
+                        };
+                        // `code` is moved into the `data` JSON object.
+                        // The local binding `code` no longer holds the
+                        // string after `json!` consumes it.
+
+                        let (ack_tx, _ack_rx) = oneshot::channel::<AckResult>();
+                        let cmd = OutboundCommand { frame, ack_tx };
+                        // `try_send` so we never block the Slint event
+                        // loop. A full channel surfaces as a debug log;
+                        // the PIN value is NOT in the log line.
+                        if let Err(send_err) = command_tx.try_send(cmd) {
+                            warn!(
+                                entity = %entity_id_for_frame,
+                                error = ?send_err.to_string(),
+                                "pin_submit: command_tx send failed"
+                            );
+                        }
+                        // Audit row per
+                        // locked_decisions.audit_substrate_placement.
+                        // No code, no length, no format hint, no
+                        // entity_id — `AuditEvent`'s field types are
+                        // structurally restricted to the sealed
+                        // `AuditField` whitelist (static strings + the
+                        // `AuditScheme` enum + `TraceId`), per the
+                        // `field_gate::ASSERT_AUDIT_EVENT_FIELDS_ARE_AUDIT_FIELDS`
+                        // gate in `src/audit/mod.rs`. Tagging the row by
+                        // entity would require extending the seal —
+                        // out of scope for TASK-104 (security-engineer-
+                        // owned, `src/audit/**` is must_not_touch).
+                        crate::audit::emit(crate::audit::AuditEvent {
+                            event: "pin.submitted",
+                            outcome: "submitted",
+                            error_kind: None,
+                            scheme: None,
+                        });
+                    }),
+                );
+
+                Ok(DispatchOutcome::LockAwaitingPinEntry { entity_id })
+            }
+            // `PinPolicy::None` and the alarm-only `RequiredOnDisarm`
+            // (validator-rejected on locks) fall through to direct
+            // dispatch. We do not allocate a `data` payload — HA's
+            // `lock.lock` / `lock.unlock` services accept no arguments
+            // beyond `entity_id` when the lock has no code requirement.
+            crate::dashboard::schema::PinPolicy::None
+            | crate::dashboard::schema::PinPolicy::RequiredOnDisarm { .. } => self
+                .dispatch_call_service("lock", service, Some(entry.entity_id.as_str()), None, None),
+        }
+    }
+
     /// Route a dispatch attempt through the offline queue (TASK-065).
     ///
     /// Returns `Some(_)` when the action is consumed by the offline path
@@ -1255,10 +1785,27 @@ impl Dispatcher {
                 }))
             }
 
+            // TASK-104: Lock / Unlock are wired in dispatch but the offline
+            // queue cannot accept them (`OfflineQueue::enqueue` rejects
+            // them as `UnsupportedVariant` — `src/actions/queue.rs` is in
+            // TASK-104's must_not_touch list). When offline we therefore
+            // surface `NotImplementedYet` directly so the user sees a
+            // typed error rather than a phantom queue entry. The PIN
+            // entry / confirm modal flow lives ONLY on the live path —
+            // per `locked_decisions.confirmation_on_lock_unlock`,
+            // offline replay does not show the confirm modal, but
+            // there is no offline replay for Lock/Unlock until a future
+            // ticket extends the queue to accept them.
+            Action::Lock { .. } | Action::Unlock { .. } => {
+                Some(Err(DispatchError::NotImplementedYet {
+                    what: "Lock-or-Unlock-offline",
+                    ticket: "TASK-104",
+                }))
+            }
             // Phase 6 typed variants (TASK-099): dispatcher wiring is deferred
-            // to TASK-102..TASK-105, TASK-108, TASK-109. Until those tickets
-            // wire the per-variant dispatch paths, returning `None` here lets
-            // the main `dispatch` match return `DispatchError::NotImplementedYet`
+            // to TASK-105, TASK-108, TASK-109. Until those tickets wire the
+            // per-variant dispatch paths, returning `None` here lets the main
+            // `dispatch` match return `DispatchError::NotImplementedYet`
             // regardless of connection state. No offline-queued toast fires,
             // no phantom entry is enqueued. Kept exhaustive — no wildcard —
             // so a future variant addition remains a compile error.
@@ -1268,8 +1815,6 @@ impl Dispatcher {
             | Action::MediaTransport { .. }
             | Action::SetCoverPosition { .. }
             | Action::SetFanSpeed { .. }
-            | Action::Lock { .. }
-            | Action::Unlock { .. }
             | Action::AlarmArm { .. }
             | Action::AlarmDisarm { .. } => None,
 
@@ -3912,10 +4457,16 @@ mod tests {
         }
     }
 
+    /// TASK-104 wired the Lock dispatcher: `Action::Lock` with no PIN
+    /// policy and no confirmation dispatches `lock.lock` directly via
+    /// the standard call-service path. The `NotImplementedYet` outcome
+    /// landed in TASK-099 is no longer the right assertion — the new
+    /// behaviour is covered here and the previous assertion would mask a
+    /// regression.
     #[test]
-    fn phase6_lock_dispatch_returns_not_implemented_yet() {
+    fn lock_dispatch_calls_lock_lock_service_with_no_pin_no_confirm() {
         let services = handle_from(ServiceRegistry::new());
-        let (dispatcher, _rx) = make_dispatcher_with_recorder(services);
+        let (dispatcher, mut rx) = make_dispatcher_with_recorder(services);
         let action = Action::Lock {
             entity_id: "lock.front_door".to_owned(),
         };
@@ -3925,22 +4476,31 @@ mod tests {
         );
         let store = store_with(vec![]);
 
-        let err = dispatcher
+        let outcome = dispatcher
             .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
-            .expect_err("Lock must return NotImplementedYet");
-        match err {
-            DispatchError::NotImplementedYet { what, ticket } => {
-                assert_eq!(what, "Lock");
-                assert_eq!(ticket, "TASK-102");
-            }
-            other => panic!("expected NotImplementedYet, got {other:?}"),
+            .expect("Lock with no PIN, no confirm dispatches synchronously");
+        match outcome {
+            DispatchOutcome::Sent { .. } => {}
+            other => panic!("expected DispatchOutcome::Sent, got {other:?}"),
         }
+        let cmd = rx.try_recv().expect("recorder must have received");
+        assert_eq!(cmd.frame.domain, "lock");
+        assert_eq!(cmd.frame.service, "lock");
+        assert_eq!(
+            cmd.frame.target,
+            Some(serde_json::json!({ "entity_id": "lock.front_door" }))
+        );
+        // No PIN means no `data` payload — HA's `lock.lock` accepts the
+        // entity_id alone for code-less locks.
+        assert!(cmd.frame.data.is_none());
     }
 
+    /// TASK-104: `Action::Unlock` with no PIN policy and no confirmation
+    /// dispatches `lock.unlock` synchronously.
     #[test]
-    fn phase6_unlock_dispatch_returns_not_implemented_yet() {
+    fn unlock_dispatch_calls_lock_unlock_service_with_no_pin_no_confirm() {
         let services = handle_from(ServiceRegistry::new());
-        let (dispatcher, _rx) = make_dispatcher_with_recorder(services);
+        let (dispatcher, mut rx) = make_dispatcher_with_recorder(services);
         let action = Action::Unlock {
             entity_id: "lock.front_door".to_owned(),
         };
@@ -3950,16 +4510,17 @@ mod tests {
         );
         let store = store_with(vec![]);
 
-        let err = dispatcher
+        let outcome = dispatcher
             .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
-            .expect_err("Unlock must return NotImplementedYet");
-        match err {
-            DispatchError::NotImplementedYet { what, ticket } => {
-                assert_eq!(what, "Unlock");
-                assert_eq!(ticket, "TASK-102");
-            }
-            other => panic!("expected NotImplementedYet, got {other:?}"),
+            .expect("Unlock with no PIN, no confirm dispatches synchronously");
+        match outcome {
+            DispatchOutcome::Sent { .. } => {}
+            other => panic!("expected DispatchOutcome::Sent, got {other:?}"),
         }
+        let cmd = rx.try_recv().expect("recorder must have received");
+        assert_eq!(cmd.frame.domain, "lock");
+        assert_eq!(cmd.frame.service, "unlock");
+        assert!(cmd.frame.data.is_none());
     }
 
     #[test]
@@ -4200,6 +4761,10 @@ mod tests {
         );
     }
 
+    /// TASK-104: Lock offline — the offline queue rejects Lock/Unlock as
+    /// `UnsupportedVariant` (`src/actions/queue.rs` is in must_not_touch),
+    /// so the dispatcher surfaces `NotImplementedYet` directly when
+    /// offline. The confirm/PIN flow lives only on the live path.
     #[test]
     fn phase6_lock_offline_returns_not_implemented_yet() {
         let (dispatcher, _cmd_rx, _toast_rx, _queue, _state_tx) = make_offline_fixture();
@@ -4216,11 +4781,18 @@ mod tests {
             .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
             .expect_err("Lock offline must return NotImplementedYet");
         assert!(
-            matches!(err, DispatchError::NotImplementedYet { what: "Lock", .. }),
-            "expected NotImplementedYet for Lock, got {err:?}"
+            matches!(
+                err,
+                DispatchError::NotImplementedYet {
+                    what: "Lock-or-Unlock-offline",
+                    ..
+                }
+            ),
+            "expected NotImplementedYet for Lock offline, got {err:?}"
         );
     }
 
+    /// TASK-104: Unlock offline — same offline-path treatment as Lock.
     #[test]
     fn phase6_unlock_offline_returns_not_implemented_yet() {
         let (dispatcher, _cmd_rx, _toast_rx, _queue, _state_tx) = make_offline_fixture();
@@ -4237,8 +4809,14 @@ mod tests {
             .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
             .expect_err("Unlock offline must return NotImplementedYet");
         assert!(
-            matches!(err, DispatchError::NotImplementedYet { what: "Unlock", .. }),
-            "expected NotImplementedYet for Unlock, got {err:?}"
+            matches!(
+                err,
+                DispatchError::NotImplementedYet {
+                    what: "Lock-or-Unlock-offline",
+                    ..
+                }
+            ),
+            "expected NotImplementedYet for Unlock offline, got {err:?}"
         );
     }
 
@@ -4305,5 +4883,436 @@ mod tests {
             ),
             "expected NotImplementedYet for AlarmDisarm, got {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-104: Lock dispatch with PIN entry + confirm modal
+    // -----------------------------------------------------------------------
+
+    use crate::actions::pin::{CodeFormat, PinEntryHost};
+    use crate::dashboard::schema::PinPolicy;
+    use std::sync::Mutex as StdMutex;
+
+    /// Boxed `FnOnce(String) + Send` closure stashed by the mock PIN host
+    /// so a test can drive the on-submit callback synchronously. The
+    /// `type` alias keeps the `Mutex<Option<Box<dyn ...>>>` chain inside a
+    /// single name (clippy::type_complexity).
+    type PendingPinSubmit = Box<dyn FnOnce(String) + Send>;
+
+    /// Boxed `FnOnce() + Send` closure stashed by the mock confirm host.
+    /// Same rationale as [`PendingPinSubmit`].
+    type PendingConfirmAccept = Box<dyn FnOnce() + Send>;
+
+    /// Mock PinEntryHost: captures the on_submit closure and the
+    /// requested CodeFormat. Mirrors the test mock in
+    /// `src/actions/pin.rs::tests` but lives here so the dispatcher
+    /// tests can drive it directly without a cross-module import dance.
+    struct MockPinEntryHost {
+        pending: StdMutex<Option<PendingPinSubmit>>,
+        received_format: StdMutex<Option<CodeFormat>>,
+    }
+
+    impl MockPinEntryHost {
+        fn new() -> Self {
+            MockPinEntryHost {
+                pending: StdMutex::new(None),
+                received_format: StdMutex::new(None),
+            }
+        }
+
+        fn submit(&self, code: String) {
+            let cb = self
+                .pending
+                .lock()
+                .unwrap()
+                .take()
+                .expect("request_pin must have been called");
+            cb(code);
+        }
+
+        fn received_format(&self) -> Option<CodeFormat> {
+            *self.received_format.lock().unwrap()
+        }
+    }
+
+    impl PinEntryHost for MockPinEntryHost {
+        fn request_pin(&self, code_format: CodeFormat, on_submit: Box<dyn FnOnce(String) + Send>) {
+            *self.received_format.lock().unwrap() = Some(code_format);
+            *self.pending.lock().unwrap() = Some(on_submit);
+        }
+    }
+
+    /// Mock ConfirmHost: captures the on_accept closure. Mirrors the
+    /// MockPinEntryHost shape — accept by calling `accept`, dismiss by
+    /// dropping the captured closure.
+    struct MockConfirmHost {
+        pending: StdMutex<Option<PendingConfirmAccept>>,
+        invocations: StdMutex<usize>,
+    }
+
+    impl MockConfirmHost {
+        fn new() -> Self {
+            MockConfirmHost {
+                pending: StdMutex::new(None),
+                invocations: StdMutex::new(0),
+            }
+        }
+
+        fn accept(&self) {
+            let cb = self
+                .pending
+                .lock()
+                .unwrap()
+                .take()
+                .expect("confirm must have been called");
+            cb();
+        }
+
+        fn invocation_count(&self) -> usize {
+            *self.invocations.lock().unwrap()
+        }
+    }
+
+    impl ConfirmHost for MockConfirmHost {
+        fn confirm(&self, _entity_id: EntityId, on_accept: Box<dyn FnOnce() + Send>) {
+            *self.invocations.lock().unwrap() += 1;
+            *self.pending.lock().unwrap() = Some(on_accept);
+        }
+    }
+
+    /// `Action::Unlock` with `pin_policy: Required` invokes
+    /// `PinEntryHost::request_pin` with the configured code_format AND
+    /// returns `LockAwaitingPinEntry` synchronously. The actual
+    /// `lock.unlock` service call only fires after the test invokes
+    /// `host.submit(code)`.
+    #[test]
+    fn pin_required_triggers_pin_entry() {
+        let services = handle_from(ServiceRegistry::new());
+        let (tx, mut rx) = mpsc::channel::<OutboundCommand>(8);
+        let pin_host = Arc::new(MockPinEntryHost::new());
+
+        let mut settings = HashMap::new();
+        settings.insert(
+            WidgetId::from("w"),
+            LockDispatchSettings {
+                pin_policy: PinPolicy::Required {
+                    length: 4,
+                    code_format: CodeFormat::Number,
+                },
+                require_confirmation_on_unlock: false,
+            },
+        );
+
+        let dispatcher = Dispatcher::with_command_tx(services, tx)
+            .with_pin_host_arc(pin_host.clone() as Arc<dyn PinEntryHost>)
+            .with_lock_settings(settings);
+
+        let action = Action::Unlock {
+            entity_id: "lock.front_door".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("lock.front_door", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let outcome = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect("Unlock with PIN must return LockAwaitingPinEntry");
+        match outcome {
+            DispatchOutcome::LockAwaitingPinEntry { ref entity_id } => {
+                assert_eq!(entity_id.as_str(), "lock.front_door");
+            }
+            other => panic!("expected LockAwaitingPinEntry, got {other:?}"),
+        }
+        assert_eq!(
+            pin_host.received_format(),
+            Some(CodeFormat::Number),
+            "request_pin must be invoked with the configured code_format"
+        );
+        // The OutboundCommand has NOT been sent yet — it fires from
+        // within the on_submit closure.
+        assert!(
+            rx.try_recv().is_err(),
+            "no OutboundCommand should be sent until on_submit fires"
+        );
+
+        // Simulate the user entering the PIN.
+        pin_host.submit("1234".to_owned());
+
+        let cmd = rx
+            .try_recv()
+            .expect("OutboundCommand must be sent after submit");
+        assert_eq!(cmd.frame.domain, "lock");
+        assert_eq!(cmd.frame.service, "unlock");
+        assert_eq!(
+            cmd.frame.target,
+            Some(serde_json::json!({ "entity_id": "lock.front_door" }))
+        );
+        assert_eq!(
+            cmd.frame.data,
+            Some(serde_json::json!({ "code": "1234" })),
+            "code must be injected into data.code by on_submit"
+        );
+    }
+
+    /// `Action::Unlock` with `require_confirmation_on_unlock: true`
+    /// invokes `ConfirmHost::confirm` BEFORE PIN entry. After the user
+    /// accepts, the PIN entry fires; after the user submits the code,
+    /// the OutboundCommand is sent.
+    #[test]
+    fn require_confirmation_on_unlock_shows_modal() {
+        let services = handle_from(ServiceRegistry::new());
+        let (tx, mut rx) = mpsc::channel::<OutboundCommand>(8);
+        let pin_host = Arc::new(MockPinEntryHost::new());
+        let confirm_host = Arc::new(MockConfirmHost::new());
+
+        let mut settings = HashMap::new();
+        settings.insert(
+            WidgetId::from("w"),
+            LockDispatchSettings {
+                pin_policy: PinPolicy::Required {
+                    length: 4,
+                    code_format: CodeFormat::Number,
+                },
+                require_confirmation_on_unlock: true,
+            },
+        );
+
+        let dispatcher = Dispatcher::with_command_tx(services, tx)
+            .with_pin_host_arc(pin_host.clone() as Arc<dyn PinEntryHost>)
+            .with_confirm_host_arc(confirm_host.clone() as Arc<dyn ConfirmHost>)
+            .with_lock_settings(settings);
+
+        let action = Action::Unlock {
+            entity_id: "lock.front_door".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("lock.front_door", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let outcome = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect("Unlock with confirm must return LockAwaitingConfirm");
+        match outcome {
+            DispatchOutcome::LockAwaitingConfirm { ref entity_id } => {
+                assert_eq!(entity_id.as_str(), "lock.front_door");
+            }
+            other => panic!("expected LockAwaitingConfirm, got {other:?}"),
+        }
+        assert_eq!(
+            confirm_host.invocation_count(),
+            1,
+            "ConfirmHost::confirm must be invoked before PIN entry"
+        );
+        assert!(
+            pin_host.received_format().is_none(),
+            "PIN entry must NOT fire until the user accepts the confirm modal"
+        );
+        assert!(rx.try_recv().is_err(), "no command sent yet");
+
+        // User accepts the confirm modal.
+        confirm_host.accept();
+
+        // Now PIN entry should be invoked.
+        assert_eq!(
+            pin_host.received_format(),
+            Some(CodeFormat::Number),
+            "PIN entry must fire after confirm accept"
+        );
+        assert!(rx.try_recv().is_err(), "still no command until PIN submit");
+
+        // User enters the PIN.
+        pin_host.submit("9876".to_owned());
+        let cmd = rx.try_recv().expect("command after PIN submit");
+        assert_eq!(cmd.frame.service, "unlock");
+        assert_eq!(cmd.frame.data, Some(serde_json::json!({ "code": "9876" })));
+    }
+
+    /// `Action::Unlock` with `require_confirmation_on_unlock: true` AND
+    /// `pin_policy: None` shows the confirm modal but skips PIN entry.
+    /// Acceptance dispatches `lock.unlock` directly with no `data`.
+    #[test]
+    fn require_confirmation_on_unlock_with_no_pin_dispatches_after_accept() {
+        let services = handle_from(ServiceRegistry::new());
+        let (tx, mut rx) = mpsc::channel::<OutboundCommand>(8);
+        let confirm_host = Arc::new(MockConfirmHost::new());
+
+        let mut settings = HashMap::new();
+        settings.insert(
+            WidgetId::from("w"),
+            LockDispatchSettings {
+                pin_policy: PinPolicy::None,
+                require_confirmation_on_unlock: true,
+            },
+        );
+
+        let dispatcher = Dispatcher::with_command_tx(services, tx)
+            .with_confirm_host_arc(confirm_host.clone() as Arc<dyn ConfirmHost>)
+            .with_lock_settings(settings);
+
+        let action = Action::Unlock {
+            entity_id: "lock.front_door".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("lock.front_door", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let _ = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect("Unlock with confirm dispatches");
+        confirm_host.accept();
+
+        let cmd = rx.try_recv().expect("command after accept");
+        assert_eq!(cmd.frame.service, "unlock");
+        assert!(cmd.frame.data.is_none(), "no PIN means no data payload");
+    }
+
+    /// Per `locked_decisions.confirmation_on_lock_unlock`: the
+    /// `Action::Lock` (lock-down) variant does NOT consult
+    /// `require_confirmation_on_unlock`. Only the *unlock* path shows a
+    /// confirm modal — locking is always direct (or PIN-gated).
+    #[test]
+    fn lock_action_does_not_show_confirm_modal_even_when_unlock_flag_is_set() {
+        let services = handle_from(ServiceRegistry::new());
+        let (tx, mut rx) = mpsc::channel::<OutboundCommand>(8);
+        let confirm_host = Arc::new(MockConfirmHost::new());
+
+        let mut settings = HashMap::new();
+        settings.insert(
+            WidgetId::from("w"),
+            LockDispatchSettings {
+                pin_policy: PinPolicy::None,
+                require_confirmation_on_unlock: true,
+            },
+        );
+
+        let dispatcher = Dispatcher::with_command_tx(services, tx)
+            .with_confirm_host_arc(confirm_host.clone() as Arc<dyn ConfirmHost>)
+            .with_lock_settings(settings);
+
+        let action = Action::Lock {
+            entity_id: "lock.front_door".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with("lock.front_door", action, Action::None, Action::None),
+        );
+        let store = store_with(vec![]);
+
+        let outcome = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect("Lock dispatches synchronously even when unlock flag is set");
+        match outcome {
+            DispatchOutcome::Sent { .. } => {}
+            other => panic!("expected DispatchOutcome::Sent, got {other:?}"),
+        }
+        assert_eq!(
+            confirm_host.invocation_count(),
+            0,
+            "Lock action must NOT invoke confirm host"
+        );
+        let cmd = rx.try_recv().expect("Lock dispatched directly");
+        assert_eq!(cmd.frame.service, "lock");
+    }
+
+    /// Per Risk #7 (PIN code leakage): when the dispatcher fires a PIN
+    /// entry submit, the entered code MUST NOT appear in any captured
+    /// tracing span or event during the test. This is the dispatcher-side
+    /// counterpart of the same assertion in
+    /// `src/actions/pin.rs::tests::code_not_captured_in_tracing_spans`.
+    #[test]
+    fn pin_code_not_in_tracing_spans() {
+        use std::sync::Arc as StdArc;
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct CapturingLayer {
+            events: StdArc<StdMutex<Vec<String>>>,
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturingLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct FieldCollector(Vec<String>);
+                impl tracing::field::Visit for FieldCollector {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push(format!("{}={:?}", field.name(), value));
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.push(format!("{}={}", field.name(), value));
+                    }
+                }
+                let mut collector = FieldCollector(Vec::new());
+                event.record(&mut collector);
+                let line = collector.0.join(" ");
+                self.events.lock().unwrap().push(line);
+            }
+        }
+
+        let events: StdArc<StdMutex<Vec<String>>> = StdArc::new(StdMutex::new(Vec::new()));
+        let layer = CapturingLayer {
+            events: StdArc::clone(&events),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let synthetic_code = "555123";
+
+        with_default(subscriber, || {
+            let services = handle_from(ServiceRegistry::new());
+            let (tx, mut rx) = mpsc::channel::<OutboundCommand>(8);
+            let pin_host = Arc::new(MockPinEntryHost::new());
+            let mut settings = HashMap::new();
+            settings.insert(
+                WidgetId::from("w"),
+                LockDispatchSettings {
+                    pin_policy: PinPolicy::Required {
+                        length: 6,
+                        code_format: CodeFormat::Number,
+                    },
+                    require_confirmation_on_unlock: false,
+                },
+            );
+            let dispatcher = Dispatcher::with_command_tx(services, tx)
+                .with_pin_host_arc(pin_host.clone() as Arc<dyn PinEntryHost>)
+                .with_lock_settings(settings);
+
+            let action = Action::Unlock {
+                entity_id: "lock.front_door".to_owned(),
+            };
+            let map = one_widget_map(
+                "w",
+                entry_with("lock.front_door", action, Action::None, Action::None),
+            );
+            let store = store_with(vec![]);
+
+            let _ = dispatcher.dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map);
+            pin_host.submit(synthetic_code.to_owned());
+            // Drain the receiver so the OutboundCommand is consumed,
+            // matching the production fire-and-forget shape.
+            let _ = rx.try_recv();
+        });
+
+        // No event line may contain the synthetic code. The OutboundFrame
+        // does carry the code in its `data` field, but the dispatcher's
+        // log lines NEVER emit the frame body — only static metadata.
+        let captured = events.lock().unwrap();
+        for line in captured.iter() {
+            assert!(
+                !line.contains(synthetic_code),
+                "PIN code must not appear in any tracing event: {line:?}"
+            );
+        }
     }
 }
