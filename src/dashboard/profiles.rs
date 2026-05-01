@@ -346,6 +346,16 @@ pub struct DeviceProfile {
     /// HTTP cache TTL in seconds (Phase 6.0 http.rs).
     pub http_cache_ttl_s: u32,
 
+    /// Maximum HTTP request retry attempts (Phase 7 F13). Profile-bound.
+    pub http_retry_budget: u32,
+
+    /// Per-request timeout in milliseconds, covering all retry attempts and
+    /// backoff sleep (Phase 7 F13). Profile-bound.
+    pub http_request_timeout_ms: u64,
+
+    /// Per-host rate limit in requests per second (Phase 7 F13). Profile-bound.
+    pub http_rate_limit_per_host_qps: u32,
+
     /// SmallVec inline capacity for the dependency index (Phase 6b visibility
     /// evaluator). Entries above this threshold spill to the heap.
     pub dep_index_inline_cap: usize,
@@ -420,6 +430,9 @@ pub const PROFILE_RPI4: DeviceProfile = DeviceProfile {
     history_window_max_s: 24 * 3_600,
     http_cache_bytes: 32 * 1024 * 1024,
     http_cache_ttl_s: 300,
+    http_retry_budget: 2,
+    http_request_timeout_ms: 8_000,
+    http_rate_limit_per_host_qps: 2,
     dep_index_inline_cap: 8,
     frame_histogram_buckets: 100,
     soc_temp_ceiling_c: 75,
@@ -464,6 +477,9 @@ pub const PROFILE_OPI_ZERO3: DeviceProfile = DeviceProfile {
     history_window_max_s: 12 * 3_600,
     http_cache_bytes: 16 * 1024 * 1024,
     http_cache_ttl_s: 300,
+    http_retry_budget: 2,
+    http_request_timeout_ms: 8_000,
+    http_rate_limit_per_host_qps: 2,
     dep_index_inline_cap: 8,
     frame_histogram_buckets: 100,
     soc_temp_ceiling_c: 80,
@@ -513,6 +529,9 @@ pub const PROFILE_DESKTOP: DeviceProfile = DeviceProfile {
     history_window_max_s: 168 * 3_600,
     http_cache_bytes: 128 * 1024 * 1024,
     http_cache_ttl_s: 600,
+    http_retry_budget: 3,
+    http_request_timeout_ms: 5_000,
+    http_rate_limit_per_host_qps: 10,
     dep_index_inline_cap: 8,
     frame_histogram_buckets: 100,
     soc_temp_ceiling_c: 0,
@@ -851,6 +870,9 @@ mod tests {
         assert_eq!(PROFILE_RPI4.history_window_max_s, 24 * 3_600);
         assert_eq!(PROFILE_RPI4.http_cache_bytes, 32 * 1024 * 1024);
         assert_eq!(PROFILE_RPI4.http_cache_ttl_s, 300);
+        assert_eq!(PROFILE_RPI4.http_retry_budget, 2);
+        assert_eq!(PROFILE_RPI4.http_request_timeout_ms, 8_000);
+        assert_eq!(PROFILE_RPI4.http_rate_limit_per_host_qps, 2);
         assert_eq!(PROFILE_RPI4.dep_index_inline_cap, 8);
         assert_eq!(PROFILE_RPI4.frame_histogram_buckets, 100);
         assert_eq!(PROFILE_RPI4.soc_temp_ceiling_c, 75);
@@ -889,6 +911,9 @@ mod tests {
         assert_eq!(PROFILE_OPI_ZERO3.history_window_max_s, 12 * 3_600);
         assert_eq!(PROFILE_OPI_ZERO3.http_cache_bytes, 16 * 1024 * 1024);
         assert_eq!(PROFILE_OPI_ZERO3.http_cache_ttl_s, 300);
+        assert_eq!(PROFILE_OPI_ZERO3.http_retry_budget, 2);
+        assert_eq!(PROFILE_OPI_ZERO3.http_request_timeout_ms, 8_000);
+        assert_eq!(PROFILE_OPI_ZERO3.http_rate_limit_per_host_qps, 2);
         assert_eq!(PROFILE_OPI_ZERO3.dep_index_inline_cap, 8);
         assert_eq!(PROFILE_OPI_ZERO3.frame_histogram_buckets, 100);
         assert_eq!(PROFILE_OPI_ZERO3.soc_temp_ceiling_c, 80);
@@ -927,6 +952,9 @@ mod tests {
         assert_eq!(PROFILE_DESKTOP.history_window_max_s, 168 * 3_600);
         assert_eq!(PROFILE_DESKTOP.http_cache_bytes, 128 * 1024 * 1024);
         assert_eq!(PROFILE_DESKTOP.http_cache_ttl_s, 600);
+        assert_eq!(PROFILE_DESKTOP.http_retry_budget, 3);
+        assert_eq!(PROFILE_DESKTOP.http_request_timeout_ms, 5_000);
+        assert_eq!(PROFILE_DESKTOP.http_rate_limit_per_host_qps, 10);
         assert_eq!(PROFILE_DESKTOP.dep_index_inline_cap, 8);
         assert_eq!(PROFILE_DESKTOP.frame_histogram_buckets, 100);
         assert_eq!(PROFILE_DESKTOP.soc_temp_ceiling_c, 0);
