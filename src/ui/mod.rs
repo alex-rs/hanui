@@ -14,6 +14,7 @@
 //! [`crate::ha::live_store::LiveStore::pending_for_widget`].
 
 pub mod bridge;
+pub mod cover;
 pub mod more_info;
 pub mod toast;
 pub mod view_router;

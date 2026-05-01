@@ -245,10 +245,31 @@ impl MoreInfoBody for AttributesBody {
 // path references inside src/ui/**).
 // ---------------------------------------------------------------------------
 
-/// More-info body for `cover` entities.
+/// More-info body for `cover` entities (TASK-102).
 ///
-/// Returns the entity's state. Phase 6a (`TASK-102`) will replace this with a
-/// richer slider-based view.
+/// Renders cover-specific rows: state, current position (when exposed),
+/// current tilt position (when exposed), and the `supported_features`
+/// bitmask. The Slint shell already binds `body-rows` to the modal's
+/// row list, so [`CoverBody`] reuses the generic rendering path —
+/// keeping the trait shape stable per TASK-102 AC #6.
+///
+/// # Position slider integration (locked_decisions.cover_slider_component)
+///
+/// TASK-096 created a stub `PositionSlider` Slint component
+/// (`ui/slint/components/position_slider.slint`); TASK-108 fills in its
+/// visual design. TASK-102 consumes the stub by emitting the position
+/// value as an additional `position` row — when `main_window.slint`
+/// gains a per-domain modal body slot in a future ticket, the Rust body
+/// will swap to writing the slider's `value` property directly. Today
+/// the position is surfaced through the existing row model so the
+/// information reaches the user without amending the Slint shell.
+///
+/// # Stateless
+///
+/// `CoverBody` carries no fields; the body queries the live entity at
+/// `render_rows` time. Per locked_decisions.more_info_modal, the body
+/// is invoked exactly once per modal-open — so the per-call attribute
+/// reads are not on a hot path.
 #[derive(Debug, Default)]
 pub struct CoverBody;
 
@@ -263,10 +284,58 @@ impl CoverBody {
 
 impl MoreInfoBody for CoverBody {
     fn render_rows(&self, entity: &Entity) -> Vec<ModalRow> {
-        vec![ModalRow {
+        // Capacity of 4 covers the worst case (state + position + tilt +
+        // supported_features) without growing.
+        let mut rows = Vec::with_capacity(4);
+
+        // State row — always emitted, matches the per-domain stub
+        // contract every other body upholds.
+        rows.push(ModalRow {
             key: "state".to_owned(),
             value: entity.state.as_ref().to_owned(),
-        }]
+        });
+
+        // Position row, only when the entity exposes `current_position`.
+        // We thread through `crate::ui::cover::CoverVM::from_entity`
+        // for the canonical position-resolution logic (clamping,
+        // state-derived fallback) — the body sees the same value the
+        // tile renders. This keeps tile and modal in lockstep without
+        // duplicating the parsing logic.
+        if entity.attributes.get("current_position").is_some() {
+            let cover_vm = crate::ui::cover::CoverVM::from_entity(entity);
+            rows.push(ModalRow {
+                key: "position".to_owned(),
+                value: format!("{}%", cover_vm.position),
+            });
+        }
+
+        // Tilt row, only when the entity exposes `current_tilt_position`.
+        // Some covers (e.g. blinds) expose tilt independently of
+        // position. The shared `read_tilt_attribute` helper in
+        // `crate::ui::cover` keeps the parsing rules identical to the
+        // tile's tilt label.
+        if let Some(tilt) = crate::ui::cover::read_tilt_attribute(entity) {
+            rows.push(ModalRow {
+                key: "tilt".to_owned(),
+                value: format!("{tilt}%"),
+            });
+        }
+
+        // supported_features row, only when present. The bitmask is
+        // emitted as a decimal integer; a future ticket may decode the
+        // individual flags into a human-readable list once the cover
+        // dispatcher (TASK-099 + service map) defines the bit-to-action
+        // mapping at the trait level. We emit the raw integer now so
+        // the user has visibility into which controls the entity
+        // declares it supports.
+        if let Some(features) = crate::ui::cover::read_supported_features(entity) {
+            rows.push(ModalRow {
+                key: "supported_features".to_owned(),
+                value: features.to_string(),
+            });
+        }
+
+        rows
     }
 }
 
