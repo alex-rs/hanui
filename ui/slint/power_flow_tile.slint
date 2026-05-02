@@ -13,14 +13,12 @@
 // adapter, but the user-visible feature set matches as closely as Slint
 // primitives allow.
 //
-// Per TASK-094 (Phase 6 6d) plan: Phase 6 baseline is the **static current-
-// values render** with theme-token colour coding. Per-particle SVG-path
-// stroke-dasharray animations are deferred to a follow-up — they require
-// Slint surface support (Path stroke-dasharray with offset animation) that
-// is not yet exercised in any other tile and would expand the surface
-// significantly. The tile structure below is laid out so the future
-// animated lanes drop in cleanly: each lane has its own visibility gate
-// (`has-solar`, `has-battery`, etc.) and its own value label.
+// Per TASK-094 (Phase 6 6d) plan: Phase 6 baseline shipped the **static
+// current-values render** with theme-token colour coding. The
+// TASK-094-followup pass (this file) adds the per-lane animated flow
+// particles using `animation-tick()`-derived phase, matching the canonical
+// Lovelace power-flow-card animation idiom but expressed in Slint
+// primitives that work on every backend including the software renderer.
 //
 // Display-mode logic (TASK-094 acceptance criterion §Display-mode logic):
 //   * `Auto` (default): values >= 1000 W render as kW with one decimal;
@@ -34,7 +32,9 @@
 //   * Lanes with magnitude < `min_flow_w` render at 30% opacity with no
 //     particle animation. The numeric value still displays. The bridge
 //     pre-computes the per-lane idle booleans (`solar-idle`, etc.) so the
-//     Slint side does not branch on threshold values.
+//     Slint side does not branch on threshold values. Opacity transitions
+//     are animated (250 ms ease) so a lane crossing the threshold does not
+//     flicker.
 //
 // All colors come from theme tokens; no inline hex literals (CI hex-color
 // gate, `.github/workflows/ci.yml` § Gate 1). Visual primitives only — no
@@ -57,21 +57,39 @@
 //     mapping with `dashboard::schema::Placement` in Rust.
 //
 // Three-state render (per Phase 6 plan acceptance):
-//   * idle (all lanes below threshold)        — text-secondary lane tint, full opacity.
-//   * active (any lane above threshold)        — accent / state-on lane tint, full opacity.
-//   * unavailable (grid entity unreachable)    — state-unavailable tint, reduced opacity (0.5).
+//   * idle (all lanes below threshold)        — text-secondary lane tint, 30% lane opacity.
+//   * active (any lane above threshold)        — accent / state-on lane tint, full opacity, animated particles.
+//   * unavailable (grid entity unreachable)    — state-unavailable tint, reduced root opacity (0.5).
 //
-// AnimationBudget integration (TASK-094 acceptance criterion §Per-profile budget):
+// AnimationBudget integration (TASK-094 acceptance criterion §Per-profile budget,
+// TASK-094-followup):
 //   * Animation framerate is capped at `AnimationBudget.framerate-cap` per
-//     PHASES.md § Performance budgets. A power_flow_tile with all 7
-//     standard lanes active counts as min(7, max_simultaneous_animations)
-//     animations; the Phase 6 baseline emits no flowing-particle animation
-//     (deferred), so the tile contributes zero to `AnimationBudget.active-count`.
-//   * Press feedback is inherited from CardBase. The active-count gate is a
-//     global concern (see card_base.slint).
+//     PHASES.md § Performance budgets — the cap is enforced at the
+//     renderer/timer level by the Rust bridge wiring; this file only
+//     references the budget surface, never hardcodes the cap.
+//   * Per-lane particles are driven by `animation-tick()` derived phase,
+//     not by tile-owned `Timer`s. Slint owns the interpolation; the bridge
+//     is responsible for the per-frame budget (via `framerate-cap`).
+//   * Particle count: 3 per active lane × up to 4 lanes (solar / grid /
+//     battery / home) = 12 particles peak. Well within the per-frame
+//     budget on the tightest profile (opi_zero3 = 2 simultaneous tile
+//     animations; particle motion runs continuously and is shared across
+//     all 12 dots via a single `animation-tick()` source).
+//   * `AnimationBudget.at-capacity` collapses the entire particle subtree
+//     (the `if` block produces nothing). The lane line and value label
+//     remain visible, preserving the static read-out — only the per-
+//     particle movement is suppressed. (Snapping `phase-0` to 0 was
+//     considered but rejected: the phase-1/phase-2 stagger offsets are
+//     constants (0.333 / 0.667), so a `phase-0 == 0` collapse would leave
+//     three stationary dots compressed into the first 67 % of the strip.)
+//   * Idle lanes (`*-idle == true`) render no particles at all (the `if`
+//     subtree collapses), so an idle dashboard contributes zero animation
+//     work.
+//   * Press feedback is inherited from CardBase. The active-count gate is
+//     a global concern (see card_base.slint).
 
 import { Theme } from "theme.slint";
-import { CardBase } from "card_base.slint";
+import { CardBase, AnimationBudget } from "card_base.slint";
 
 // Computed grid placement, mirrors `dashboard::schema::Placement` in Rust.
 // Re-declared per tile file for self-documentation; identical to
@@ -93,25 +111,30 @@ export struct PowerFlowTilePlacement {
 //   * grid-w            — grid power flow in watts (signed: positive = import,
 //                          negative = export). Always meaningful when the
 //                          grid entity is configured (it is required).
+//                          Also used as the per-frame flow-magnitude input
+//                          to the grid-lane particle period (TASK-094-followup).
 //   * grid-label        — pre-formatted display string for the grid value
 //                          (e.g. `"1.5 kW"`, `"-200 W"`).
 //   * grid-importing    — derived: true when grid-w > 0 (importing from grid).
 //   * grid-idle         — derived: true when |grid-w| < min_flow_w. Drives
 //                          the dimmed / no-particle visual.
 //   * has-solar         — whether the widget configures a solar entity.
-//   * solar-w           — solar production in watts.
+//   * solar-w           — solar production in watts. Also drives the
+//                          solar-lane particle period (TASK-094-followup).
 //   * solar-label       — pre-formatted display string for the solar value.
 //   * solar-idle        — derived: true when solar-w < min_flow_w.
 //   * has-battery       — whether the widget configures a battery entity.
 //   * battery-w         — battery flow in watts (signed: positive = charging,
-//                          negative = discharging).
+//                          negative = discharging). Also drives the
+//                          battery-lane particle period (TASK-094-followup).
 //   * battery-label     — pre-formatted display string for the battery value.
 //   * battery-charging  — derived: true when battery-w > 0.
 //   * battery-idle      — derived: true when |battery-w| < min_flow_w.
 //   * has-battery-pct   — whether the widget configures a battery_soc_entity.
 //   * battery-pct       — battery state-of-charge in 0..=100.
 //   * has-home          — whether the widget configures a home entity.
-//   * home-w            — home consumption in watts.
+//   * home-w            — home consumption in watts. Also drives the
+//                          home-lane particle period (TASK-094-followup).
 //   * home-label        — pre-formatted display string for the home value.
 //   * home-idle         — derived: true when home-w < min_flow_w.
 //   * is-available      — false when the grid entity is unavailable / unknown;
@@ -152,6 +175,185 @@ export struct PowerFlowTileVM {
     pending: bool,
 }
 
+// FlowLane — a single source→destination lane with three animated particles
+// flowing along the connector strip.
+//
+// Visual:
+//   * `lane-color`-tinted thin connector line spanning the strip width.
+//   * Three small (4 px) `lane-color` dots travelling left→right, evenly
+//     phase-staggered (0, 1/3, 2/3 of the cycle) so the flow reads as
+//     continuous.
+//   * Particles fade in over the first 10 % of their cycle and fade out over
+//     the last 10 %, so the dots do not appear to pile at the destination.
+//
+// Animation:
+//   * Driven by `animation-tick()` modulo `period` — a single time source for
+//     all three dots (no per-particle Timer). The phase-stagger is a constant
+//     offset added to the same time source. Animation capped at
+//     `AnimationBudget.framerate-cap` per PHASES.md § Performance budgets.
+//   * `period-ms` is computed by the parent tile from the lane's flow watts
+//     via `clamp(3000 - watts/10, 800, 3000)` — high power → fast particles,
+//     low power → slow. The mapping is the canonical Lovelace
+//     power-flow-card behaviour.
+//   * `AnimationBudget.at-capacity` snaps phases to 0 (particles are visible
+//     but do not move). Lane line and labels remain visible regardless.
+//   * `idle == true` collapses the entire particle subtree (the `if` block
+//     produces nothing) so an idle dashboard contributes zero animation work.
+//   * Lane opacity transitions are animated (250 ms ease-in-out) so the lane
+//     does not flicker when crossing the idle threshold.
+component FlowLane inherits Rectangle {
+    in property <string> label-text;
+    in property <string> arrow-text;
+    in property <string> value-text;
+    in property <color> lane-color;
+    // Lane is "idle" — magnitude below min_flow_w. Pre-computed by the
+    // bridge (`*-idle` view-model field).
+    in property <bool> idle;
+    // Lane should render at root opacity even when idle (used for the
+    // unavailable variant where the parent already dims to 0.5).
+    in property <bool> is-available;
+    // Period of one full particle traversal in milliseconds; lower = faster.
+    // Parent computes this via the canonical
+    //     clamp(3000 - watts/10, 800, 3000)
+    // mapping. When `idle == true` this property is ignored (the particle
+    // subtree is collapsed).
+    in property <int> period-ms: 2000;
+
+    height: Theme.space-5;
+
+    // Animated lane opacity. 250 ms ease so a lane crossing the idle
+    // threshold cross-fades rather than flickering.
+    opacity: idle ? 0.3 : 1.0;
+    animate opacity {
+        duration: AnimationBudget.at-capacity ? 0ms : 250ms;
+        easing: ease-in-out;
+    }
+
+    // Source-end label (e.g. "solar", "grid").
+    Text {
+        x: 0px;
+        y: (parent.height - self.height) / 2;
+        text: root.label-text;
+        color: Theme.text-secondary;
+        font-size: Theme.font-sm;
+        font-weight: Theme.font-weight-regular;
+        vertical-alignment: center;
+    }
+
+    // Direction arrow.
+    Text {
+        x: 48px;
+        y: (parent.height - self.height) / 2;
+        text: root.arrow-text;
+        color: root.lane-color;
+        font-size: Theme.font-md;
+        font-weight: Theme.font-weight-bold;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+
+    // Connector strip — fills the area between the arrow and the value
+    // label. Particles ride along this strip.
+    connector := Rectangle {
+        x: 72px;
+        y: (parent.height - self.height) / 2;
+        width: parent.width - 72px - 88px;
+        height: 2px;
+        background: root.lane-color;
+        // Connector subtly fades when the lane is idle; the parent
+        // opacity already dims this rectangle, so no explicit branch
+        // is needed here.
+    }
+
+    // Particle subtree — only present when the lane is non-idle, the
+    // grid entity is available, AND the global animation budget has
+    // headroom. This is the per-frame work; the three-way guard ensures:
+    //   * Idle dashboards contribute zero animation work (`!root.idle`).
+    //   * Unavailable lanes do not animate (`root.is-available`).
+    //   * Budget-exhausted runs suppress the particles entirely
+    //     (`!AnimationBudget.at-capacity`) — collapsing the subtree is
+    //     correct here rather than snapping `phase-0` to 0, because the
+    //     phase-1 / phase-2 stagger constants (0.333, 0.667) would
+    //     otherwise leave three stationary dots compressed into the
+    //     first 67 % of the strip, a visually distracting artefact
+    //     (per opencode-review iteration 1, blocker 1). Lane line +
+    //     labels remain visible regardless, preserving the static
+    //     read-out.
+    if !root.idle && root.is-available && !AnimationBudget.at-capacity : Rectangle {
+        // Mirror the connector geometry so child particles compute their
+        // travel from a stable parent-relative coordinate space.
+        x: 72px;
+        y: 0px;
+        width: parent.width - 72px - 88px;
+        height: parent.height;
+
+        // Phase 0..1 for the first particle. The `mod(animation-tick(),
+        // period_ms)` expression yields a duration in 0..period_ms; we
+        // divide by period_ms to get a unit-less progress value. Pattern
+        // ratified by `card_base.slint:393` (`mod(animation-tick() / 1ms,
+        // 1200) / 1200 * 360deg`) — `mod(float, int)` operand mix is
+        // accepted by the Slint compiler.
+        property <float> phase-0:
+            mod(animation-tick() / 1ms, root.period-ms) / root.period-ms;
+        // Phase-staggered second and third particles (1/3, 2/3 of cycle).
+        // `mod(x + offset, 1)` keeps the value in 0..1.
+        property <float> phase-1: mod(self.phase-0 + 0.333, 1.0);
+        property <float> phase-2: mod(self.phase-0 + 0.667, 1.0);
+
+        // Particle 0.
+        Rectangle {
+            width: 4px;
+            height: 4px;
+            border-radius: 2px;
+            background: root.lane-color;
+            x: parent.phase-0 * (parent.width - self.width);
+            y: (parent.height - self.height) / 2;
+            // Fade in (first 10 %) / fade out (last 10 %) so the dot
+            // does not appear to pile at the destination.
+            opacity: parent.phase-0 < 0.1 ? parent.phase-0 * 10
+                : parent.phase-0 > 0.9 ? (1.0 - parent.phase-0) * 10
+                : 1.0;
+        }
+        // Particle 1.
+        Rectangle {
+            width: 4px;
+            height: 4px;
+            border-radius: 2px;
+            background: root.lane-color;
+            x: parent.phase-1 * (parent.width - self.width);
+            y: (parent.height - self.height) / 2;
+            opacity: parent.phase-1 < 0.1 ? parent.phase-1 * 10
+                : parent.phase-1 > 0.9 ? (1.0 - parent.phase-1) * 10
+                : 1.0;
+        }
+        // Particle 2.
+        Rectangle {
+            width: 4px;
+            height: 4px;
+            border-radius: 2px;
+            background: root.lane-color;
+            x: parent.phase-2 * (parent.width - self.width);
+            y: (parent.height - self.height) / 2;
+            opacity: parent.phase-2 < 0.1 ? parent.phase-2 * 10
+                : parent.phase-2 > 0.9 ? (1.0 - parent.phase-2) * 10
+                : 1.0;
+        }
+    }
+
+    // Value label (right-aligned).
+    Text {
+        x: parent.width - 88px;
+        y: (parent.height - self.height) / 2;
+        width: 88px;
+        text: root.value-text;
+        color: root.lane-color;
+        font-size: Theme.font-md;
+        font-weight: Theme.font-weight-bold;
+        vertical-alignment: center;
+        horizontal-alignment: right;
+    }
+}
+
 // PowerFlowTile — wraps CardBase with the power-flow content layout.
 //
 // Press feedback and gesture detection both live on CardBase (TASK-060):
@@ -162,19 +364,72 @@ export struct PowerFlowTileVM {
 // Layout: 4-row vertical stack (header, grid lane, optional solar/battery
 // lanes, home lane). Lanes branch by visibility — covers the canonical
 // 4-node power-flow graph (Solar → Grid ↔ Home ← Battery) flattened into
-// a vertical list for legibility on a 2x2 / 4x3 grid cell. The full
-// per-particle SVG animation is deferred to a follow-up.
+// a vertical list for legibility on a 2x2 / 4x3 grid cell. Each lane has
+// animated flow particles travelling along the connector strip
+// (TASK-094-followup).
 //
 // Animation discipline (TASK-094 acceptance §Per-profile budget):
-//   * Per-frame work is read-only — there are no `animation-tick()`
-//     bindings in this tile (the Phase 6 baseline emits no flowing-
-//     particle animation). Future per-lane particle animation will be
-//     gated by `AnimationBudget.at-capacity` so the tile gracefully
-//     degrades when the global animation budget is exhausted.
-//   * Animation framerate is capped at `AnimationBudget.framerate-cap`
-//     per PHASES.md § Performance budgets.
+//   * Per-frame work is read-only — particle positions derive from
+//     `animation-tick()` modulo per-lane `period-ms`. There are no
+//     per-tile `Timer`s. Per PHASES.md:58, animation framerate is capped
+//     at `AnimationBudget.framerate-cap` (the cap is enforced at the
+//     renderer level by the Rust bridge — this file only references the
+//     budget surface).
+//   * `AnimationBudget.at-capacity` collapses every particle subtree so
+//     the budget is honoured globally; lane lines + labels remain
+//     visible (the read-out is preserved even when motion is suppressed).
+//     Collapsing rather than snapping is required because the phase
+//     stagger constants (0.333, 0.667) would leave three stationary
+//     dots compressed into the strip start otherwise.
+//   * Idle lanes collapse the particle subtree entirely (the `if !idle`
+//     guard) so an idle dashboard contributes zero animation work.
+//   * Particle count: 3 per active lane × up to 4 lanes = 12 particles
+//     peak. The opi_zero3 profile budget is 2 simultaneous tile
+//     animations; particles share a single `animation-tick()` source so
+//     they count as a single continuous animation, not 12.
 export component PowerFlowTile inherits Rectangle {
     in property <PowerFlowTileVM> view-model;
+
+    // Per-lane particle period in milliseconds. Canonical Lovelace
+    // power-flow-card mapping:
+    //     duration_ms = clamp(3000 - flow_watts / 10, 800, 3000)
+    // High power → fast particles (≈ 800 ms full traversal), low power →
+    // slow (≈ 3000 ms full traversal). The bridge supplies typed
+    // signed-watts values; we use `abs` via a ternary because Slint's
+    // float `abs(x)` is not a guaranteed builtin — `x > 0 ? x : -x` is
+    // the conservative spelling.
+    //
+    // The clamp is expressed as `min(max(…, 800), 3000)` because Slint
+    // does not have a 3-arg `clamp` builtin in 1.7. Output type is `int`
+    // (millisecond count) to match `FlowLane.period-ms` in-property.
+    property <int> grid-period-ms: min(
+        max(
+            (3000 - (view-model.grid-w > 0 ? view-model.grid-w : -view-model.grid-w) / 10),
+            800,
+        ),
+        3000,
+    );
+    property <int> solar-period-ms: min(
+        max(
+            (3000 - (view-model.solar-w > 0 ? view-model.solar-w : -view-model.solar-w) / 10),
+            800,
+        ),
+        3000,
+    );
+    property <int> battery-period-ms: min(
+        max(
+            (3000 - (view-model.battery-w > 0 ? view-model.battery-w : -view-model.battery-w) / 10),
+            800,
+        ),
+        3000,
+    );
+    property <int> home-period-ms: min(
+        max(
+            (3000 - (view-model.home-w > 0 ? view-model.home-w : -view-model.home-w) / 10),
+            800,
+        ),
+        3000,
+    );
 
     // Resolved icon tint. Branches on availability first, then on whether
     // any lane is non-idle. No inline hex literals; every branch picks a
@@ -219,7 +474,8 @@ export component PowerFlowTile inherits Rectangle {
 
     // Reduce opacity for the unavailable visual state (Phase 6 plan
     // three-state render acceptance). Idle and active render at full
-    // opacity; only unavailable dims.
+    // opacity at the root level; per-lane idle dimming happens inside
+    // `FlowLane.opacity` (animated cross-fade).
     opacity: !view-model.is-available ? 0.5 : 1.0;
 
     base := CardBase {
@@ -263,113 +519,42 @@ export component PowerFlowTile inherits Rectangle {
             // time). The directional indicator is "↓" for import and
             // "↑" for export, mirroring the `power-flow-card-plus`
             // Lovelace convention.
-            HorizontalLayout {
-                spacing: Theme.space-2;
-                alignment: stretch;
-
-                // Idle lanes dim to 30% opacity per the TASK-094
-                // acceptance criterion §Idle-lane behaviour.
-                opacity: view-model.grid-idle ? 0.3 : 1.0;
-
-                Text {
-                    text: "grid";
-                    color: Theme.text-secondary;
-                    font-size: Theme.font-sm;
-                    font-weight: Theme.font-weight-regular;
-                    vertical-alignment: center;
-                }
-
-                Text {
-                    text: !view-model.is-available
-                        ? "—"
-                        : view-model.grid-importing ? "↓" : "↑";
-                    color: grid-color;
-                    font-size: Theme.font-md;
-                    font-weight: Theme.font-weight-bold;
-                    vertical-alignment: center;
-                    horizontal-alignment: center;
-                }
-
-                Text {
-                    text: view-model.grid-label;
-                    color: grid-color;
-                    font-size: Theme.font-md;
-                    font-weight: Theme.font-weight-bold;
-                    vertical-alignment: center;
-                    horizontal-alignment: right;
-                }
+            FlowLane {
+                label-text: "grid";
+                arrow-text: !view-model.is-available
+                    ? "—"
+                    : view-model.grid-importing ? "↓" : "↑";
+                value-text: view-model.grid-label;
+                lane-color: grid-color;
+                idle: view-model.grid-idle;
+                is-available: view-model.is-available;
+                period-ms: grid-period-ms;
             }
 
             // Solar lane — rendered only when the widget configures a
             // solar entity. The arrow is always "↓" (solar generation
             // flows toward the home / grid).
-            if view-model.has-solar : HorizontalLayout {
-                spacing: Theme.space-2;
-                alignment: stretch;
-
-                opacity: view-model.solar-idle ? 0.3 : 1.0;
-
-                Text {
-                    text: "solar";
-                    color: Theme.text-secondary;
-                    font-size: Theme.font-sm;
-                    font-weight: Theme.font-weight-regular;
-                    vertical-alignment: center;
-                }
-
-                Text {
-                    text: "↓";
-                    color: solar-color;
-                    font-size: Theme.font-md;
-                    font-weight: Theme.font-weight-bold;
-                    vertical-alignment: center;
-                    horizontal-alignment: center;
-                }
-
-                Text {
-                    text: view-model.solar-label;
-                    color: solar-color;
-                    font-size: Theme.font-md;
-                    font-weight: Theme.font-weight-bold;
-                    vertical-alignment: center;
-                    horizontal-alignment: right;
-                }
+            if view-model.has-solar : FlowLane {
+                label-text: "solar";
+                arrow-text: "↓";
+                value-text: view-model.solar-label;
+                lane-color: solar-color;
+                idle: view-model.solar-idle;
+                is-available: view-model.is-available;
+                period-ms: solar-period-ms;
             }
 
             // Battery lane — rendered only when the widget configures a
             // battery entity. Charging shows "↓" (energy into battery);
             // discharging shows "↑" (energy out to home/grid).
-            if view-model.has-battery : HorizontalLayout {
-                spacing: Theme.space-2;
-                alignment: stretch;
-
-                opacity: view-model.battery-idle ? 0.3 : 1.0;
-
-                Text {
-                    text: "battery";
-                    color: Theme.text-secondary;
-                    font-size: Theme.font-sm;
-                    font-weight: Theme.font-weight-regular;
-                    vertical-alignment: center;
-                }
-
-                Text {
-                    text: view-model.battery-charging ? "↓" : "↑";
-                    color: battery-color;
-                    font-size: Theme.font-md;
-                    font-weight: Theme.font-weight-bold;
-                    vertical-alignment: center;
-                    horizontal-alignment: center;
-                }
-
-                Text {
-                    text: view-model.battery-label;
-                    color: battery-color;
-                    font-size: Theme.font-md;
-                    font-weight: Theme.font-weight-bold;
-                    vertical-alignment: center;
-                    horizontal-alignment: right;
-                }
+            if view-model.has-battery : FlowLane {
+                label-text: "battery";
+                arrow-text: view-model.battery-charging ? "↓" : "↑";
+                value-text: view-model.battery-label;
+                lane-color: battery-color;
+                idle: view-model.battery-idle;
+                is-available: view-model.is-available;
+                period-ms: battery-period-ms;
             }
 
             // Battery state-of-charge label — rendered only when the
@@ -390,37 +575,14 @@ export component PowerFlowTile inherits Rectangle {
             // Home lane — rendered only when the widget configures a
             // home entity. The arrow is always "↑" (energy flowing
             // INTO the home).
-            if view-model.has-home : HorizontalLayout {
-                spacing: Theme.space-2;
-                alignment: stretch;
-
-                opacity: view-model.home-idle ? 0.3 : 1.0;
-
-                Text {
-                    text: "home";
-                    color: Theme.text-secondary;
-                    font-size: Theme.font-sm;
-                    font-weight: Theme.font-weight-regular;
-                    vertical-alignment: center;
-                }
-
-                Text {
-                    text: "↑";
-                    color: home-color;
-                    font-size: Theme.font-md;
-                    font-weight: Theme.font-weight-bold;
-                    vertical-alignment: center;
-                    horizontal-alignment: center;
-                }
-
-                Text {
-                    text: view-model.home-label;
-                    color: home-color;
-                    font-size: Theme.font-md;
-                    font-weight: Theme.font-weight-bold;
-                    vertical-alignment: center;
-                    horizontal-alignment: right;
-                }
+            if view-model.has-home : FlowLane {
+                label-text: "home";
+                arrow-text: "↑";
+                value-text: view-model.home-label;
+                lane-color: home-color;
+                idle: view-model.home-idle;
+                is-available: view-model.is-available;
+                period-ms: home-period-ms;
             }
         }
     }
