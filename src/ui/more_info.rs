@@ -638,15 +638,45 @@ impl MoreInfoBody for AlarmBody {
     }
 }
 
-/// More-info body for `climate` entities.
+/// More-info body for `climate` entities (TASK-108).
 ///
-/// Returns the entity's state. Phase 6b (`TASK-108`) will replace this with a
-/// setpoint slider and HVAC mode picker.
+/// Renders climate-specific rows: state (the active HVAC mode), the
+/// current and target temperatures (when reported), and the optional
+/// `humidity`, `fan_mode`, and `swing_mode` HA attributes (when
+/// supported by the integration). The Slint shell already binds
+/// `body-rows` to the modal's row list, so [`ClimateBody`] reuses the
+/// generic rendering path — keeping the trait shape stable per
+/// TASK-098 + TASK-108.
+///
+/// Per `locked_decisions.cover_slider_component`: the **setpoint slider
+/// visual design** is owned by TASK-108. The slider widget itself lives
+/// in the Slint shell (`ui/slint/components/position_slider.slint`,
+/// stub from TASK-096) and is bound to `WidgetOptions::Climate.min_temp` /
+/// `max_temp` / `step`. The Slint integration is out of scope for this
+/// row-only `MoreInfoBody`; the dispatcher wires
+/// `Action::SetTemperature { entity_id, temperature }` (TASK-099) when
+/// the slider commits.
+///
+/// Per `locked_decisions.hvac_mode_vocabulary`: the **HVAC mode picker**
+/// shows only operator-configured modes from
+/// `WidgetOptions::Climate.hvac_modes` (a free `Vec<String>` at the
+/// schema level). Tapping a mode dispatches
+/// `Action::SetHvacMode { entity_id, mode }` (TASK-099). The picker
+/// widget lives in the Slint shell; this body surfaces only the
+/// **current** state via the `state` row.
+///
+/// # Stateless
+///
+/// `ClimateBody` carries no fields; the body queries the live entity
+/// at `render_rows` time. Per `locked_decisions.more_info_modal`, the
+/// body is invoked exactly once per modal-open — so the per-call
+/// attribute reads are not on a hot path.
 #[derive(Debug, Default)]
 pub struct ClimateBody;
 
 impl ClimateBody {
-    /// Construct a [`ClimateBody`].
+    /// Construct a [`ClimateBody`]. Stateless; the constructor exists so
+    /// callers do not depend on `Default`.
     #[must_use]
     pub fn new() -> Self {
         ClimateBody
@@ -655,10 +685,76 @@ impl ClimateBody {
 
 impl MoreInfoBody for ClimateBody {
     fn render_rows(&self, entity: &Entity) -> Vec<ModalRow> {
-        vec![ModalRow {
+        // Capacity of 6 covers the worst case (state + current_temperature
+        // + target_temperature + humidity + fan_mode + swing_mode) without
+        // growing.
+        let mut rows = Vec::with_capacity(6);
+
+        // State row — always emitted, matches the per-domain body
+        // contract every other body upholds. Carries the canonical HVAC
+        // mode string forwarded verbatim.
+        rows.push(ModalRow {
             key: "state".to_owned(),
             value: entity.state.as_ref().to_owned(),
-        }]
+        });
+
+        // current_temperature row, only when the entity exposes the
+        // attribute. HA's climate integration emits this as the measured
+        // ambient temperature; the body forwards a fixed-precision
+        // f32-formatted value (one decimal place to match the typical
+        // HA emit precision) so the modal does not surface trailing
+        // zeros from a `%g` formatter.
+        if let Some(temp) = crate::ui::climate::read_current_temperature_attribute(entity) {
+            rows.push(ModalRow {
+                key: "current_temperature".to_owned(),
+                value: format!("{temp:.1}"),
+            });
+        }
+
+        // target_temperature row, only when the entity exposes the
+        // setpoint via HA's `temperature` attribute (NOT
+        // `target_temperature`). Some integrations in `heat_cool` mode
+        // emit `target_temp_low` / `target_temp_high` separately and no
+        // top-level `temperature` — those entities show only the state
+        // row from this body.
+        if let Some(temp) = crate::ui::climate::read_target_temperature_attribute(entity) {
+            rows.push(ModalRow {
+                key: "target_temperature".to_owned(),
+                value: format!("{temp:.1}"),
+            });
+        }
+
+        // humidity row, only when the entity exposes the attribute.
+        // HA emits this when the climate device measures humidity
+        // (heat-pumps, smart thermostats with built-in hygrometers).
+        if let Some(humidity) = crate::ui::climate::read_humidity_attribute(entity) {
+            rows.push(ModalRow {
+                key: "humidity".to_owned(),
+                value: format!("{humidity:.1}"),
+            });
+        }
+
+        // fan_mode row, only when the entity exposes the attribute.
+        // Common values: `"auto"`, `"low"`, `"medium"`, `"high"` —
+        // forwarded verbatim because integrations vary.
+        if let Some(fan_mode) = crate::ui::climate::read_fan_mode_attribute(entity) {
+            rows.push(ModalRow {
+                key: "fan_mode".to_owned(),
+                value: fan_mode,
+            });
+        }
+
+        // swing_mode row, only when the entity exposes the attribute.
+        // Common values: `"on"`, `"off"`, `"vertical"`, `"horizontal"` —
+        // forwarded verbatim because integrations vary.
+        if let Some(swing_mode) = crate::ui::climate::read_swing_mode_attribute(entity) {
+            rows.push(ModalRow {
+                key: "swing_mode".to_owned(),
+                value: swing_mode,
+            });
+        }
+
+        rows
     }
 }
 
@@ -1595,5 +1691,159 @@ mod tests {
                 .any(|r| r.key == "state" && r.value == "unavailable"),
             "CameraBody must emit state row for unavailable cameras: {rows:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ClimateBody attribute-row branches (TASK-108)
+    //
+    // ClimateBody surfaces six possible rows in order: state (always),
+    // current_temperature, target_temperature, humidity, fan_mode,
+    // swing_mode (each optional). Each conditional branch needs its own
+    // assertion so the per-file coverage ratchet does not regress when
+    // the body grows new branches in future tickets.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn climate_body_emits_current_temperature_row_when_present() {
+        let entity = entity_with_attr("climate.living_room", "heat", "current_temperature", "21.5");
+        let rows = ClimateBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "current_temperature" && r.value == "21.5"),
+            "current_temperature attribute must produce a row: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn climate_body_emits_target_temperature_row_when_present() {
+        // HA emits the setpoint as the `temperature` attribute (NOT
+        // `target_temperature`) — verify the body reads from the correct
+        // attribute key.
+        let entity = entity_with_attr("climate.living_room", "heat", "temperature", "23.0");
+        let rows = ClimateBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "target_temperature" && r.value == "23.0"),
+            "temperature attribute must produce target_temperature row: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn climate_body_emits_humidity_row_when_present() {
+        let entity = entity_with_attr("climate.living_room", "cool", "humidity", "42.5");
+        let rows = ClimateBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "humidity" && r.value == "42.5"),
+            "humidity attribute must produce a row: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn climate_body_emits_fan_mode_row_when_present() {
+        let entity = entity_with_attr("climate.living_room", "heat", "fan_mode", "\"auto\"");
+        let rows = ClimateBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "fan_mode" && r.value == "auto"),
+            "fan_mode attribute must produce a row: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn climate_body_emits_swing_mode_row_when_present() {
+        let entity = entity_with_attr("climate.living_room", "heat", "swing_mode", "\"vertical\"");
+        let rows = ClimateBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "swing_mode" && r.value == "vertical"),
+            "swing_mode attribute must produce a row: {rows:?}"
+        );
+    }
+
+    /// `ClimateBody::render_rows` skips optional rows when their
+    /// attributes are absent — the body must surface only the state row
+    /// for a minimal entity.
+    #[test]
+    fn climate_body_skips_optional_rows_when_absent() {
+        let entity = minimal_entity("climate.living_room", "heat");
+        let rows = ClimateBody::new().render_rows(&entity);
+        // Mandatory row always present.
+        assert!(rows.iter().any(|r| r.key == "state" && r.value == "heat"));
+        // Optional rows must be absent.
+        assert!(!rows.iter().any(|r| r.key == "current_temperature"));
+        assert!(!rows.iter().any(|r| r.key == "target_temperature"));
+        assert!(!rows.iter().any(|r| r.key == "humidity"));
+        assert!(!rows.iter().any(|r| r.key == "fan_mode"));
+        assert!(!rows.iter().any(|r| r.key == "swing_mode"));
+    }
+
+    /// `ClimateBody::render_rows` for an `unavailable` climate entity
+    /// still emits the state row (the fallback contract every per-domain
+    /// body upholds).
+    #[test]
+    fn climate_body_unavailable_state_emits_state_row() {
+        let entity = minimal_entity("climate.living_room", "unavailable");
+        let rows = ClimateBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "state" && r.value == "unavailable"),
+            "ClimateBody must emit state row for unavailable climates: {rows:?}"
+        );
+    }
+
+    /// `ClimateBody::render_rows` formats temperatures with one decimal
+    /// place even when HA emits an integer value (some integrations
+    /// emit `21` rather than `21.0`).
+    #[test]
+    fn climate_body_formats_integer_temperature_with_one_decimal() {
+        let entity = entity_with_attr("climate.living_room", "heat", "current_temperature", "22");
+        let rows = ClimateBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "current_temperature" && r.value == "22.0"),
+            "integer current_temperature must format with one decimal: {rows:?}"
+        );
+    }
+
+    /// All five optional rows render simultaneously when every supported
+    /// attribute is present — exercises the "all branches taken" path.
+    /// Uses `serde_yaml_ng::from_str` so the parsed map's type is
+    /// inferred from the `Arc::new(...)` site (Gate 2: never names the
+    /// JSON crate).
+    #[test]
+    fn climate_body_emits_all_optional_rows_when_all_attributes_present() {
+        let snippet = r#"{
+            "current_temperature": 21.5,
+            "temperature": 23.0,
+            "humidity": 45.2,
+            "fan_mode": "auto",
+            "swing_mode": "vertical"
+        }"#;
+        let map = serde_yaml_ng::from_str(snippet).expect("test snippet must parse");
+        let entity = Entity {
+            id: EntityId::from("climate.living_room"),
+            state: Arc::from("heat"),
+            attributes: Arc::new(map),
+            last_changed: jiff::Timestamp::UNIX_EPOCH,
+            last_updated: jiff::Timestamp::UNIX_EPOCH,
+        };
+        let rows = ClimateBody::new().render_rows(&entity);
+        assert!(rows.iter().any(|r| r.key == "state" && r.value == "heat"));
+        assert!(rows
+            .iter()
+            .any(|r| r.key == "current_temperature" && r.value == "21.5"));
+        assert!(rows
+            .iter()
+            .any(|r| r.key == "target_temperature" && r.value == "23.0"));
+        assert!(rows
+            .iter()
+            .any(|r| r.key == "humidity" && r.value == "45.2"));
+        assert!(rows
+            .iter()
+            .any(|r| r.key == "fan_mode" && r.value == "auto"));
+        assert!(rows
+            .iter()
+            .any(|r| r.key == "swing_mode" && r.value == "vertical"));
     }
 }

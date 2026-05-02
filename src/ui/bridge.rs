@@ -481,6 +481,64 @@ pub struct CameraTileVM {
 }
 
 // ---------------------------------------------------------------------------
+// ClimateTileVM (TASK-108)
+// ---------------------------------------------------------------------------
+
+/// View-model for a `ClimateTile` widget, mirroring the Slint
+/// `ClimateTileVM` struct in `ui/slint/climate_tile.slint`.
+///
+/// Built by [`compute_climate_tile_vm`], which threads through
+/// [`crate::ui::climate::ClimateVM::from_entity`] to derive the
+/// `is_active` boolean and forward the optional `current_temperature` /
+/// `target_temperature` reads from the entity attributes.
+///
+/// The `icon: image` Slint field is absent here; it is written by the
+/// Slint bridge during property wiring (the same pattern used for every
+/// other per-kind tile VM).
+///
+/// Note (TASK-108 scope): the `MainWindow` Slint component does not yet
+/// declare a `climate-tiles` array property — `ui/slint/main_window.slint`
+/// is in this ticket's `must_not_touch` list. `compute_climate_tile_vm`
+/// is invoked indirectly via [`build_tiles`] so climate entities exercise
+/// the `ClimateVM::from_entity` path on every state change, and the result
+/// flows into the existing fallback `EntityTileVM` render with the raw
+/// HA state string. A subsequent ticket will amend `main_window.slint`
+/// to render a per-kind `ClimateTile` model directly.
+///
+/// `pending` is the per-tile spinner gate added in TASK-067; see
+/// [`LightTileVM`] for the full contract.
+///
+/// # No `Vec` fields (lesson from TASK-103 / TASK-105 / TASK-107)
+///
+/// Like `ClimateVM`, this struct deliberately carries no `Vec` fields. The
+/// `WidgetOptions::Climate.hvac_modes` mode-picker list is read at modal-
+/// open time by [`crate::ui::more_info::ClimateBody`] / the dispatcher,
+/// NOT stored on the per-frame tile VM. Allocating a `Vec` here that the
+/// tile renderer never reads would be wasted work on every state change.
+///
+/// # Float fields and `Eq`
+///
+/// `current_temperature` and `target_temperature` are `Option<f32>` —
+/// `f32: !Eq`, so this struct is `PartialEq` but not `Eq` (deliberate
+/// drift from the alarm/camera VMs). Bridge equality checks rely on
+/// `PartialEq`; no consumer of this VM stores it in a hash-keyed
+/// container.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClimateTileVM {
+    pub name: String,
+    pub state: String,
+    pub is_active: bool,
+    pub current_temperature: Option<f32>,
+    pub target_temperature: Option<f32>,
+    pub icon_id: String,
+    pub preferred_columns: i32,
+    pub preferred_rows: i32,
+    pub placement: TilePlacement,
+    /// Per-tile spinner gate (TASK-067). Default `false`.
+    pub pending: bool,
+}
+
+// ---------------------------------------------------------------------------
 // TileVM enum
 // ---------------------------------------------------------------------------
 
@@ -951,14 +1009,42 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                                     pending: false,
                                 })
                             }
-                            // Phase 6 adds MediaPlayer, Climate, PowerFlow.
-                            // Until dedicated Slint tile components exist
-                            // (TASK-108..TASK-109), these are rendered as
+                            // TASK-108: climate entities flow through
+                            // `ClimateVM::from_entity` so the per-frame
+                            // derived `is_active` boolean and the optional
+                            // `current_temperature` / `target_temperature`
+                            // reads are exercised on every state change.
+                            // Until `main_window.slint` grows a
+                            // `climate-tiles` array property (subsequent
+                            // ticket), the climate tile renders as the
+                            // generic `EntityTileVM` fallback — the
+                            // canonical HVAC-mode string (`"heat"`,
+                            // `"cool"`, `"auto"`, `"off"`, `"fan_only"`,
+                            // ...) is forwarded verbatim. The `ClimateVM`
+                            // is exposed via `compute_climate_tile_vm`
+                            // for the per-kind rendering path that
+                            // follows when `main_window.slint` gains the
+                            // array property.
+                            WidgetKind::Climate => {
+                                let _climate_vm =
+                                    crate::ui::climate::ClimateVM::from_entity(&entity);
+                                TileVM::Entity(EntityTileVM {
+                                    name,
+                                    state,
+                                    icon_id,
+                                    preferred_columns,
+                                    preferred_rows,
+                                    placement,
+                                    pending: false,
+                                })
+                            }
+                            // Phase 6 adds MediaPlayer + PowerFlow. Until
+                            // dedicated Slint tile components exist
+                            // (TASK-109), these are rendered as
                             // EntityTileVM — the generic entity tile covers
                             // the state display until per-kind tiles ship.
                             WidgetKind::EntityTile
                             | WidgetKind::MediaPlayer
-                            | WidgetKind::Climate
                             | WidgetKind::PowerFlow => TileVM::Entity(EntityTileVM {
                                 name,
                                 state,
@@ -2441,6 +2527,34 @@ pub use camera_snapshot_tile_slint::{
 };
 
 // ---------------------------------------------------------------------------
+// ClimateTile slint submodule (TASK-108)
+// ---------------------------------------------------------------------------
+//
+// `ui/slint/climate_tile.slint` is compiled by `build.rs` (TASK-108) to a
+// separate generated Rust file exposed via the `HANUI_CLIMATE_TILE_INCLUDE`
+// env var — the same pattern as `cover_tile.slint` (TASK-102),
+// `fan_tile.slint` (TASK-103), `lock_tile.slint` (TASK-104),
+// `alarm_panel_tile.slint` (TASK-105), `history_graph_tile.slint`
+// (TASK-106), and `camera_snapshot_tile.slint` (TASK-107). This module
+// picks it up via `include!` so the generated `ClimateTile`,
+// `ClimateTileVM`, and `ClimateTilePlacement` types are available for the
+// `compute_climate_tile_vm` projection function below without polluting
+// the production `slint_ui` namespace (which would clash with the
+// same-named Rust struct declared earlier in this file).
+//
+// Future work: once `main_window.slint` grows a `climate-tiles` array
+// property, this module's types will be re-exported through the production
+// `slint_ui` namespace instead. The separate compile is the minimal-blast
+// path that satisfies TASK-108's "Slint compile gate" acceptance criterion
+// (climate_tile.slint must be in the build graph) without amending any of
+// the protected `must_not_touch` Slint files.
+pub mod climate_tile_slint {
+    include!(env!("HANUI_CLIMATE_TILE_INCLUDE"));
+}
+
+pub use climate_tile_slint::{ClimateTile, ClimateTilePlacement as SlintClimateTilePlacement};
+
+// ---------------------------------------------------------------------------
 // compute_cover_tile_vm (TASK-102)
 // ---------------------------------------------------------------------------
 
@@ -2909,6 +3023,64 @@ pub fn compute_camera_tile_vm(
         is_recording: camera_vm.is_recording,
         is_streaming: camera_vm.is_streaming,
         is_available: camera_vm.is_available,
+        icon_id,
+        preferred_columns,
+        preferred_rows,
+        placement,
+        pending: false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// compute_climate_tile_vm (TASK-108)
+// ---------------------------------------------------------------------------
+
+/// Project a typed Rust [`ClimateTileVM`] from a live entity snapshot,
+/// threading through [`crate::ui::climate::ClimateVM::from_entity`] for
+/// the per-frame derived `is_active` boolean and the optional
+/// `current_temperature` / `target_temperature` reads.
+///
+/// # Hot-path discipline
+///
+/// Called at entity-change time (NOT per render). The result is a typed
+/// `ClimateTileVM` Rust struct; the further `String -> SharedString` /
+/// `icon_id -> Image` conversions are deferred to a follow-up ticket
+/// once `main_window.slint` declares the `climate-tiles` array property.
+///
+/// # No `Vec` allocation on the per-frame path
+///
+/// Per the TASK-103 / TASK-105 / TASK-107 audit lesson: this projection
+/// writes only scalar `state` / `name` / `icon_id` strings and the
+/// optional `current_temperature` / `target_temperature` numerics. The
+/// `WidgetOptions::Climate.hvac_modes` list lives on the dashboard config
+/// and is read at modal-open / dispatch time — it does NOT travel through
+/// this VM.
+///
+/// # Naming
+///
+/// Returns the Rust [`ClimateTileVM`] (defined earlier in this file). The
+/// Slint-shape projection (`SlintClimateTileVM` from
+/// [`climate_tile_slint::ClimateTileVM`]) is not built here because there
+/// is no `climate-tiles` `MainWindow` property to write into yet — that
+/// shape conversion lives next to the `set_climate_tiles` call site once
+/// it exists.
+#[must_use]
+pub fn compute_climate_tile_vm(
+    name: String,
+    icon_id: String,
+    preferred_columns: i32,
+    preferred_rows: i32,
+    placement: TilePlacement,
+    entity: &crate::ha::entity::Entity,
+) -> ClimateTileVM {
+    let climate_vm = crate::ui::climate::ClimateVM::from_entity(entity);
+
+    ClimateTileVM {
+        name,
+        state: climate_vm.state,
+        is_active: climate_vm.is_active,
+        current_temperature: climate_vm.current_temperature,
+        target_temperature: climate_vm.target_temperature,
         icon_id,
         preferred_columns,
         preferred_rows,
@@ -8495,6 +8667,194 @@ mod tests {
         assert!(vm.is_available);
         assert!(!vm.is_recording);
         assert!(!vm.is_streaming);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_climate_tile_vm + build_tiles Climate arm (TASK-108)
+    // -----------------------------------------------------------------------
+
+    /// `build_tiles` dispatches `WidgetKind::Climate` through the
+    /// `ClimateVM::from_entity` path and produces an `EntityTileVM` fallback
+    /// (no `climate-tiles` array property exists yet on `main_window.slint`).
+    /// The state string is forwarded verbatim per TASK-108 AC.
+    #[test]
+    fn build_tiles_climate_widget_uses_climate_state() {
+        use crate::ha::store::MemoryStore;
+
+        let store = MemoryStore::load(vec![make_test_entity("climate.living_room", "heat")])
+            .expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("climate.living_room", WidgetKind::Climate);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1, "one widget → one tile");
+        match &tiles[0] {
+            TileVM::Entity(vm) => {
+                assert_eq!(vm.state, "heat", "climate state forwarded verbatim");
+            }
+            other => panic!("expected EntityTileVM (Climate fallback), got {other:?}"),
+        }
+    }
+
+    /// `build_tiles` for a `WidgetKind::Climate` widget routes a `"cool"`
+    /// state through the bridge without altering the state string — the
+    /// active visual is driven downstream by `ClimateVM::is_active`.
+    #[test]
+    fn build_tiles_climate_widget_cool_state_passes_through() {
+        use crate::ha::store::MemoryStore;
+
+        let store = MemoryStore::load(vec![make_test_entity("climate.living_room", "cool")])
+            .expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("climate.living_room", WidgetKind::Climate);
+        let tiles = build_tiles(&store, &dashboard);
+        match &tiles[0] {
+            TileVM::Entity(vm) => assert_eq!(vm.state, "cool"),
+            other => panic!("expected EntityTileVM (Climate fallback), got {other:?}"),
+        }
+    }
+
+    /// `build_tiles` for a `WidgetKind::Climate` widget routes an `"off"`
+    /// state through the bridge without altering the state string — the
+    /// idle visual is driven downstream by `ClimateVM::is_active=false`.
+    #[test]
+    fn build_tiles_climate_widget_off_state_passes_through() {
+        use crate::ha::store::MemoryStore;
+
+        let store = MemoryStore::load(vec![make_test_entity("climate.living_room", "off")])
+            .expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("climate.living_room", WidgetKind::Climate);
+        let tiles = build_tiles(&store, &dashboard);
+        match &tiles[0] {
+            TileVM::Entity(vm) => assert_eq!(vm.state, "off"),
+            other => panic!("expected EntityTileVM (Climate fallback), got {other:?}"),
+        }
+    }
+
+    /// `build_tiles` for a `WidgetKind::Climate` widget routes an
+    /// `"unavailable"` entity through the bridge without altering the
+    /// state string — the unavailable visual is driven downstream by
+    /// `ClimateVM::is_active=false`.
+    #[test]
+    fn build_tiles_climate_widget_unavailable_state_passes_through() {
+        use crate::ha::store::MemoryStore;
+
+        let store = MemoryStore::load(vec![make_test_entity("climate.living_room", "unavailable")])
+            .expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("climate.living_room", WidgetKind::Climate);
+        let tiles = build_tiles(&store, &dashboard);
+        match &tiles[0] {
+            TileVM::Entity(vm) => assert_eq!(vm.state, "unavailable"),
+            other => panic!("expected EntityTileVM (Climate fallback), got {other:?}"),
+        }
+    }
+
+    /// `compute_climate_tile_vm` for a heating climate produces the typed
+    /// Rust `ClimateTileVM` with `is_active=true`.
+    #[test]
+    fn compute_climate_tile_vm_heat_state() {
+        let entity = make_test_entity("climate.living_room", "heat");
+        let vm = compute_climate_tile_vm(
+            "Living Room".to_owned(),
+            "mdi:thermostat".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.name, "Living Room");
+        assert_eq!(vm.state, "heat");
+        assert!(vm.is_active, "heat → is_active=true");
+        assert_eq!(vm.icon_id, "mdi:thermostat");
+        assert!(!vm.pending);
+        assert_eq!(vm.current_temperature, None);
+        assert_eq!(vm.target_temperature, None);
+    }
+
+    /// `compute_climate_tile_vm` for an off climate flips `is_active=false`.
+    #[test]
+    fn compute_climate_tile_vm_off_state() {
+        let entity = make_test_entity("climate.living_room", "off");
+        let vm = compute_climate_tile_vm(
+            "Living Room".to_owned(),
+            "mdi:thermostat".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.state, "off");
+        assert!(!vm.is_active, "off → is_active=false");
+    }
+
+    /// `compute_climate_tile_vm` for an unavailable climate produces
+    /// `is_active=false`.
+    #[test]
+    fn compute_climate_tile_vm_unavailable_state() {
+        let entity = make_test_entity("climate.living_room", "unavailable");
+        let vm = compute_climate_tile_vm(
+            "Living Room".to_owned(),
+            "mdi:thermostat".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.state, "unavailable");
+        assert!(!vm.is_active, "unavailable → is_active=false");
+    }
+
+    /// `compute_climate_tile_vm` reads HA's `current_temperature` and
+    /// `temperature` (NOT `target_temperature`) attributes into the
+    /// typed VM.
+    #[test]
+    fn compute_climate_tile_vm_reads_temperature_attributes() {
+        let raw = entity_with_attr("heat", "current_temperature", "21.5");
+        // entity_with_attr builds a one-key map; merge a second key by
+        // re-parsing the full snippet.
+        let snippet = r#"{"current_temperature":21.5,"temperature":23.0}"#;
+        let map = serde_yaml_ng::from_str(snippet).expect("test snippet must parse");
+        let entity = Entity {
+            id: EntityId::from("climate.living_room"),
+            attributes: Arc::new(map),
+            ..raw
+        };
+        let vm = compute_climate_tile_vm(
+            "Living Room".to_owned(),
+            "mdi:thermostat".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.current_temperature, Some(21.5));
+        assert_eq!(
+            vm.target_temperature,
+            Some(23.0),
+            "target_temperature must read HA's `temperature` attribute"
+        );
+        assert_eq!(vm.state, "heat");
+        assert!(vm.is_active);
+    }
+
+    /// `compute_climate_tile_vm` for a vendor-specific HVAC mode forwards
+    /// the state verbatim and treats it as active per
+    /// `locked_decisions.hvac_mode_vocabulary` (the picker only shows
+    /// operator-configured modes; whatever the entity reports is shown).
+    #[test]
+    fn compute_climate_tile_vm_vendor_specific_state_is_active() {
+        let entity = make_test_entity("climate.living_room", "boost");
+        let vm = compute_climate_tile_vm(
+            "Living Room".to_owned(),
+            "mdi:thermostat".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.state, "boost");
+        assert!(vm.is_active, "vendor mode → is_active=true");
     }
 
     // -----------------------------------------------------------------------

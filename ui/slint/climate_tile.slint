@@ -1,0 +1,228 @@
+// climate_tile.slint — Phase 6 Wave 2 (TASK-108) tile for `type: climate`.
+//
+// Renders a Home Assistant climate entity (HVAC controllers, thermostats,
+// heat pumps) with a three-state visual: idle (state == "off"), active (any
+// non-off, non-unavailable HVAC mode — heat / cool / auto / dry / fan_only /
+// vendor-specific), and unavailable. The Rust bridge produces a
+// `ClimateTileVM` per climate widget via `crate::ui::climate::ClimateVM::from_entity`
+// followed by a Slint-shape projection in
+// `src/ui/bridge.rs::compute_climate_tile_vm`.
+//
+// Per `locked_decisions.cover_slider_component` ("TASK-108 (climate) fills in
+// the visual design"): the **setpoint slider** lives in the more-info modal,
+// NOT in the tile. The tile shows the current temperature, the target
+// temperature, the active HVAC mode, and the entity name — drag-to-set for
+// the setpoint is an out-of-tile interaction. This matches the cover-tile
+// pattern (TASK-102) where the position slider also lives in the modal.
+//
+// Per `locked_decisions.hvac_mode_vocabulary`: the `state` field is a free
+// `String` because HA integrations may emit custom modes; the tile renders
+// whatever state string the entity reports without enforcing a canonical
+// vocabulary. The `is-active` boolean is precomputed by `ClimateVM::from_entity`
+// so the Slint side does not branch on the state-string vocabulary.
+//
+// All colors come from theme tokens; no inline hex literals (CI hex-color
+// gate, `.github/workflows/ci.yml` § Gate 1). Visual primitives only — no
+// SVG-based icons in the tile body itself; the icon image is resolved by the
+// Rust asset layer (TASK-010) and bound via `ClimateTileVM.icon`.
+//
+// View-model contract (see `src/ui/bridge.rs::ClimateTileVM`):
+//   * The struct shape is mirrored 1:1 in Rust by the bridge. The Slint
+//     compiler generates a Rust struct named `ClimateTileVM` whose fields
+//     match these names with kebab→snake conversion.
+//   * `state` is the canonical HVAC-mode string forwarded verbatim
+//     (`"off"`, `"heat"`, `"cool"`, `"auto"`, `"heat_cool"`, `"dry"`,
+//     `"fan_only"`, `"unavailable"`, or any vendor-specific value).
+//   * `is-active` is precomputed (true for any non-off, non-unavailable,
+//     non-unknown state).
+//   * `current-temperature` and `target-temperature` are `float` values; the
+//     companion `has-current-temperature` / `has-target-temperature`
+//     booleans gate whether to render the corresponding label, because
+//     Slint floats have no native `Option<>` and `0.0` would render as a
+//     valid (but misleading) "0°" label.
+//   * `placement` is a NESTED struct (`ClimateTilePlacement`) for 1:1
+//     mapping with `dashboard::schema::Placement` in Rust.
+//
+// Three-state render (per Phase 6 plan acceptance):
+//   * idle (state == "off")            — text-secondary icon tint, full opacity.
+//   * active (is-active == true)       — accent icon tint, full opacity.
+//   * unavailable                      — state-unavailable tint, reduced opacity (0.5).
+//
+// AnimationBudget integration:
+//   * No tile-internal animation. Press feedback is inherited from CardBase.
+//     The active-count gate is a global concern (see card_base.slint) — this
+//     tile holds no animated property of its own. The setpoint-slider
+//     animation lives in the modal-side `position_slider.slint` (TASK-096
+//     stub, visual design TASK-108).
+
+import { Theme } from "theme.slint";
+import { CardBase } from "card_base.slint";
+
+// Computed grid placement, mirrors `dashboard::schema::Placement` in Rust.
+// Re-declared per tile file for self-documentation; identical to
+// `LightTilePlacement` / `SensorTilePlacement` / `EntityTilePlacement` /
+// `CoverTilePlacement` / `FanTilePlacement` / `LockTilePlacement` /
+// `AlarmTilePlacement` / `HistoryGraphTilePlacement` /
+// `CameraTilePlacement`.
+export struct ClimateTilePlacement {
+    col: int,
+    row: int,
+    span-cols: int,
+    span-rows: int,
+}
+
+// Typed view-model for a climate tile.
+//
+// Field semantics:
+//   * name                       — user-visible entity label
+//                                  (friendly_name fallback to id).
+//   * state                      — canonical HVAC-mode string forwarded
+//                                  verbatim (`"off"`, `"heat"`, `"cool"`,
+//                                  `"auto"`, `"heat_cool"`, `"dry"`,
+//                                  `"fan_only"`, `"unavailable"`, or vendor
+//                                  string).
+//   * is-active                  — derived: true for any state other than
+//                                  `"off"`, `"unavailable"`, `"unknown"`.
+//                                  Drives the "active" icon tint.
+//   * current-temperature        — current measured temperature; only
+//                                  meaningful when `has-current-temperature`
+//                                  is true.
+//   * has-current-temperature    — gates the current-temperature label
+//                                  (Slint floats have no `Option<>`).
+//   * target-temperature         — setpoint target; only meaningful when
+//                                  `has-target-temperature` is true.
+//   * has-target-temperature     — gates the target-temperature label.
+//   * icon-id                    — design-token id (e.g. "mdi:thermostat");
+//                                  resolved to bytes by the asset layer
+//                                  (TASK-010).
+//   * icon                       — resolved Slint image written by the
+//                                  bridge (TASK-015).
+//   * preferred-columns / preferred-rows — author intent from YAML, used
+//                                  by the grid packer (TASK-014).
+//   * placement                  — packed grid coordinates and span. Static
+//                                  this phase.
+//   * pending                    — true while an OptimisticEntry exists for
+//                                  this tile's entity. Drives the per-tile
+//                                  spinner overlay on CardBase (TASK-067),
+//                                  bound from
+//                                  `LiveStore::pending_for_widget(widget_id)`.
+export struct ClimateTileVM {
+    name: string,
+    state: string,
+    is-active: bool,
+    current-temperature: float,
+    has-current-temperature: bool,
+    target-temperature: float,
+    has-target-temperature: bool,
+    icon-id: string,
+    icon: image,
+    preferred-columns: int,
+    preferred-rows: int,
+    placement: ClimateTilePlacement,
+    pending: bool,
+}
+
+// ClimateTile — wraps CardBase with the climate-specific content layout.
+//
+// Press feedback and gesture detection both live on CardBase (TASK-060):
+// the single TouchArea inside CardBase captures pointer events for the
+// whole tile and exposes `pressed` as an out-property this tile reads
+// for visual feedback. Tile-level TouchAreas were removed to avoid
+// double-capture (Risk #4).
+//
+// Setpoint-slider drag is intentionally NOT in this tile — that interaction
+// lives in the more-info modal per `locked_decisions.cover_slider_component`.
+export component ClimateTile inherits Rectangle {
+    in property <ClimateTileVM> view-model;
+
+    // Resolved icon tint colour. Branches on availability first, then on
+    // is-active, falling back to text-secondary for the idle (off) state.
+    // No inline hex literals; every branch picks a token from `Theme`.
+    property <color> icon-color:
+        view-model.state == "unavailable" ? Theme.state-unavailable
+        : view-model.is-active ? Theme.accent
+        : Theme.text-secondary;
+
+    // Reduce opacity for the unavailable visual state (Phase 6 plan
+    // three-state render acceptance). Idle and active render at full
+    // opacity; only unavailable dims.
+    opacity: view-model.state == "unavailable" ? 0.5 : 1.0;
+
+    base := CardBase {
+        // Bind the per-tile pending-spinner gate (TASK-067). The Rust
+        // bridge writes `view-model.pending` from
+        // `LiveStore::pending_for_widget` (TASK-064 read API) on each
+        // refresh; this property feeds the spinner overlay declared on
+        // CardBase. Slint MUST read only this property — there is no
+        // parallel pending-state path (Risk #14).
+        pending: view-model.pending;
+
+        VerticalLayout {
+            spacing: Theme.space-2;
+
+            // Header row: icon + entity name. Icon is tinted with the
+            // resolved icon colour so a glance at the tile reveals
+            // off / active / unavailable status.
+            HorizontalLayout {
+                spacing: Theme.space-2;
+                alignment: start;
+
+                Image {
+                    source: view-model.icon;
+                    width: Theme.font-xl;
+                    height: Theme.font-xl;
+                    colorize: icon-color;
+                }
+
+                Text {
+                    text: view-model.name;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-medium;
+                    vertical-alignment: center;
+                }
+            }
+
+            // HVAC-mode label. The state string is rendered in the
+            // resolved icon colour for redundancy with the icon tint
+            // (accessibility: do not rely on colour alone). Mode strings
+            // are short ("heat" / "cool" / "auto" / "fan_only") so
+            // font-md is the right hero size — sensor-tile-like font-xxl
+            // would push longer vendor mode names ("heat_cool",
+            // "auto_heat") off the card.
+            Text {
+                text: view-model.state;
+                color: icon-color;
+                font-size: Theme.font-md;
+                font-weight: Theme.font-weight-bold;
+            }
+
+            // Current-temperature row, only when the entity reports
+            // `current_temperature`. Suffix "°" without a unit letter:
+            // HA emits the unit on a separate `unit_of_measurement`
+            // attribute and the choice between °C / °F is integration-
+            // specific; rendering "°" alone is unit-agnostic and matches
+            // the Lovelace climate-card convention of leaving the unit
+            // implicit.
+            if view-model.has-current-temperature: Text {
+                text: "now " + round(view-model.current-temperature * 10) / 10 + "°";
+                color: Theme.text-secondary;
+                font-size: Theme.font-sm;
+                font-weight: Theme.font-weight-regular;
+            }
+
+            // Target-temperature row, only when the entity reports the
+            // setpoint via HA's `temperature` attribute. Absent on
+            // entities in `heat_cool` mode (which emit
+            // `target_temp_low` / `target_temp_high` instead) — the
+            // companion fields are not surfaced on the per-frame tile
+            // VM; the modal handles the dual-setpoint shape.
+            if view-model.has-target-temperature: Text {
+                text: "set " + round(view-model.target-temperature * 10) / 10 + "°";
+                color: Theme.text-primary;
+                font-size: Theme.font-sm;
+                font-weight: Theme.font-weight-medium;
+            }
+        }
+    }
+}
