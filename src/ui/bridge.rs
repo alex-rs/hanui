@@ -7528,6 +7528,29 @@ mod tests {
     // compute_alarm_tile_vm (TASK-105)
     // -----------------------------------------------------------------------
 
+    /// `build_tiles` dispatches `WidgetKind::Alarm` through `AlarmVM::from_entity`
+    /// and produces an `EntityTileVM` with the alarm state string.
+    #[test]
+    fn build_tiles_alarm_panel_widget_uses_alarm_state() {
+        use crate::ha::store::MemoryStore;
+
+        let store = MemoryStore::load(vec![make_test_entity(
+            "alarm_control_panel.home",
+            "armed_away",
+        )])
+        .expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("alarm_control_panel.home", WidgetKind::Alarm);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1, "one widget → one tile");
+        match &tiles[0] {
+            TileVM::Entity(vm) => {
+                assert_eq!(vm.state, "armed_away", "alarm state flows through to tile");
+            }
+            other => panic!("expected EntityTileVM for alarm, got {other:?}"),
+        }
+    }
+
     #[test]
     fn compute_alarm_tile_vm_disarmed_state() {
         let entity = make_test_entity("alarm_control_panel.home", "disarmed");
