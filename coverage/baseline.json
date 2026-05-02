@@ -4,20 +4,30 @@
     "enforcement": "ops/checks/coverage-ratchet.js",
     "tool": "cargo-llvm-cov",
     "tool_version": "cargo-llvm-cov 0.8.5",
-    "seeded_at": "2026-04-30T00:00:00Z",
-    "seeded_from": "26075c4b630f7ef0b5c20130df3d71256b06405a",
-    "regenerated": "2026-04-30",
-    "regenerated_for": "TASK-100 PR #94 \u2014 capture bridge.rs PinEntryHost additions before merge; TASK-113 final re-seed at end of Phase 6 supersedes"
+    "seeded_at": "2026-05-02T11:18:20Z",
+    "seeded_from": "6eab7360d35673afa3cedfe390c805b99a84db9d",
+    "regenerated": "2026-05-02",
+    "regenerated_for": "TASK-113 — Phase 6 final coverage baseline re-seed: 16 new source files (audit/mod.rs, ha/{http,history,camera}.rs, dashboard/visibility.rs, actions/{pin,service_map}.rs, ui/{cover,fan,lock,alarm,climate,media_player,camera,history_graph,power_flow}.rs) and re-measured entries for files heavily extended in Phase 6.",
+    "source_command": "cargo llvm-cov --json --output-path /tmp/cov-task113.json -- --skip parse_time_rss_under_opi_zero3_budget",
+    "skipped_tests": [
+      {
+        "name": "parse_time_rss_under_opi_zero3_budget",
+        "module": "src/dashboard/loader.rs",
+        "reason": "Instrumented (llvm-cov) build inflates process RSS above the 60 MiB opi_zero3 budget on the seeding host; non-deterministic across hardware. CI runs without the skip and will only meet or exceed the seeded src/dashboard/loader.rs pct (85.3%); the per-file ratchet allows current >= baseline."
+      }
+    ],
+    "rounding": "Each pct is floored to 1 decimal place; combined with the ratchet's 0.05 epsilon this keeps ~0.1 effective headroom against floating-point noise.",
+    "scope_note": "Baseline is scoped to src/** (application crate). tools/** workspace members (e.g. tools/lovelace-import) are intentionally excluded from this re-seed to honor the TASK-113 MUST-NOT-TOUCH list; they will be baselined in a follow-up task that explicitly owns tools/."
   },
   "files": {
     "src/actions/dispatcher.rs": {
-      "lines_total": 2328,
-      "lines_covered": 2248,
-      "pct": 96.6
+      "lines_total": 3400,
+      "lines_covered": 3300,
+      "pct": 97.0
     },
     "src/actions/map.rs": {
-      "lines_total": 442,
-      "lines_covered": 442,
+      "lines_total": 448,
+      "lines_covered": 448,
       "pct": 100.0
     },
     "src/actions/mod.rs": {
@@ -25,10 +35,15 @@
       "lines_covered": 0,
       "pct": 0.0
     },
+    "src/actions/pin.rs": {
+      "lines_total": 100,
+      "lines_covered": 75,
+      "pct": 75.0
+    },
     "src/actions/queue.rs": {
       "lines_total": 680,
-      "lines_covered": 642,
-      "pct": 94.4
+      "lines_covered": 643,
+      "pct": 94.5
     },
     "src/actions/schema.rs": {
       "lines_total": 329,
@@ -48,7 +63,7 @@
     "src/actions/url.rs": {
       "lines_total": 602,
       "lines_covered": 549,
-      "pct": 91.2
+      "pct": 91.1
     },
     "src/assets/icons.rs": {
       "lines_total": 156,
@@ -66,8 +81,8 @@
       "pct": 93.5
     },
     "src/dashboard/fixture.rs": {
-      "lines_total": 163,
-      "lines_covered": 163,
+      "lines_total": 164,
+      "lines_covered": 164,
       "pct": 100.0
     },
     "src/dashboard/layout.rs": {
@@ -76,9 +91,9 @@
       "pct": 100.0
     },
     "src/dashboard/loader.rs": {
-      "lines_total": 225,
-      "lines_covered": 208,
-      "pct": 92.4
+      "lines_total": 349,
+      "lines_covered": 298,
+      "pct": 85.3
     },
     "src/dashboard/mod.rs": {
       "lines_total": 0,
@@ -86,23 +101,33 @@
       "pct": 0.0
     },
     "src/dashboard/profiles.rs": {
-      "lines_total": 206,
-      "lines_covered": 206,
+      "lines_total": 247,
+      "lines_covered": 247,
       "pct": 100.0
     },
     "src/dashboard/schema.rs": {
-      "lines_total": 389,
-      "lines_covered": 389,
+      "lines_total": 563,
+      "lines_covered": 563,
       "pct": 100.0
     },
     "src/dashboard/validate.rs": {
-      "lines_total": 1052,
-      "lines_covered": 1038,
-      "pct": 98.7
+      "lines_total": 1054,
+      "lines_covered": 1040,
+      "pct": 98.6
+    },
+    "src/dashboard/visibility.rs": {
+      "lines_total": 625,
+      "lines_covered": 612,
+      "pct": 97.9
+    },
+    "src/ha/camera.rs": {
+      "lines_total": 142,
+      "lines_covered": 135,
+      "pct": 95.0
     },
     "src/ha/client.rs": {
-      "lines_total": 2230,
-      "lines_covered": 2078,
+      "lines_total": 2314,
+      "lines_covered": 2157,
       "pct": 93.2
     },
     "src/ha/entity.rs": {
@@ -113,17 +138,22 @@
     "src/ha/fixture.rs": {
       "lines_total": 210,
       "lines_covered": 203,
-      "pct": 96.7
+      "pct": 96.6
+    },
+    "src/ha/history.rs": {
+      "lines_total": 402,
+      "lines_covered": 385,
+      "pct": 95.7
     },
     "src/ha/http.rs": {
-      "lines_total": 514,
-      "lines_covered": 331,
-      "pct": 64.4
+      "lines_total": 540,
+      "lines_covered": 412,
+      "pct": 76.2
     },
     "src/ha/live_store.rs": {
-      "lines_total": 572,
-      "lines_covered": 558,
-      "pct": 97.6
+      "lines_total": 1197,
+      "lines_covered": 1180,
+      "pct": 98.5
     },
     "src/ha/mod.rs": {
       "lines_total": 0,
@@ -131,24 +161,24 @@
       "pct": 0.0
     },
     "src/ha/protocol.rs": {
-      "lines_total": 424,
-      "lines_covered": 390,
+      "lines_total": 452,
+      "lines_covered": 416,
       "pct": 92.0
     },
     "src/ha/services.rs": {
       "lines_total": 317,
       "lines_covered": 314,
-      "pct": 99.1
+      "pct": 99.0
     },
     "src/ha/store.rs": {
       "lines_total": 198,
       "lines_covered": 190,
-      "pct": 96.0
+      "pct": 95.9
     },
     "src/lib.rs": {
-      "lines_total": 480,
-      "lines_covered": 311,
-      "pct": 64.8
+      "lines_total": 742,
+      "lines_covered": 543,
+      "pct": 73.1
     },
     "src/main.rs": {
       "lines_total": 6,
@@ -170,10 +200,50 @@
       "lines_covered": 91,
       "pct": 100.0
     },
+    "src/ui/alarm.rs": {
+      "lines_total": 140,
+      "lines_covered": 140,
+      "pct": 100.0
+    },
     "src/ui/bridge.rs": {
-      "lines_total": 2571,
-      "lines_covered": 2533,
-      "pct": 98.52
+      "lines_total": 4726,
+      "lines_covered": 4657,
+      "pct": 98.5
+    },
+    "src/ui/camera.rs": {
+      "lines_total": 147,
+      "lines_covered": 147,
+      "pct": 100.0
+    },
+    "src/ui/climate.rs": {
+      "lines_total": 194,
+      "lines_covered": 190,
+      "pct": 97.9
+    },
+    "src/ui/cover.rs": {
+      "lines_total": 175,
+      "lines_covered": 151,
+      "pct": 86.2
+    },
+    "src/ui/fan.rs": {
+      "lines_total": 188,
+      "lines_covered": 182,
+      "pct": 96.8
+    },
+    "src/ui/history_graph.rs": {
+      "lines_total": 100,
+      "lines_covered": 100,
+      "pct": 100.0
+    },
+    "src/ui/lock.rs": {
+      "lines_total": 130,
+      "lines_covered": 125,
+      "pct": 96.1
+    },
+    "src/ui/media_player.rs": {
+      "lines_total": 211,
+      "lines_covered": 208,
+      "pct": 98.5
     },
     "src/ui/mod.rs": {
       "lines_total": 0,
@@ -181,14 +251,19 @@
       "pct": 0.0
     },
     "src/ui/more_info.rs": {
-      "lines_total": 369,
-      "lines_covered": 349,
-      "pct": 94.6
+      "lines_total": 852,
+      "lines_covered": 831,
+      "pct": 97.5
+    },
+    "src/ui/power_flow.rs": {
+      "lines_total": 219,
+      "lines_covered": 219,
+      "pct": 100.0
     },
     "src/ui/toast.rs": {
       "lines_total": 396,
       "lines_covered": 378,
-      "pct": 95.5
+      "pct": 95.4
     },
     "src/ui/view_router.rs": {
       "lines_total": 125,
