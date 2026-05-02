@@ -1652,4 +1652,88 @@ views:
             "require_confirmation_on_unlock must default to false"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // dep_index_structurally_eq branch coverage (TASK-110)
+    // -----------------------------------------------------------------------
+
+    fn make_dashboard_with_dep_index(
+        map: HashMap<EntityId, crate::dashboard::visibility::DepBucket>,
+    ) -> Dashboard {
+        let mut d = minimal_dashboard();
+        d.dep_index = Arc::new(map);
+        d
+    }
+
+    fn minimal_dashboard() -> Dashboard {
+        Dashboard {
+            version: 1,
+            theme: None,
+            default_view: "default".to_owned(),
+            views: vec![],
+            device_profile: ProfileKey::Desktop,
+            home_assistant: None,
+            dep_index: Arc::default(),
+            call_service_allowlist: Default::default(),
+        }
+    }
+
+    #[test]
+    fn dep_index_eq_different_map_lengths_returns_false() {
+        let mut map_a: HashMap<EntityId, crate::dashboard::visibility::DepBucket> = HashMap::new();
+        map_a.insert(EntityId::from("light.a"), vec![WidgetId::from("w1")]);
+        map_a.insert(EntityId::from("light.b"), vec![WidgetId::from("w2")]);
+
+        let mut map_b: HashMap<EntityId, crate::dashboard::visibility::DepBucket> = HashMap::new();
+        map_b.insert(EntityId::from("light.a"), vec![WidgetId::from("w1")]);
+
+        let da = make_dashboard_with_dep_index(map_a);
+        let db = make_dashboard_with_dep_index(map_b);
+        assert_ne!(da, db, "different map sizes must not be equal");
+    }
+
+    #[test]
+    fn dep_index_eq_missing_key_in_b_returns_false() {
+        let mut map_a: HashMap<EntityId, crate::dashboard::visibility::DepBucket> = HashMap::new();
+        map_a.insert(EntityId::from("light.x"), vec![WidgetId::from("w1")]);
+
+        let mut map_b: HashMap<EntityId, crate::dashboard::visibility::DepBucket> = HashMap::new();
+        map_b.insert(EntityId::from("light.y"), vec![WidgetId::from("w1")]);
+
+        let da = make_dashboard_with_dep_index(map_a);
+        let db = make_dashboard_with_dep_index(map_b);
+        assert_ne!(da, db, "key present in a but absent in b must not be equal");
+    }
+
+    #[test]
+    fn dep_index_eq_different_bucket_lengths_returns_false() {
+        let mut map_a: HashMap<EntityId, crate::dashboard::visibility::DepBucket> = HashMap::new();
+        map_a.insert(
+            EntityId::from("light.x"),
+            vec![WidgetId::from("w1"), WidgetId::from("w2")],
+        );
+
+        let mut map_b: HashMap<EntityId, crate::dashboard::visibility::DepBucket> = HashMap::new();
+        map_b.insert(EntityId::from("light.x"), vec![WidgetId::from("w1")]);
+
+        let da = make_dashboard_with_dep_index(map_a);
+        let db = make_dashboard_with_dep_index(map_b);
+        assert_ne!(da, db, "different bucket lengths must not be equal");
+    }
+
+    #[test]
+    fn dep_index_eq_different_bucket_contents_returns_false() {
+        let mut map_a: HashMap<EntityId, crate::dashboard::visibility::DepBucket> = HashMap::new();
+        map_a.insert(EntityId::from("light.x"), vec![WidgetId::from("w1")]);
+
+        let mut map_b: HashMap<EntityId, crate::dashboard::visibility::DepBucket> = HashMap::new();
+        map_b.insert(EntityId::from("light.x"), vec![WidgetId::from("w2")]);
+
+        let da = make_dashboard_with_dep_index(map_a);
+        let db = make_dashboard_with_dep_index(map_b);
+        assert_ne!(
+            da, db,
+            "same bucket length but different content must not be equal"
+        );
+    }
 }
