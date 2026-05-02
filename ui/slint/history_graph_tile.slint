@@ -5,7 +5,7 @@
 //   * The trace is a Slint `Path` element rendered with `MoveTo` + `LineTo`
 //     commands. Slint exposes two surface forms for Path commands: a model-
 //     driven `MoveTo` / `LineTo` child set (NOT supported with `for`/`in`
-//     yet — Slint issue #754) and a string-encoded `commands` property using
+//     yet — see Slint upstream issue tracker) and a string-encoded `commands` property using
 //     the SVG mini-language (`M x y L x y L ...`). We use the string form
 //     because the model-driven form does not currently support iteration
 //     over a Rust-supplied `[Point]` model.
