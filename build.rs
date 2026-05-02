@@ -385,4 +385,41 @@ fn main() {
         "cargo:rustc-env=HANUI_HISTORY_GRAPH_TILE_INCLUDE={}",
         history_graph_tile_output.display()
     );
+
+    // CameraSnapshotTile component (TASK-107) — Phase 6 Wave 2 camera-snapshot tile.
+    //
+    // Compiles `ui/slint/camera_snapshot_tile.slint` to a separate output file
+    // so the bridge's `camera_snapshot_tile_slint` submodule can reference the
+    // generated `CameraSnapshotTile`, `CameraTileVM`, and `CameraTilePlacement`
+    // types without pulling in the full production `MainWindow` symbol set.
+    // Mirrors the pattern used by `cover_tile.slint` (TASK-102),
+    // `fan_tile.slint` (TASK-103), `lock_tile.slint` (TASK-104),
+    // `alarm_panel_tile.slint` (TASK-105), and `history_graph_tile.slint`
+    // (TASK-106).
+    //
+    // This compile puts `camera_snapshot_tile.slint` in the build graph:
+    // `cargo build` fails if the component has a syntax or type error
+    // (satisfying the "Slint component compile gate" acceptance criterion in
+    // TASK-107).
+    //
+    // The generated types are accessible to `src/ui/bridge.rs` via
+    // `include!(env!("HANUI_CAMERA_SNAPSHOT_TILE_INCLUDE"))` inside the
+    // `camera_snapshot_tile_slint` submodule.
+    let camera_snapshot_tile_input = manifest_dir.join("ui/slint/camera_snapshot_tile.slint");
+    let camera_snapshot_tile_output = out_dir.join("camera_snapshot_tile.rs");
+
+    let camera_snapshot_tile_deps = slint_build::compile_with_output_path(
+        &camera_snapshot_tile_input,
+        &camera_snapshot_tile_output,
+        slint_build::CompilerConfiguration::default(),
+    )
+    .expect("compile ui/slint/camera_snapshot_tile.slint with slint-build");
+
+    for dep in camera_snapshot_tile_deps {
+        println!("cargo:rerun-if-changed={}", dep.display());
+    }
+    println!(
+        "cargo:rustc-env=HANUI_CAMERA_SNAPSHOT_TILE_INCLUDE={}",
+        camera_snapshot_tile_output.display()
+    );
 }

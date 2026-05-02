@@ -1,0 +1,174 @@
+// camera_snapshot_tile.slint — Phase 6 Wave 2 (TASK-107) tile for `type: camera`.
+//
+// Renders a Home Assistant camera entity as a placeholder image area + a
+// state label. The actual MJPEG/JPEG frame rendering is Phase 7+ (TASK-107
+// scope is the bounded decoder pool + the Slint placeholder; live frames
+// land when the bridge wires `Image::source` to `Arc<DecodedImage>` from
+// `HaHttpClient::get_image`).
+//
+// Per `locked_decisions.camera_pool_shape`:
+//   * The Rust bridge runs the bounded `CameraPool` (`src/ha/camera.rs`); this
+//     Slint tile only displays the current state-derived placeholder. No
+//     per-frame work is performed in the Slint render path.
+//   * Three-state render: idle (state == "idle"), active (state == "recording"
+//     or "streaming"), unavailable (state == "unavailable" or unknown). Drives
+//     icon tint + the opacity-dim on the unavailable branch.
+//
+// View-model contract (see `src/ui/bridge.rs::CameraTileVM`):
+//   * The struct shape is mirrored 1:1 in Rust by the bridge. The Slint
+//     compiler generates a Rust struct named `CameraTileVM` whose fields
+//     match these names with kebab→snake conversion.
+//   * `state` is the canonical HA state string (`"idle"`, `"recording"`,
+//     `"streaming"`, `"unavailable"`, or any other vendor-specific value
+//     forwarded verbatim).
+//   * `is-recording` / `is-streaming` are precomputed booleans so the Slint
+//     side does not branch on the state-string vocabulary.
+//   * `placement` is a NESTED struct (`CameraTilePlacement`) for 1:1 mapping
+//     with `dashboard::schema::Placement` in Rust.
+//
+// All colors come from theme tokens; no inline hex literals (CI hex-color
+// gate, `.github/workflows/ci.yml` § Gate 1).
+//
+// AnimationBudget integration:
+//   * No tile-internal animation; the tile is static placeholder. Press
+//     feedback is inherited from CardBase. Snapshot refresh is bridge-side
+//     and bounded by the `WidgetOptions::Camera.interval_seconds` knob and
+//     the `CameraPool` worker count.
+
+import { Theme } from "theme.slint";
+import { CardBase } from "card_base.slint";
+
+// Computed grid placement, mirrors `dashboard::schema::Placement` in Rust.
+// Re-declared per tile file for self-documentation; identical to
+// `LightTilePlacement` / `SensorTilePlacement` / `EntityTilePlacement` /
+// `CoverTilePlacement` / `FanTilePlacement` / `LockTilePlacement` /
+// `AlarmTilePlacement` / `HistoryGraphTilePlacement`.
+export struct CameraTilePlacement {
+    col: int,
+    row: int,
+    span-cols: int,
+    span-rows: int,
+}
+
+// Typed view-model for a camera snapshot tile.
+//
+// Field semantics:
+//   * name           — user-visible entity label (friendly_name fallback to id).
+//   * state          — canonical HA state string (`"idle"`, `"recording"`,
+//                      `"streaming"`, `"unavailable"`, or vendor-specific
+//                      string forwarded verbatim).
+//   * is-recording   — derived: true only for `"recording"`. Drives the
+//                      "active" icon tint variant.
+//   * is-streaming   — derived: true only for `"streaming"`. Drives the
+//                      "active" icon tint variant.
+//   * is-available   — derived: false when state is `"unavailable"` or
+//                      `"unknown"`. Drives the dim/full-opacity branch.
+//   * icon-id        — design-token id (e.g. "mdi:cctv"); resolved
+//                      to bytes by the asset layer (TASK-010).
+//   * icon           — resolved Slint image written by the bridge (TASK-015).
+//   * preferred-columns / preferred-rows — author intent from YAML, used
+//                      by the grid packer (TASK-014).
+//   * placement      — packed grid coordinates and span. Static this phase.
+//   * pending        — true while an OptimisticEntry exists for this tile's
+//                      entity. Drives the per-tile spinner overlay on
+//                      CardBase (TASK-067), bound from
+//                      `LiveStore::pending_for_widget(widget_id)`.
+export struct CameraTileVM {
+    name: string,
+    state: string,
+    is-recording: bool,
+    is-streaming: bool,
+    is-available: bool,
+    icon-id: string,
+    icon: image,
+    preferred-columns: int,
+    preferred-rows: int,
+    placement: CameraTilePlacement,
+    pending: bool,
+}
+
+// CameraSnapshotTile — wraps CardBase with the camera placeholder content.
+//
+// Press feedback and gesture detection both live on CardBase (TASK-060):
+// the single TouchArea inside CardBase captures pointer events for the
+// whole tile. Tile-level TouchAreas were removed to avoid double-capture
+// (Risk #4).
+export component CameraSnapshotTile inherits Rectangle {
+    in property <CameraTileVM> view-model;
+
+    // Resolved icon tint colour. Branches on availability first, then on
+    // the active booleans. Idle state falls back to text-secondary so the
+    // tile reads as "ready but not actively recording / streaming".
+    property <color> icon-color:
+        !view-model.is-available ? Theme.state-unavailable
+        : view-model.is-recording ? Theme.accent
+        : view-model.is-streaming ? Theme.state-on
+        : Theme.text-secondary;
+
+    // Reduce opacity for the unavailable visual state (Phase 6 plan
+    // three-state render acceptance). Idle, recording, and streaming render
+    // at full opacity; only unavailable dims.
+    opacity: !view-model.is-available ? 0.5 : 1.0;
+
+    base := CardBase {
+        // Bind the per-tile pending-spinner gate (TASK-067). The Rust
+        // bridge writes `view-model.pending` from
+        // `LiveStore::pending_for_widget` (TASK-064 read API) on each
+        // refresh; this property feeds the spinner overlay declared on
+        // CardBase. Slint MUST read only this property — there is no
+        // parallel pending-state path (Risk #14).
+        pending: view-model.pending;
+
+        VerticalLayout {
+            spacing: Theme.space-2;
+
+            // Header row: icon + entity name. Icon is tinted with the
+            // resolved icon colour so a glance at the tile reveals
+            // idle / recording / streaming / unavailable status.
+            HorizontalLayout {
+                spacing: Theme.space-2;
+                alignment: start;
+
+                Image {
+                    source: view-model.icon;
+                    width: Theme.font-xl;
+                    height: Theme.font-xl;
+                    colorize: icon-color;
+                }
+
+                Text {
+                    text: view-model.name;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-medium;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Snapshot placeholder area. The actual MJPEG/JPEG frame is
+            // wired in Phase 7+ once the bridge connects `Image::source`
+            // to `Arc<DecodedImage>` from the `CameraPool` fetch path.
+            // Today this Rectangle reserves space and renders a tinted
+            // backdrop so the tile keeps a visible footprint.
+            placeholder := Rectangle {
+                horizontal-stretch: 1;
+                vertical-stretch: 1;
+                background: Theme.surface;
+                border-color: icon-color;
+                border-width: 1px;
+                border-radius: Theme.radius-md;
+
+                // Centred state label so users see the camera state at a
+                // glance even without a live frame.
+                Text {
+                    text: view-model.state;
+                    color: icon-color;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-bold;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}
