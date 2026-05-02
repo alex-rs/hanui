@@ -1,0 +1,10 @@
+{
+  "sections": [
+    {
+      "section_id": "main",
+      "positions": [
+        {"widget_id": "history_idle", "col": 0, "row": 0, "span_cols": 2, "span_rows": 2}
+      ]
+    }
+  ]
+}

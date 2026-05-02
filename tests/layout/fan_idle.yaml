@@ -1,0 +1,25 @@
+version: 1
+device_profile: desktop
+default_view: home
+# Phase 6 acceptance fixture (TASK-112): fan widget at idle state.
+views:
+  - id: home
+    title: Home
+    layout: sections
+    sections:
+      - id: main
+        title: Main
+        grid:
+          columns: 4
+          gap: 8
+        widgets:
+          - id: fan_idle
+            type: fan
+            entity: fan.bedroom
+            options:
+              fan:
+                speed_count: 3
+                preset_modes: [Low, Medium, High]
+            layout:
+              preferred_columns: 1
+              preferred_rows: 1
