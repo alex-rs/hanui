@@ -35,5 +35,155 @@
     "attributes": {},
     "last_changed": "2026-04-24T08:00:00Z",
     "last_updated": "2026-04-24T08:00:00Z"
+  },
+  {
+    "entity_id": "fan.living_room",
+    "state": "on",
+    "attributes": {
+      "friendly_name": "Living Room Fan",
+      "percentage": 66,
+      "preset_mode": "medium"
+    },
+    "last_changed": "2026-04-24T10:05:00Z",
+    "last_updated": "2026-04-24T10:05:00Z"
+  },
+  {
+    "entity_id": "camera.bedroom",
+    "state": "idle",
+    "attributes": {
+      "friendly_name": "Bedroom Camera"
+    },
+    "last_changed": "2026-04-24T10:00:00Z",
+    "last_updated": "2026-04-24T10:00:00Z"
+  },
+  {
+    "entity_id": "sensor.energy_consumption",
+    "state": "532.4",
+    "attributes": {
+      "friendly_name": "Energy Consumption",
+      "unit_of_measurement": "W",
+      "device_class": "power"
+    },
+    "last_changed": "2026-04-24T10:10:00Z",
+    "last_updated": "2026-04-24T10:10:00Z"
+  },
+  {
+    "entity_id": "climate.living_room",
+    "state": "heat",
+    "attributes": {
+      "friendly_name": "Living Room Thermostat",
+      "current_temperature": 20.5,
+      "temperature": 21.0,
+      "min_temp": 16.0,
+      "max_temp": 30.0,
+      "hvac_modes": ["heat", "cool", "heat_cool", "off"]
+    },
+    "last_changed": "2026-04-24T10:00:00Z",
+    "last_updated": "2026-04-24T10:00:00Z"
+  },
+  {
+    "entity_id": "lock.front_door",
+    "state": "locked",
+    "attributes": {
+      "friendly_name": "Front Door"
+    },
+    "last_changed": "2026-04-24T09:30:00Z",
+    "last_updated": "2026-04-24T09:30:00Z"
+  },
+  {
+    "entity_id": "lock.garage_door",
+    "state": "unlocked",
+    "attributes": {
+      "friendly_name": "Garage Door"
+    },
+    "last_changed": "2026-04-24T09:30:00Z",
+    "last_updated": "2026-04-24T09:30:00Z"
+  },
+  {
+    "entity_id": "cover.patio",
+    "state": "open",
+    "attributes": {
+      "friendly_name": "Patio Cover",
+      "current_position": 75
+    },
+    "last_changed": "2026-04-24T08:45:00Z",
+    "last_updated": "2026-04-24T08:45:00Z"
+  },
+  {
+    "entity_id": "alarm_control_panel.home",
+    "state": "armed_home",
+    "attributes": {
+      "friendly_name": "Home Alarm",
+      "code_format": "number",
+      "code_arm_required": true
+    },
+    "last_changed": "2026-04-24T07:00:00Z",
+    "last_updated": "2026-04-24T07:00:00Z"
+  },
+  {
+    "entity_id": "media_player.living_room_tv",
+    "state": "playing",
+    "attributes": {
+      "friendly_name": "Living Room TV",
+      "volume_level": 0.4,
+      "is_volume_muted": false
+    },
+    "last_changed": "2026-04-24T10:15:00Z",
+    "last_updated": "2026-04-24T10:15:00Z"
+  },
+  {
+    "entity_id": "sensor.grid_power",
+    "state": "1280",
+    "attributes": {
+      "friendly_name": "Grid Power",
+      "unit_of_measurement": "W",
+      "device_class": "power"
+    },
+    "last_changed": "2026-04-24T10:20:00Z",
+    "last_updated": "2026-04-24T10:20:00Z"
+  },
+  {
+    "entity_id": "sensor.solar_power",
+    "state": "2420",
+    "attributes": {
+      "friendly_name": "Solar Power",
+      "unit_of_measurement": "W",
+      "device_class": "power"
+    },
+    "last_changed": "2026-04-24T10:20:00Z",
+    "last_updated": "2026-04-24T10:20:00Z"
+  },
+  {
+    "entity_id": "sensor.battery_power",
+    "state": "-300",
+    "attributes": {
+      "friendly_name": "Battery Power",
+      "unit_of_measurement": "W",
+      "device_class": "power"
+    },
+    "last_changed": "2026-04-24T10:20:00Z",
+    "last_updated": "2026-04-24T10:20:00Z"
+  },
+  {
+    "entity_id": "sensor.battery_soc",
+    "state": "82",
+    "attributes": {
+      "friendly_name": "Battery State of Charge",
+      "unit_of_measurement": "%",
+      "device_class": "battery"
+    },
+    "last_changed": "2026-04-24T10:20:00Z",
+    "last_updated": "2026-04-24T10:20:00Z"
+  },
+  {
+    "entity_id": "sensor.home_power",
+    "state": "840",
+    "attributes": {
+      "friendly_name": "Home Power",
+      "unit_of_measurement": "W",
+      "device_class": "power"
+    },
+    "last_changed": "2026-04-24T10:20:00Z",
+    "last_updated": "2026-04-24T10:20:00Z"
   }
 ]

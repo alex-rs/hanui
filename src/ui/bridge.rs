@@ -3965,8 +3965,9 @@ mod tests {
         store.for_each(&mut |_id, _entity| {
             count += 1;
         });
-        // The canonical Phase 1 fixture has exactly 4 entities.
-        assert_eq!(count, 4, "for_each must visit all 4 fixture entities");
+        // The canonical fixture covers every Phase 6 widget kind and carries
+        // 18 entities. Bump this constant when the fixture grows again.
+        assert_eq!(count, 18, "for_each must visit all 18 fixture entities");
     }
 
     // -----------------------------------------------------------------------
