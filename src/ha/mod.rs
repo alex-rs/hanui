@@ -4,8 +4,10 @@
 //! Phase 2 adds `LiveStore`, the WebSocket client, and live state subscriptions.
 //! Phase 6.0 adds `http` — the shared HTTP layer for REST API access (TASK-097).
 //! Phase 6 Wave 2 adds `history` — REST history fetch + LTTB downsampling (TASK-106).
+//! Phase 6 Wave 2 adds `camera` — bounded decoder pool for snapshot fetches (TASK-107).
 //! This module never performs network I/O in Phase 1.
 
+pub mod camera;
 pub mod client;
 pub mod entity;
 pub mod fixture;

@@ -34,6 +34,7 @@ pub mod slint_harness;
 
 pub mod actions_protocol;
 pub mod actions_ui;
+pub mod camera_pool;
 pub mod command_tx;
 pub mod gesture_layer;
 pub mod lagged_resync;

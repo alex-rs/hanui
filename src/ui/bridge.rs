@@ -431,6 +431,56 @@ pub struct HistoryGraphTileVM {
 }
 
 // ---------------------------------------------------------------------------
+// CameraTileVM (TASK-107)
+// ---------------------------------------------------------------------------
+
+/// View-model for a `CameraSnapshotTile` widget, mirroring the Slint
+/// `CameraTileVM` struct in `ui/slint/camera_snapshot_tile.slint`.
+///
+/// Built by [`compute_camera_tile_vm`], which threads through
+/// [`crate::ui::camera::CameraVM::from_entity`] to derive the
+/// `is_recording` / `is_streaming` / `is_available` booleans from the
+/// canonical HA state.
+///
+/// The `icon: image` Slint field is absent here; it is written by the
+/// Slint bridge during property wiring (the same pattern used for
+/// every other per-kind tile VM).
+///
+/// Note (TASK-107 scope): the `MainWindow` Slint component does not yet
+/// declare a `camera-tiles` array property — `ui/slint/main_window.slint`
+/// is in this ticket's `must_not_touch` list. `compute_camera_tile_vm`
+/// is invoked indirectly via [`build_tiles`] so camera entities exercise
+/// the `CameraVM::from_entity` path on every state change, and the
+/// result flows into the existing fallback `EntityTileVM` render with the
+/// raw HA state string. A subsequent ticket will amend `main_window.slint`
+/// to render a per-kind `CameraSnapshotTile` model directly.
+///
+/// `pending` is the per-tile spinner gate added in TASK-067; see
+/// [`LightTileVM`] for the full contract.
+///
+/// # No `Vec` fields (lesson from TASK-103 / TASK-105)
+///
+/// Like `CameraVM`, this struct deliberately carries no `Vec` fields. The
+/// snapshot bytes live in [`crate::ha::camera::CameraPool`] and reach
+/// Slint as an `Image` property in a follow-up ticket — they do NOT
+/// travel through this VM. Allocating a `Vec` here that the tile never
+/// reads would be wasted work on every state change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CameraTileVM {
+    pub name: String,
+    pub state: String,
+    pub is_recording: bool,
+    pub is_streaming: bool,
+    pub is_available: bool,
+    pub icon_id: String,
+    pub preferred_columns: i32,
+    pub preferred_rows: i32,
+    pub placement: TilePlacement,
+    /// Per-tile spinner gate (TASK-067). Default `false`.
+    pub pending: bool,
+}
+
+// ---------------------------------------------------------------------------
 // TileVM enum
 // ---------------------------------------------------------------------------
 
@@ -876,14 +926,37 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                                     pending: false,
                                 })
                             }
-                            // Phase 4 schema adds Camera variant.
+                            // TASK-107: camera entities flow through
+                            // `CameraVM::from_entity` so the per-frame
+                            // derived `is_recording` / `is_streaming` /
+                            // `is_available` booleans are available
+                            // downstream. Until `main_window.slint` grows
+                            // a `camera-tiles` array property (subsequent
+                            // ticket), the camera tile renders as the
+                            // generic `EntityTileVM` fallback — the
+                            // canonical HA state string is forwarded
+                            // verbatim. The `CameraVM` is exposed via
+                            // `compute_camera_tile_vm` for the per-kind
+                            // rendering path that follows when
+                            // `main_window.slint` gains the array property.
+                            WidgetKind::Camera => {
+                                let _camera_vm = crate::ui::camera::CameraVM::from_entity(&entity);
+                                TileVM::Entity(EntityTileVM {
+                                    name,
+                                    state,
+                                    icon_id,
+                                    preferred_columns,
+                                    preferred_rows,
+                                    placement,
+                                    pending: false,
+                                })
+                            }
                             // Phase 6 adds MediaPlayer, Climate, PowerFlow.
                             // Until dedicated Slint tile components exist
-                            // (TASK-107..TASK-109), these are rendered as
+                            // (TASK-108..TASK-109), these are rendered as
                             // EntityTileVM — the generic entity tile covers
                             // the state display until per-kind tiles ship.
                             WidgetKind::EntityTile
-                            | WidgetKind::Camera
                             | WidgetKind::MediaPlayer
                             | WidgetKind::Climate
                             | WidgetKind::PowerFlow => TileVM::Entity(EntityTileVM {
@@ -2337,6 +2410,37 @@ pub use history_graph_tile_slint::{
 };
 
 // ---------------------------------------------------------------------------
+// CameraSnapshotTile Slint module (TASK-107)
+// ---------------------------------------------------------------------------
+//
+// `ui/slint/camera_snapshot_tile.slint` is compiled by `build.rs` (TASK-107)
+// to a separate generated Rust file exposed via the
+// `HANUI_CAMERA_SNAPSHOT_TILE_INCLUDE` env var — the same pattern as
+// `cover_tile.slint` (TASK-102), `fan_tile.slint` (TASK-103),
+// `lock_tile.slint` (TASK-104), `alarm_panel_tile.slint` (TASK-105), and
+// `history_graph_tile.slint` (TASK-106). This module picks it up via
+// `include!` so the generated `CameraSnapshotTile`, `CameraTileVM`, and
+// `CameraTilePlacement` types are available for the
+// `compute_camera_tile_vm` projection function below without polluting the
+// production `slint_ui` namespace (which would clash with the same-named
+// Rust struct declared earlier in this file).
+//
+// Future work: once `main_window.slint` grows a `camera-tiles` array
+// property, this module's types will be re-exported through the
+// production `slint_ui` namespace instead. The separate compile is the
+// minimal-blast path that satisfies TASK-107's "Slint compile gate"
+// acceptance criterion (camera_snapshot_tile.slint must be in the build
+// graph) without amending any of the protected `must_not_touch` Slint
+// files.
+pub mod camera_snapshot_tile_slint {
+    include!(env!("HANUI_CAMERA_SNAPSHOT_TILE_INCLUDE"));
+}
+
+pub use camera_snapshot_tile_slint::{
+    CameraSnapshotTile, CameraTilePlacement as SlintCameraTilePlacement,
+};
+
+// ---------------------------------------------------------------------------
 // compute_cover_tile_vm (TASK-102)
 // ---------------------------------------------------------------------------
 
@@ -2753,6 +2857,64 @@ pub fn history_path_commands(window: &crate::ha::history::HistoryWindow) -> Stri
         out.pop();
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// compute_camera_tile_vm (TASK-107)
+// ---------------------------------------------------------------------------
+
+/// Project a typed Rust [`CameraTileVM`] from a live entity snapshot,
+/// threading through [`crate::ui::camera::CameraVM::from_entity`] for the
+/// per-frame derived booleans (`is_recording` / `is_streaming` /
+/// `is_available`).
+///
+/// # Hot-path discipline
+///
+/// Called at entity-change time (NOT per render). The result is a typed
+/// `CameraTileVM` Rust struct; the further `String -> SharedString` /
+/// `icon_id -> Image` conversions are deferred to a follow-up ticket
+/// once `main_window.slint` declares the `camera-tiles` array property.
+///
+/// # No `Vec` allocation on the per-frame path
+///
+/// Per the TASK-103 / TASK-105 audit lesson: this projection writes only
+/// scalar `state` / `name` / `icon_id` strings the tile actually renders.
+/// The decoder pool's image bytes live in [`crate::ha::camera::CameraPool`]
+/// and reach Slint as an `Image` property in a follow-up ticket — they do
+/// NOT travel through this VM.
+///
+/// # Naming
+///
+/// Returns the Rust [`CameraTileVM`] (defined earlier in this file). The
+/// Slint-shape projection (`SlintCameraTileVM` from
+/// [`camera_snapshot_tile_slint::CameraTileVM`]) is not built here because
+/// there is no `camera-tiles` `MainWindow` property to write into yet —
+/// that shape conversion lives next to the `set_camera_tiles` call site
+/// once it exists.
+#[must_use]
+pub fn compute_camera_tile_vm(
+    name: String,
+    icon_id: String,
+    preferred_columns: i32,
+    preferred_rows: i32,
+    placement: TilePlacement,
+    entity: &crate::ha::entity::Entity,
+) -> CameraTileVM {
+    let camera_vm = crate::ui::camera::CameraVM::from_entity(entity);
+    let state = entity.state.as_ref().to_owned();
+
+    CameraTileVM {
+        name,
+        state,
+        is_recording: camera_vm.is_recording,
+        is_streaming: camera_vm.is_streaming,
+        is_available: camera_vm.is_available,
+        icon_id,
+        preferred_columns,
+        preferred_rows,
+        placement,
+        pending: false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -8177,6 +8339,165 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // compute_camera_tile_vm + build_tiles Camera arm (TASK-107)
+    // -----------------------------------------------------------------------
+
+    /// `build_tiles` dispatches `WidgetKind::Camera` through the
+    /// `CameraVM::from_entity` path and produces an `EntityTileVM` fallback
+    /// (no `camera-tiles` array property exists yet on `main_window.slint`).
+    /// The state string is forwarded verbatim per TASK-107 AC.
+    #[test]
+    fn build_tiles_camera_widget_uses_camera_state() {
+        use crate::ha::store::MemoryStore;
+
+        let store = MemoryStore::load(vec![make_test_entity("camera.front_door", "idle")])
+            .expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("camera.front_door", WidgetKind::Camera);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1, "one widget → one tile");
+        match &tiles[0] {
+            TileVM::Entity(vm) => {
+                assert_eq!(vm.state, "idle", "camera state forwarded verbatim");
+            }
+            other => panic!("expected EntityTileVM (Camera fallback), got {other:?}"),
+        }
+    }
+
+    /// `build_tiles` for a `WidgetKind::Camera` widget routes a `"recording"`
+    /// state through the bridge without altering the state string — the
+    /// active visual is driven downstream by `CameraVM::is_recording`.
+    #[test]
+    fn build_tiles_camera_widget_recording_state_passes_through() {
+        use crate::ha::store::MemoryStore;
+
+        let store = MemoryStore::load(vec![make_test_entity("camera.front_door", "recording")])
+            .expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("camera.front_door", WidgetKind::Camera);
+        let tiles = build_tiles(&store, &dashboard);
+        match &tiles[0] {
+            TileVM::Entity(vm) => assert_eq!(vm.state, "recording"),
+            other => panic!("expected EntityTileVM (Camera fallback), got {other:?}"),
+        }
+    }
+
+    /// `build_tiles` for a `WidgetKind::Camera` widget routes an
+    /// `"unavailable"` entity through the bridge without altering the state
+    /// string — the unavailable visual is driven downstream by
+    /// `CameraVM::is_available`.
+    #[test]
+    fn build_tiles_camera_widget_unavailable_state_passes_through() {
+        use crate::ha::store::MemoryStore;
+
+        let store = MemoryStore::load(vec![make_test_entity("camera.front_door", "unavailable")])
+            .expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("camera.front_door", WidgetKind::Camera);
+        let tiles = build_tiles(&store, &dashboard);
+        match &tiles[0] {
+            TileVM::Entity(vm) => assert_eq!(vm.state, "unavailable"),
+            other => panic!("expected EntityTileVM (Camera fallback), got {other:?}"),
+        }
+    }
+
+    /// `compute_camera_tile_vm` for an idle camera produces the typed Rust
+    /// `CameraTileVM` with `is_available=true` and active flags clear.
+    #[test]
+    fn compute_camera_tile_vm_idle_state() {
+        let entity = make_test_entity("camera.front_door", "idle");
+        let vm = compute_camera_tile_vm(
+            "Front Door".to_owned(),
+            "mdi:cctv".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.name, "Front Door");
+        assert_eq!(vm.state, "idle");
+        assert!(vm.is_available, "idle → is_available=true");
+        assert!(!vm.is_recording, "idle → is_recording=false");
+        assert!(!vm.is_streaming, "idle → is_streaming=false");
+        assert!(!vm.pending);
+        assert_eq!(vm.icon_id, "mdi:cctv");
+    }
+
+    /// `compute_camera_tile_vm` for a recording camera flips `is_recording`.
+    #[test]
+    fn compute_camera_tile_vm_recording_state() {
+        let entity = make_test_entity("camera.front_door", "recording");
+        let vm = compute_camera_tile_vm(
+            "Front Door".to_owned(),
+            "mdi:cctv".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.state, "recording");
+        assert!(vm.is_available);
+        assert!(vm.is_recording, "recording → is_recording=true");
+        assert!(!vm.is_streaming);
+    }
+
+    /// `compute_camera_tile_vm` for a streaming camera flips `is_streaming`.
+    #[test]
+    fn compute_camera_tile_vm_streaming_state() {
+        let entity = make_test_entity("camera.front_door", "streaming");
+        let vm = compute_camera_tile_vm(
+            "Front Door".to_owned(),
+            "mdi:cctv".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.state, "streaming");
+        assert!(vm.is_available);
+        assert!(!vm.is_recording);
+        assert!(vm.is_streaming, "streaming → is_streaming=true");
+    }
+
+    /// `compute_camera_tile_vm` for an unavailable camera produces
+    /// `is_available=false`.
+    #[test]
+    fn compute_camera_tile_vm_unavailable_state() {
+        let entity = make_test_entity("camera.front_door", "unavailable");
+        let vm = compute_camera_tile_vm(
+            "Front Door".to_owned(),
+            "mdi:cctv".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert!(!vm.is_available, "unavailable → is_available=false");
+        assert!(!vm.is_recording);
+        assert!(!vm.is_streaming);
+        assert_eq!(vm.state, "unavailable");
+    }
+
+    /// `compute_camera_tile_vm` for a vendor-specific state forwards the
+    /// state verbatim and treats it as available + idle.
+    #[test]
+    fn compute_camera_tile_vm_vendor_specific_state_is_available_idle() {
+        let entity = make_test_entity("camera.front_door", "armed");
+        let vm = compute_camera_tile_vm(
+            "Front Door".to_owned(),
+            "mdi:cctv".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.state, "armed");
+        assert!(vm.is_available);
+        assert!(!vm.is_recording);
+        assert!(!vm.is_streaming);
+    }
+
+    // -----------------------------------------------------------------------
     // HistoryBody more-info richer impl (TASK-106)
     // -----------------------------------------------------------------------
 
@@ -8258,6 +8579,121 @@ mod tests {
         // Optional rows must be absent.
         assert!(!rows.iter().any(|r| r.key == "unit_of_measurement"));
         assert!(!rows.iter().any(|r| r.key == "device_class"));
+    }
+
+    // -----------------------------------------------------------------------
+    // CameraBody more-info richer impl (TASK-107)
+    // -----------------------------------------------------------------------
+
+    /// `CameraBody::render_rows` always emits the state row.
+    #[test]
+    fn camera_body_emits_state_row() {
+        use crate::ui::more_info::{CameraBody, MoreInfoBody};
+        let entity = make_test_entity("camera.front_door", "idle");
+        let rows = CameraBody::new().render_rows(&entity);
+        assert!(
+            rows.iter().any(|r| r.key == "state" && r.value == "idle"),
+            "CameraBody must always emit a state row; got {rows:?}"
+        );
+    }
+
+    /// `CameraBody::render_rows` emits a `friendly_name` row when present.
+    #[test]
+    fn camera_body_emits_friendly_name_row_when_attribute_present() {
+        use crate::ui::more_info::{CameraBody, MoreInfoBody};
+        let entity = entity_with_attr("idle", "friendly_name", "\"Front Door Camera\"");
+        let entity = Entity {
+            id: EntityId::from("camera.front_door"),
+            ..entity
+        };
+        let rows = CameraBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "friendly_name" && r.value == "Front Door Camera"),
+            "CameraBody must emit a friendly_name row when set; got {rows:?}"
+        );
+    }
+
+    /// `CameraBody::render_rows` emits a `last_motion` row when present.
+    #[test]
+    fn camera_body_emits_last_motion_row_when_attribute_present() {
+        use crate::ui::more_info::{CameraBody, MoreInfoBody};
+        let entity = entity_with_attr("idle", "last_motion", "\"2026-04-30T12:00:00Z\"");
+        let entity = Entity {
+            id: EntityId::from("camera.front_door"),
+            ..entity
+        };
+        let rows = CameraBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "last_motion" && r.value == "2026-04-30T12:00:00Z"),
+            "CameraBody must emit a last_motion row when set; got {rows:?}"
+        );
+    }
+
+    /// `CameraBody::render_rows` emits a `brand` row when present.
+    #[test]
+    fn camera_body_emits_brand_row_when_attribute_present() {
+        use crate::ui::more_info::{CameraBody, MoreInfoBody};
+        let entity = entity_with_attr("idle", "brand", "\"Reolink\"");
+        let entity = Entity {
+            id: EntityId::from("camera.front_door"),
+            ..entity
+        };
+        let rows = CameraBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "brand" && r.value == "Reolink"),
+            "CameraBody must emit a brand row when set; got {rows:?}"
+        );
+    }
+
+    /// `CameraBody::render_rows` emits a `snapshot_url` indicator when
+    /// `entity_picture` is set — but the indicator value MUST NOT contain
+    /// the URL itself per `CLAUDE.md` security rules (the URL embeds a
+    /// short-lived access token).
+    #[test]
+    fn camera_body_emits_snapshot_url_indicator_without_logging_url() {
+        use crate::ui::more_info::{CameraBody, MoreInfoBody};
+        let entity = entity_with_attr(
+            "idle",
+            "entity_picture",
+            "\"/api/camera_proxy/camera.front_door?token=secret-token-value\"",
+        );
+        let entity = Entity {
+            id: EntityId::from("camera.front_door"),
+            ..entity
+        };
+        let rows = CameraBody::new().render_rows(&entity);
+        let snapshot_row = rows
+            .iter()
+            .find(|r| r.key == "snapshot_url")
+            .expect("CameraBody must emit a snapshot_url row when entity_picture is set");
+        // The indicator value must NOT include the token.
+        assert!(
+            !snapshot_row.value.contains("secret-token-value"),
+            "snapshot_url row must not log the token: {snapshot_row:?}"
+        );
+        assert!(
+            !snapshot_row.value.contains("/api/camera_proxy/"),
+            "snapshot_url row must not log the URL path: {snapshot_row:?}"
+        );
+    }
+
+    /// `CameraBody::render_rows` skips optional rows when their attributes
+    /// are absent.
+    #[test]
+    fn camera_body_skips_optional_rows_when_absent() {
+        use crate::ui::more_info::{CameraBody, MoreInfoBody};
+        let entity = make_test_entity("camera.front_door", "idle");
+        let rows = CameraBody::new().render_rows(&entity);
+        // Mandatory row always present.
+        assert!(rows.iter().any(|r| r.key == "state"));
+        // Optional rows must be absent.
+        assert!(!rows.iter().any(|r| r.key == "friendly_name"));
+        assert!(!rows.iter().any(|r| r.key == "last_motion"));
+        assert!(!rows.iter().any(|r| r.key == "brand"));
+        assert!(!rows.iter().any(|r| r.key == "snapshot_url"));
     }
 
     // -----------------------------------------------------------------------

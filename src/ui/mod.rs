@@ -15,6 +15,7 @@
 
 pub mod alarm;
 pub mod bridge;
+pub mod camera;
 pub mod cover;
 pub mod fan;
 pub mod history_graph;

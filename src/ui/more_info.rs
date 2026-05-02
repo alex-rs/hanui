@@ -766,15 +766,39 @@ impl MoreInfoBody for HistoryBody {
     }
 }
 
-/// More-info body for `camera` entities.
+/// More-info body for `camera` entities (TASK-107).
 ///
-/// Returns the entity's state. Phase 6b (`TASK-107`) will replace this with a
-/// live snapshot decoder.
+/// Renders camera-specific rows: state, `friendly_name` (when reported),
+/// `last_motion` (when reported), `brand` (when reported), and a
+/// `snapshot_url` *indicator* (a non-leaking placeholder string) when
+/// `entity_picture` is set. The Slint shell already binds `body-rows` to
+/// the modal's row list, so [`CameraBody`] reuses the generic rendering
+/// path — keeping the trait shape stable per TASK-098 + TASK-107.
+///
+/// # Why the snapshot URL is NOT surfaced verbatim
+///
+/// HA's `entity_picture` attribute can embed a short-lived access token
+/// (`?token=...`). Per `CLAUDE.md` security rules ("Never log secrets,
+/// tokens, or full request/response bodies"), the URL value is NEVER
+/// rendered into the modal row — instead, the row carries the literal
+/// string `"set"` so the user knows a snapshot URL is configured without
+/// the token reaching tracing output, screenshots, or accessibility
+/// readers. The decoder pool ([`crate::ha::camera::CameraPool`]) already
+/// fetches snapshots through `WidgetOptions::Camera.url`, which is the
+/// dashboard-author-configured URL — not the HA-emitted `entity_picture`.
+///
+/// # Stateless
+///
+/// `CameraBody` carries no fields; the body queries the live entity at
+/// `render_rows` time. Per `locked_decisions.more_info_modal`, the body
+/// is invoked exactly once per modal-open — so the per-call attribute
+/// reads are not on a hot path.
 #[derive(Debug, Default)]
 pub struct CameraBody;
 
 impl CameraBody {
-    /// Construct a [`CameraBody`].
+    /// Construct a [`CameraBody`]. Stateless; the constructor exists so
+    /// callers do not depend on `Default`.
     #[must_use]
     pub fn new() -> Self {
         CameraBody
@@ -783,10 +807,60 @@ impl CameraBody {
 
 impl MoreInfoBody for CameraBody {
     fn render_rows(&self, entity: &Entity) -> Vec<ModalRow> {
-        vec![ModalRow {
+        // Capacity of 5 covers the worst case (state + friendly_name +
+        // last_motion + brand + snapshot_url) without growing.
+        let mut rows = Vec::with_capacity(5);
+
+        // State row — always emitted, matches the per-domain body
+        // contract every other body upholds.
+        rows.push(ModalRow {
             key: "state".to_owned(),
             value: entity.state.as_ref().to_owned(),
-        }]
+        });
+
+        // friendly_name row, only when the entity exposes the attribute.
+        // Routed through `crate::ui::camera::read_friendly_name_attribute`
+        // for the canonical typed-accessor path (Gate 2: never names the
+        // JSON crate).
+        if let Some(friendly) = crate::ui::camera::read_friendly_name_attribute(entity) {
+            rows.push(ModalRow {
+                key: "friendly_name".to_owned(),
+                value: friendly,
+            });
+        }
+
+        // last_motion row, only when the entity exposes the attribute.
+        // HA cameras (e.g. unifi_protect) emit this as an RFC3339
+        // timestamp string.
+        if let Some(last_motion) = crate::ui::camera::read_last_motion_attribute(entity) {
+            rows.push(ModalRow {
+                key: "last_motion".to_owned(),
+                value: last_motion,
+            });
+        }
+
+        // brand row, only when the entity exposes the attribute. Some
+        // integrations (e.g. nest, reolink) emit the manufacturer name.
+        if let Some(brand) = crate::ui::camera::read_brand_attribute(entity) {
+            rows.push(ModalRow {
+                key: "brand".to_owned(),
+                value: brand,
+            });
+        }
+
+        // snapshot_url *indicator* row — present when `entity_picture` is
+        // set. We emit the literal string "set" to confirm the camera has
+        // a snapshot URL configured WITHOUT logging the URL itself (which
+        // may embed a short-lived access token). Per `CLAUDE.md`: never
+        // log secrets, tokens, or full request/response bodies.
+        if crate::ui::camera::read_entity_picture_attribute(entity).is_some() {
+            rows.push(ModalRow {
+                key: "snapshot_url".to_owned(),
+                value: "set".to_owned(),
+            });
+        }
+
+        rows
     }
 }
 
@@ -1415,6 +1489,111 @@ mod tests {
             rows.iter()
                 .any(|r| r.key == "code_arm_required" && r.value == "false"),
             "code_arm_required=false must produce 'false' row: {rows:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CameraBody attribute-row branches (TASK-107)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn camera_body_emits_friendly_name_row_when_present() {
+        let entity = entity_with_attr(
+            "camera.front_door",
+            "idle",
+            "friendly_name",
+            "\"Front Door\"",
+        );
+        let rows = CameraBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "friendly_name" && r.value == "Front Door"),
+            "friendly_name attribute must produce a row: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn camera_body_emits_last_motion_row_when_present() {
+        let entity = entity_with_attr(
+            "camera.front_door",
+            "idle",
+            "last_motion",
+            "\"2026-04-30T12:00:00Z\"",
+        );
+        let rows = CameraBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "last_motion" && r.value == "2026-04-30T12:00:00Z"),
+            "last_motion attribute must produce a row: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn camera_body_emits_brand_row_when_present() {
+        let entity = entity_with_attr("camera.front_door", "idle", "brand", "\"Reolink\"");
+        let rows = CameraBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "brand" && r.value == "Reolink"),
+            "brand attribute must produce a row: {rows:?}"
+        );
+    }
+
+    /// `CameraBody::render_rows` emits a `snapshot_url` indicator row when
+    /// `entity_picture` is set, but the row VALUE must NOT contain the
+    /// URL or any token embedded in it. Per `CLAUDE.md` security rules.
+    #[test]
+    fn camera_body_emits_snapshot_url_indicator_value_does_not_contain_url() {
+        let entity = entity_with_attr(
+            "camera.front_door",
+            "idle",
+            "entity_picture",
+            "\"/api/camera_proxy/camera.front_door?token=secret-token\"",
+        );
+        let rows = CameraBody::new().render_rows(&entity);
+        let row = rows
+            .iter()
+            .find(|r| r.key == "snapshot_url")
+            .expect("snapshot_url indicator row must be emitted when entity_picture is set");
+        assert_eq!(
+            row.value, "set",
+            "indicator value must be the literal 'set'"
+        );
+        assert!(
+            !row.value.contains("secret-token"),
+            "indicator value must not contain the token: {row:?}"
+        );
+        assert!(
+            !row.value.contains("/api/camera_proxy/"),
+            "indicator value must not contain the URL path: {row:?}"
+        );
+    }
+
+    /// `CameraBody::render_rows` skips optional rows (friendly_name,
+    /// last_motion, brand, snapshot_url) when their attributes are absent.
+    #[test]
+    fn camera_body_skips_optional_rows_when_absent() {
+        let entity = minimal_entity("camera.front_door", "idle");
+        let rows = CameraBody::new().render_rows(&entity);
+        // Mandatory row always present.
+        assert!(rows.iter().any(|r| r.key == "state" && r.value == "idle"));
+        // Optional rows must be absent.
+        assert!(!rows.iter().any(|r| r.key == "friendly_name"));
+        assert!(!rows.iter().any(|r| r.key == "last_motion"));
+        assert!(!rows.iter().any(|r| r.key == "brand"));
+        assert!(!rows.iter().any(|r| r.key == "snapshot_url"));
+    }
+
+    /// `CameraBody::render_rows` for an `unavailable` camera still emits
+    /// the state row (the fallback contract every per-domain body upholds).
+    #[test]
+    fn camera_body_unavailable_state_emits_state_row() {
+        let entity = minimal_entity("camera.front_door", "unavailable");
+        let rows = CameraBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "state" && r.value == "unavailable"),
+            "CameraBody must emit state row for unavailable cameras: {rows:?}"
         );
     }
 }
