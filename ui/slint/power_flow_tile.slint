@@ -1,0 +1,427 @@
+// power_flow_tile.slint — Phase 6 Wave 6d (TASK-094) tile for `type: power_flow`.
+//
+// Renders the canonical Home Assistant energy-flow graph: solar generation,
+// grid import/export, home consumption, and (optional) battery flow + state-
+// of-charge. The Rust bridge produces a `PowerFlowTileVM` per power-flow
+// widget via `crate::ui::power_flow::PowerFlowVM` followed by a Slint-shape
+// projection in `src/ui/bridge.rs::compute_power_flow_tile_vm`.
+//
+// Reference (per TASK-094 acceptance criterion #1): the visual + behavioural
+// surface mirrors the `power-flow-card-plus` Lovelace card
+// (https://github.com/flixlix/power-flow-card-plus). hanui reads typed entity
+// values from `LiveStore` rather than the Lovelace home-assistant-js-websocket
+// adapter, but the user-visible feature set matches as closely as Slint
+// primitives allow.
+//
+// Per TASK-094 (Phase 6 6d) plan: Phase 6 baseline is the **static current-
+// values render** with theme-token colour coding. Per-particle SVG-path
+// stroke-dasharray animations are deferred to a follow-up — they require
+// Slint surface support (Path stroke-dasharray with offset animation) that
+// is not yet exercised in any other tile and would expand the surface
+// significantly. The tile structure below is laid out so the future
+// animated lanes drop in cleanly: each lane has its own visibility gate
+// (`has-solar`, `has-battery`, etc.) and its own value label.
+//
+// Display-mode logic (TASK-094 acceptance criterion §Display-mode logic):
+//   * `Auto` (default): values >= 1000 W render as kW with one decimal;
+//     values < 1000 W render as W as integers.
+//   * The bridge passes the formatted strings via `solar-label` / `grid-label` /
+//     etc. so the Slint side does not branch on the unit choice. This keeps
+//     the tile rendering allocation-free on the per-frame path: the bridge
+//     formats once at entity-change time.
+//
+// Idle-lane behaviour (TASK-094 acceptance criterion §Idle-lane behaviour):
+//   * Lanes with magnitude < `min_flow_w` render at 30% opacity with no
+//     particle animation. The numeric value still displays. The bridge
+//     pre-computes the per-lane idle booleans (`solar-idle`, etc.) so the
+//     Slint side does not branch on threshold values.
+//
+// All colors come from theme tokens; no inline hex literals (CI hex-color
+// gate, `.github/workflows/ci.yml` § Gate 1). Visual primitives only — no
+// SVG icons in the tile body itself; the icon image is resolved by the Rust
+// asset layer (TASK-010) and bound via `PowerFlowTileVM.icon`.
+//
+// View-model contract (see `src/ui/bridge.rs::PowerFlowTileVM`):
+//   * The struct shape is mirrored 1:1 in Rust by the bridge. The Slint
+//     compiler generates a Rust struct named `PowerFlowTileVM` whose fields
+//     match these names with kebab→snake conversion.
+//   * `*-w` are `float` values (signed for grid / battery to encode flow
+//     direction); the companion `has-*` booleans gate whether to render
+//     the corresponding lane, because Slint floats have no native
+//     `Option<>` and `0.0` is a real reading (idle lane).
+//   * `*-label` are pre-formatted display strings (e.g. `"1.5 kW"` or
+//     `"450 W"`); the bridge formats them at entity-change time per the
+//     display-mode logic so the per-frame Slint render does no string
+//     allocation.
+//   * `placement` is a NESTED struct (`PowerFlowTilePlacement`) for 1:1
+//     mapping with `dashboard::schema::Placement` in Rust.
+//
+// Three-state render (per Phase 6 plan acceptance):
+//   * idle (all lanes below threshold)        — text-secondary lane tint, full opacity.
+//   * active (any lane above threshold)        — accent / state-on lane tint, full opacity.
+//   * unavailable (grid entity unreachable)    — state-unavailable tint, reduced opacity (0.5).
+//
+// AnimationBudget integration (TASK-094 acceptance criterion §Per-profile budget):
+//   * Animation framerate is capped at `AnimationBudget.framerate-cap` per
+//     PHASES.md § Performance budgets. A power_flow_tile with all 7
+//     standard lanes active counts as min(7, max_simultaneous_animations)
+//     animations; the Phase 6 baseline emits no flowing-particle animation
+//     (deferred), so the tile contributes zero to `AnimationBudget.active-count`.
+//   * Press feedback is inherited from CardBase. The active-count gate is a
+//     global concern (see card_base.slint).
+
+import { Theme } from "theme.slint";
+import { CardBase } from "card_base.slint";
+
+// Computed grid placement, mirrors `dashboard::schema::Placement` in Rust.
+// Re-declared per tile file for self-documentation; identical to
+// `LightTilePlacement` / `SensorTilePlacement` / `EntityTilePlacement` /
+// `CoverTilePlacement` / `FanTilePlacement` / `LockTilePlacement` /
+// `AlarmTilePlacement` / `HistoryGraphTilePlacement` /
+// `CameraTilePlacement` / `ClimateTilePlacement` / `MediaPlayerTilePlacement`.
+export struct PowerFlowTilePlacement {
+    col: int,
+    row: int,
+    span-cols: int,
+    span-rows: int,
+}
+
+// Typed view-model for a power-flow tile.
+//
+// Field semantics:
+//   * name              — user-visible label (typically "Power Flow").
+//   * grid-w            — grid power flow in watts (signed: positive = import,
+//                          negative = export). Always meaningful when the
+//                          grid entity is configured (it is required).
+//   * grid-label        — pre-formatted display string for the grid value
+//                          (e.g. `"1.5 kW"`, `"-200 W"`).
+//   * grid-importing    — derived: true when grid-w > 0 (importing from grid).
+//   * grid-idle         — derived: true when |grid-w| < min_flow_w. Drives
+//                          the dimmed / no-particle visual.
+//   * has-solar         — whether the widget configures a solar entity.
+//   * solar-w           — solar production in watts.
+//   * solar-label       — pre-formatted display string for the solar value.
+//   * solar-idle        — derived: true when solar-w < min_flow_w.
+//   * has-battery       — whether the widget configures a battery entity.
+//   * battery-w         — battery flow in watts (signed: positive = charging,
+//                          negative = discharging).
+//   * battery-label     — pre-formatted display string for the battery value.
+//   * battery-charging  — derived: true when battery-w > 0.
+//   * battery-idle      — derived: true when |battery-w| < min_flow_w.
+//   * has-battery-pct   — whether the widget configures a battery_soc_entity.
+//   * battery-pct       — battery state-of-charge in 0..=100.
+//   * has-home          — whether the widget configures a home entity.
+//   * home-w            — home consumption in watts.
+//   * home-label        — pre-formatted display string for the home value.
+//   * home-idle         — derived: true when home-w < min_flow_w.
+//   * is-available      — false when the grid entity is unavailable / unknown;
+//                          drives the unavailable visual variant.
+//   * icon-id           — design-token id (typically `mdi:lightning-bolt-circle`).
+//   * icon              — resolved Slint image written by the bridge.
+//   * preferred-columns / preferred-rows — author intent from YAML.
+//   * placement         — packed grid coordinates and span. Static this phase.
+//   * pending           — true while an `OptimisticEntry` exists for any of
+//                          the configured power-flow entities.
+export struct PowerFlowTileVM {
+    name: string,
+    grid-w: float,
+    grid-label: string,
+    grid-importing: bool,
+    grid-idle: bool,
+    has-solar: bool,
+    solar-w: float,
+    solar-label: string,
+    solar-idle: bool,
+    has-battery: bool,
+    battery-w: float,
+    battery-label: string,
+    battery-charging: bool,
+    battery-idle: bool,
+    has-battery-pct: bool,
+    battery-pct: float,
+    has-home: bool,
+    home-w: float,
+    home-label: string,
+    home-idle: bool,
+    is-available: bool,
+    icon-id: string,
+    icon: image,
+    preferred-columns: int,
+    preferred-rows: int,
+    placement: PowerFlowTilePlacement,
+    pending: bool,
+}
+
+// PowerFlowTile — wraps CardBase with the power-flow content layout.
+//
+// Press feedback and gesture detection both live on CardBase (TASK-060):
+// the single TouchArea inside CardBase captures pointer events for the
+// whole tile. Tile-level TouchAreas were removed to avoid double-capture
+// (Risk #4).
+//
+// Layout: 4-row vertical stack (header, grid lane, optional solar/battery
+// lanes, home lane). Lanes branch by visibility — covers the canonical
+// 4-node power-flow graph (Solar → Grid ↔ Home ← Battery) flattened into
+// a vertical list for legibility on a 2x2 / 4x3 grid cell. The full
+// per-particle SVG animation is deferred to a follow-up.
+//
+// Animation discipline (TASK-094 acceptance §Per-profile budget):
+//   * Per-frame work is read-only — there are no `animation-tick()`
+//     bindings in this tile (the Phase 6 baseline emits no flowing-
+//     particle animation). Future per-lane particle animation will be
+//     gated by `AnimationBudget.at-capacity` so the tile gracefully
+//     degrades when the global animation budget is exhausted.
+//   * Animation framerate is capped at `AnimationBudget.framerate-cap`
+//     per PHASES.md § Performance budgets.
+export component PowerFlowTile inherits Rectangle {
+    in property <PowerFlowTileVM> view-model;
+
+    // Resolved icon tint. Branches on availability first, then on whether
+    // any lane is non-idle. No inline hex literals; every branch picks a
+    // token from `Theme`.
+    property <color> icon-color:
+        !view-model.is-available ? Theme.state-unavailable
+        : (!view-model.grid-idle || (view-model.has-solar && !view-model.solar-idle)
+            || (view-model.has-battery && !view-model.battery-idle)
+            || (view-model.has-home && !view-model.home-idle))
+          ? Theme.accent
+        : Theme.text-secondary;
+
+    // Per-lane resolved colours. Each branches on:
+    //   1. unavailable (grid entity down) → state-unavailable
+    //   2. idle (below threshold)         → text-secondary (subdued)
+    //   3. import / charging (positive)   → state-on (warm amber)
+    //   4. export / discharging (negative)→ accent (bright)
+    //
+    // Solar / home lanes never have a sign convention — they render in
+    // accent when active, text-secondary when idle.
+    property <color> grid-color:
+        !view-model.is-available ? Theme.state-unavailable
+        : view-model.grid-idle ? Theme.text-secondary
+        : view-model.grid-importing ? Theme.state-on
+        : Theme.accent;
+
+    property <color> solar-color:
+        !view-model.is-available ? Theme.state-unavailable
+        : view-model.solar-idle ? Theme.text-secondary
+        : Theme.state-on;
+
+    property <color> battery-color:
+        !view-model.is-available ? Theme.state-unavailable
+        : view-model.battery-idle ? Theme.text-secondary
+        : view-model.battery-charging ? Theme.state-on
+        : Theme.accent;
+
+    property <color> home-color:
+        !view-model.is-available ? Theme.state-unavailable
+        : view-model.home-idle ? Theme.text-secondary
+        : Theme.accent;
+
+    // Reduce opacity for the unavailable visual state (Phase 6 plan
+    // three-state render acceptance). Idle and active render at full
+    // opacity; only unavailable dims.
+    opacity: !view-model.is-available ? 0.5 : 1.0;
+
+    base := CardBase {
+        // Bind the per-tile pending-spinner gate (TASK-067). The Rust
+        // bridge writes `view-model.pending` from
+        // `LiveStore::pending_for_widget` (TASK-064 read API) on each
+        // refresh; this property feeds the spinner overlay declared on
+        // CardBase. Slint MUST read only this property — there is no
+        // parallel pending-state path (Risk #14).
+        pending: view-model.pending;
+
+        VerticalLayout {
+            spacing: Theme.space-2;
+
+            // Header row: icon + tile name. Icon is tinted with the
+            // resolved icon-color so a glance at the tile reveals
+            // overall flow status.
+            HorizontalLayout {
+                spacing: Theme.space-2;
+                alignment: start;
+
+                Image {
+                    source: view-model.icon;
+                    width: Theme.font-xl;
+                    height: Theme.font-xl;
+                    colorize: icon-color;
+                }
+
+                Text {
+                    text: view-model.name;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-medium;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Grid lane — always rendered; the grid_entity is required
+            // by the schema (`PowerFlowGridEntityNotPower` validator
+            // rejects a missing/non-power grid entity at YAML parse
+            // time). The directional indicator is "↓" for import and
+            // "↑" for export, mirroring the `power-flow-card-plus`
+            // Lovelace convention.
+            HorizontalLayout {
+                spacing: Theme.space-2;
+                alignment: stretch;
+
+                // Idle lanes dim to 30% opacity per the TASK-094
+                // acceptance criterion §Idle-lane behaviour.
+                opacity: view-model.grid-idle ? 0.3 : 1.0;
+
+                Text {
+                    text: "grid";
+                    color: Theme.text-secondary;
+                    font-size: Theme.font-sm;
+                    font-weight: Theme.font-weight-regular;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: !view-model.is-available
+                        ? "—"
+                        : view-model.grid-importing ? "↓" : "↑";
+                    color: grid-color;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-bold;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: view-model.grid-label;
+                    color: grid-color;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-bold;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                }
+            }
+
+            // Solar lane — rendered only when the widget configures a
+            // solar entity. The arrow is always "↓" (solar generation
+            // flows toward the home / grid).
+            if view-model.has-solar : HorizontalLayout {
+                spacing: Theme.space-2;
+                alignment: stretch;
+
+                opacity: view-model.solar-idle ? 0.3 : 1.0;
+
+                Text {
+                    text: "solar";
+                    color: Theme.text-secondary;
+                    font-size: Theme.font-sm;
+                    font-weight: Theme.font-weight-regular;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: "↓";
+                    color: solar-color;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-bold;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: view-model.solar-label;
+                    color: solar-color;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-bold;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                }
+            }
+
+            // Battery lane — rendered only when the widget configures a
+            // battery entity. Charging shows "↓" (energy into battery);
+            // discharging shows "↑" (energy out to home/grid).
+            if view-model.has-battery : HorizontalLayout {
+                spacing: Theme.space-2;
+                alignment: stretch;
+
+                opacity: view-model.battery-idle ? 0.3 : 1.0;
+
+                Text {
+                    text: "battery";
+                    color: Theme.text-secondary;
+                    font-size: Theme.font-sm;
+                    font-weight: Theme.font-weight-regular;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: view-model.battery-charging ? "↓" : "↑";
+                    color: battery-color;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-bold;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: view-model.battery-label;
+                    color: battery-color;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-bold;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                }
+            }
+
+            // Battery state-of-charge label — rendered only when the
+            // widget configures a `battery_soc_entity`. Independent
+            // visibility gate from `has-battery`: the
+            // `PowerFlowBatteryWithoutSoC` validator emits a Warning
+            // (not an Error) when battery is configured without SoC, so
+            // a misconfigured widget can still render the battery flow
+            // lane without the SoC label.
+            if view-model.has-battery-pct : Text {
+                text: "soc " + round(view-model.battery-pct) + "%";
+                color: Theme.text-secondary;
+                font-size: Theme.font-sm;
+                font-weight: Theme.font-weight-regular;
+                horizontal-alignment: right;
+            }
+
+            // Home lane — rendered only when the widget configures a
+            // home entity. The arrow is always "↑" (energy flowing
+            // INTO the home).
+            if view-model.has-home : HorizontalLayout {
+                spacing: Theme.space-2;
+                alignment: stretch;
+
+                opacity: view-model.home-idle ? 0.3 : 1.0;
+
+                Text {
+                    text: "home";
+                    color: Theme.text-secondary;
+                    font-size: Theme.font-sm;
+                    font-weight: Theme.font-weight-regular;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: "↑";
+                    color: home-color;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-bold;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: view-model.home-label;
+                    color: home-color;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-bold;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                }
+            }
+        }
+    }
+}

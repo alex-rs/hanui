@@ -496,4 +496,42 @@ fn main() {
         "cargo:rustc-env=HANUI_MEDIA_PLAYER_TILE_INCLUDE={}",
         media_player_tile_output.display()
     );
+
+    // PowerFlowTile component (TASK-094) — Phase 6 Wave 6d power-flow tile.
+    //
+    // Compiles `ui/slint/power_flow_tile.slint` to a separate output file so
+    // the bridge's `power_flow_tile_slint` submodule can reference the
+    // generated `PowerFlowTile`, `PowerFlowTileVM`, and
+    // `PowerFlowTilePlacement` types without pulling in the full production
+    // `MainWindow` symbol set. Mirrors the pattern used by `cover_tile.slint`
+    // (TASK-102), `fan_tile.slint` (TASK-103), `lock_tile.slint` (TASK-104),
+    // `alarm_panel_tile.slint` (TASK-105), `history_graph_tile.slint`
+    // (TASK-106), `camera_snapshot_tile.slint` (TASK-107),
+    // `climate_tile.slint` (TASK-108), and `media_player_tile.slint`
+    // (TASK-109).
+    //
+    // This compile puts `power_flow_tile.slint` in the build graph: `cargo
+    // build` fails if the component has a syntax or type error (satisfying
+    // the "Slint component compile gate" acceptance criterion in TASK-094).
+    //
+    // The generated types are accessible to `src/ui/bridge.rs` via
+    // `include!(env!("HANUI_POWER_FLOW_TILE_INCLUDE"))` inside the
+    // `power_flow_tile_slint` submodule.
+    let power_flow_tile_input = manifest_dir.join("ui/slint/power_flow_tile.slint");
+    let power_flow_tile_output = out_dir.join("power_flow_tile.rs");
+
+    let power_flow_tile_deps = slint_build::compile_with_output_path(
+        &power_flow_tile_input,
+        &power_flow_tile_output,
+        slint_build::CompilerConfiguration::default(),
+    )
+    .expect("compile ui/slint/power_flow_tile.slint with slint-build");
+
+    for dep in power_flow_tile_deps {
+        println!("cargo:rerun-if-changed={}", dep.display());
+    }
+    println!(
+        "cargo:rustc-env=HANUI_POWER_FLOW_TILE_INCLUDE={}",
+        power_flow_tile_output.display()
+    );
 }

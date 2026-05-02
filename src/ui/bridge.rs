@@ -600,6 +600,84 @@ pub struct MediaPlayerTileVM {
 }
 
 // ---------------------------------------------------------------------------
+// PowerFlowTileVM (TASK-094)
+// ---------------------------------------------------------------------------
+
+/// View-model for a `PowerFlowTile` widget, mirroring the Slint
+/// `PowerFlowTileVM` struct in `ui/slint/power_flow_tile.slint`.
+///
+/// Built by [`compute_power_flow_tile_vm`], which threads through
+/// [`crate::ui::power_flow::PowerFlowVM::read_power_watts`] and
+/// [`crate::ui::power_flow::PowerFlowVM::read_battery_pct`] so the
+/// per-frame derived numeric values are exercised on every state change.
+///
+/// The `icon: image` Slint field is absent here; it is written by the
+/// Slint bridge during property wiring (the same pattern used for every
+/// other per-kind tile VM).
+///
+/// Note (TASK-094 scope): the `MainWindow` Slint component does not yet
+/// declare a `power-flow-tiles` array property —
+/// `ui/slint/main_window.slint` is in this ticket's `must_not_touch`
+/// list. `compute_power_flow_tile_vm` is invoked indirectly via
+/// [`build_tiles`] so power-flow widgets exercise the
+/// `PowerFlowVM::read_power_watts` path on every state change, and the
+/// result flows into the existing fallback `EntityTileVM` render with
+/// the raw HA state string. A subsequent ticket will amend
+/// `main_window.slint` to render a per-kind `PowerFlowTile` model
+/// directly.
+///
+/// `pending` is the per-tile spinner gate added in TASK-067; see
+/// [`LightTileVM`] for the full contract.
+///
+/// # No `Vec` fields (lesson from TASK-103 / TASK-105 / TASK-107 / TASK-108 /
+/// TASK-109)
+///
+/// Like `PowerFlowVM`, this struct deliberately carries no `Vec` fields. The
+/// per-frame data surface is a fixed set of optional scalars (grid /
+/// solar / battery / battery_soc / home). The auxiliary entity ids
+/// configured in `WidgetOptions::PowerFlow` are read from the dashboard
+/// config at modal-open time by [`crate::ui::power_flow::PowerFlowBody`],
+/// NOT stored on the per-frame tile VM.
+///
+/// # Float fields and `Eq`
+///
+/// `grid_w` / `solar_w` / `battery_w` / `battery_pct` / `home_w` are
+/// `Option<f32>` — `f32: !Eq`, so this struct is `PartialEq` but not
+/// `Eq` (matches `ClimateTileVM` / `MediaPlayerTileVM`). Bridge equality
+/// checks rely on `PartialEq`; no consumer of this VM stores it in a
+/// hash-keyed container.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PowerFlowTileVM {
+    /// User-visible label.
+    pub name: String,
+    /// Grid power flow in watts; positive = importing, negative = exporting.
+    /// `None` when the grid entity is unavailable / unknown.
+    pub grid_w: Option<f32>,
+    /// Solar production in watts (≥ 0). `None` when no solar entity is
+    /// configured or the entity is unavailable.
+    pub solar_w: Option<f32>,
+    /// Battery flow in watts; positive = charging, negative = discharging.
+    /// `None` when no battery entity is configured.
+    pub battery_w: Option<f32>,
+    /// Battery state-of-charge in 0..=100. `None` when no
+    /// `battery_soc_entity` is configured.
+    pub battery_pct: Option<f32>,
+    /// Home consumption in watts (≥ 0). `None` when no home entity is
+    /// configured.
+    pub home_w: Option<f32>,
+    /// Design-token icon id (typically `mdi:lightning-bolt-circle`).
+    pub icon_id: String,
+    /// Author-supplied preferred column span.
+    pub preferred_columns: i32,
+    /// Author-supplied preferred row span.
+    pub preferred_rows: i32,
+    /// Computed grid placement assigned by the packer.
+    pub placement: TilePlacement,
+    /// Per-tile spinner gate (TASK-067). Default `false`.
+    pub pending: bool,
+}
+
+// ---------------------------------------------------------------------------
 // TileVM enum
 // ---------------------------------------------------------------------------
 
@@ -1126,12 +1204,23 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                                     pending: false,
                                 })
                             }
-                            // Phase 6 adds PowerFlow. Until a dedicated
-                            // Slint tile component exists, this is rendered
-                            // as EntityTileVM — the generic entity tile
-                            // covers the state display until per-kind tiles
-                            // ship.
-                            WidgetKind::EntityTile | WidgetKind::PowerFlow => {
+                            // TASK-094: power-flow widgets thread through
+                            // `PowerFlowVM::read_power_watts` so the per-frame
+                            // numeric parse (handles the `unavailable` /
+                            // `unknown` sentinels and the integer-vs-float
+                            // shape variants) is exercised on every state
+                            // change. Until `main_window.slint` grows a
+                            // `power-flow-tiles` array property (subsequent
+                            // ticket), the power-flow widget renders as the
+                            // generic `EntityTileVM` fallback — the canonical
+                            // HA state string is forwarded verbatim. The
+                            // typed view-model is exposed via
+                            // `compute_power_flow_tile_vm` for the per-kind
+                            // rendering path that follows when
+                            // `main_window.slint` gains the array property.
+                            WidgetKind::PowerFlow => {
+                                let _grid_w =
+                                    crate::ui::power_flow::PowerFlowVM::read_power_watts(&entity);
                                 TileVM::Entity(EntityTileVM {
                                     name,
                                     state,
@@ -1142,6 +1231,15 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                                     pending: false,
                                 })
                             }
+                            WidgetKind::EntityTile => TileVM::Entity(EntityTileVM {
+                                name,
+                                state,
+                                icon_id,
+                                preferred_columns,
+                                preferred_rows,
+                                placement,
+                                pending: false,
+                            }),
                         }
                     }
 
@@ -2675,6 +2773,37 @@ pub use media_player_tile_slint::{
 };
 
 // ---------------------------------------------------------------------------
+// PowerFlowTile slint submodule (TASK-094)
+// ---------------------------------------------------------------------------
+//
+// `ui/slint/power_flow_tile.slint` is compiled by `build.rs` (TASK-094) to
+// a separate generated Rust file exposed via the
+// `HANUI_POWER_FLOW_TILE_INCLUDE` env var — the same pattern as
+// `cover_tile.slint` (TASK-102), `fan_tile.slint` (TASK-103),
+// `lock_tile.slint` (TASK-104), `alarm_panel_tile.slint` (TASK-105),
+// `history_graph_tile.slint` (TASK-106), `camera_snapshot_tile.slint`
+// (TASK-107), `climate_tile.slint` (TASK-108), and `media_player_tile.slint`
+// (TASK-109). This module picks it up via `include!` so the generated
+// `PowerFlowTile`, `PowerFlowTileVM`, and `PowerFlowTilePlacement` types
+// are available for the `compute_power_flow_tile_vm` projection function
+// below without polluting the production `slint_ui` namespace (which would
+// clash with the same-named Rust struct declared earlier in this file).
+//
+// Future work: once `main_window.slint` grows a `power-flow-tiles` array
+// property, this module's types will be re-exported through the production
+// `slint_ui` namespace instead. The separate compile is the minimal-blast
+// path that satisfies TASK-094's "Slint compile gate" acceptance criterion
+// (power_flow_tile.slint must be in the build graph) without amending any
+// of the protected `must_not_touch` Slint files.
+pub mod power_flow_tile_slint {
+    include!(env!("HANUI_POWER_FLOW_TILE_INCLUDE"));
+}
+
+pub use power_flow_tile_slint::{
+    PowerFlowTile, PowerFlowTilePlacement as SlintPowerFlowTilePlacement,
+};
+
+// ---------------------------------------------------------------------------
 // compute_cover_tile_vm (TASK-102)
 // ---------------------------------------------------------------------------
 
@@ -3261,6 +3390,108 @@ pub fn compute_media_player_tile_vm(
         media_title: media_player_vm.media_title,
         artist: media_player_vm.artist,
         volume_level: media_player_vm.volume_level,
+        icon_id,
+        preferred_columns,
+        preferred_rows,
+        placement,
+        pending: false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// compute_power_flow_tile_vm (TASK-094)
+// ---------------------------------------------------------------------------
+
+/// Pre-resolved auxiliary entity readings for a power-flow widget.
+///
+/// The grid entity is the **primary** entity for the widget and is passed
+/// to [`compute_power_flow_tile_vm`] separately as a live `Entity`. The
+/// auxiliary readings (`solar_w` / `battery_w` / `battery_pct` /
+/// `home_w`) are looked up by the caller against the live store and
+/// passed as a single struct so the function signature stays under the
+/// 7-argument lint cap (clippy `too_many_arguments`).
+///
+/// Each reading is `Option<f32>`: `None` means the auxiliary entity is
+/// either unconfigured or unavailable; `Some(f)` means a parsed numeric
+/// value (which may legitimately be `0.0` for an idle lane).
+///
+/// # No `Vec` fields
+///
+/// Like [`PowerFlowTileVM`], this struct deliberately carries no `Vec`
+/// fields — every auxiliary entity slot is a fixed scalar.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PowerFlowAuxiliaryReadings {
+    /// Solar production in watts (≥ 0). `None` when no solar entity is
+    /// configured or the entity is unavailable.
+    pub solar_w: Option<f32>,
+    /// Battery flow in watts; positive = charging, negative = discharging.
+    /// `None` when no battery entity is configured.
+    pub battery_w: Option<f32>,
+    /// Battery state-of-charge in 0..=100. `None` when no
+    /// `battery_soc_entity` is configured.
+    pub battery_pct: Option<f32>,
+    /// Home consumption in watts (≥ 0). `None` when no home entity is
+    /// configured.
+    pub home_w: Option<f32>,
+}
+
+/// Project a typed Rust [`PowerFlowTileVM`] from a primary (grid) entity
+/// snapshot plus optional auxiliary readings, threading through
+/// [`crate::ui::power_flow::PowerFlowVM::read_power_watts`] /
+/// [`crate::ui::power_flow::PowerFlowVM::read_battery_pct`] for the
+/// per-frame parsed numeric values.
+///
+/// # Hot-path discipline
+///
+/// Called at entity-change time (NOT per render). The result is a typed
+/// `PowerFlowTileVM` Rust struct; the further `String -> SharedString` /
+/// `icon_id -> Image` conversions and the optional-`f32` →
+/// has-flag-plus-float Slint shape projection are deferred to a follow-up
+/// ticket once `main_window.slint` declares the `power-flow-tiles` array
+/// property.
+///
+/// # Auxiliary readings
+///
+/// The grid entity is the **primary** entity for the widget — its state
+/// is forwarded as `grid_w`. Auxiliary readings are bundled in
+/// [`PowerFlowAuxiliaryReadings`] so the signature stays under the
+/// clippy `too_many_arguments` cap.
+///
+/// # No `Vec` allocation on the per-frame path
+///
+/// Per the TASK-103 / TASK-105 / TASK-107 / TASK-108 / TASK-109 audit
+/// lesson: this projection writes only optional scalar fields. The
+/// auxiliary entity ids configured in `WidgetOptions::PowerFlow` live on
+/// the dashboard config and are read at modal-open / dispatch time —
+/// they do NOT travel through this VM.
+///
+/// # Naming
+///
+/// Returns the Rust [`PowerFlowTileVM`] (defined earlier in this file).
+/// The Slint-shape projection (`SlintPowerFlowTileVM` from
+/// [`power_flow_tile_slint::PowerFlowTileVM`]) is not built here because
+/// there is no `power-flow-tiles` `MainWindow` property to write into yet
+/// — that shape conversion lives next to the `set_power_flow_tiles` call
+/// site once it exists.
+#[must_use]
+pub fn compute_power_flow_tile_vm(
+    name: String,
+    icon_id: String,
+    preferred_columns: i32,
+    preferred_rows: i32,
+    placement: TilePlacement,
+    grid_entity: &crate::ha::entity::Entity,
+    auxiliary: PowerFlowAuxiliaryReadings,
+) -> PowerFlowTileVM {
+    let grid_w = crate::ui::power_flow::PowerFlowVM::read_power_watts(grid_entity);
+
+    PowerFlowTileVM {
+        name,
+        grid_w,
+        solar_w: auxiliary.solar_w,
+        battery_w: auxiliary.battery_w,
+        battery_pct: auxiliary.battery_pct,
+        home_w: auxiliary.home_w,
         icon_id,
         preferred_columns,
         preferred_rows,
@@ -9242,6 +9473,181 @@ mod tests {
             Some(0.0),
             "negative volume must clamp to 0.0"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_power_flow_tile_vm + build_tiles PowerFlow arm (TASK-094)
+    // -----------------------------------------------------------------------
+
+    /// `build_tiles` dispatches `WidgetKind::PowerFlow` through the
+    /// `PowerFlowVM::read_power_watts` path and produces an `EntityTileVM`
+    /// fallback (no `power-flow-tiles` array property exists yet on
+    /// `main_window.slint`). The state string is forwarded verbatim.
+    #[test]
+    fn build_tiles_power_flow_widget_uses_state() {
+        use crate::ha::store::MemoryStore;
+
+        let store = MemoryStore::load(vec![make_test_entity("sensor.grid_power", "1500")])
+            .expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("sensor.grid_power", WidgetKind::PowerFlow);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1, "one widget → one tile");
+        match &tiles[0] {
+            TileVM::Entity(vm) => {
+                assert_eq!(vm.state, "1500", "power-flow state forwarded verbatim");
+            }
+            other => panic!("expected EntityTileVM (PowerFlow fallback), got {other:?}"),
+        }
+    }
+
+    /// `build_tiles` for a `WidgetKind::PowerFlow` widget routes a
+    /// negative-export grid reading through the bridge without altering
+    /// the state string — the directional indicator is driven downstream
+    /// by `PowerFlowVM::read_power_watts`.
+    #[test]
+    fn build_tiles_power_flow_widget_export_state_passes_through() {
+        use crate::ha::store::MemoryStore;
+
+        let store = MemoryStore::load(vec![make_test_entity("sensor.grid_power", "-200.5")])
+            .expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("sensor.grid_power", WidgetKind::PowerFlow);
+        let tiles = build_tiles(&store, &dashboard);
+        match &tiles[0] {
+            TileVM::Entity(vm) => assert_eq!(vm.state, "-200.5"),
+            other => panic!("expected EntityTileVM (PowerFlow fallback), got {other:?}"),
+        }
+    }
+
+    /// `build_tiles` for a `WidgetKind::PowerFlow` widget routes an
+    /// `unavailable` entity through the bridge without altering the state
+    /// string — `PowerFlowVM::read_power_watts` returns `None` for the
+    /// sentinel and the unavailable visual is driven downstream.
+    #[test]
+    fn build_tiles_power_flow_widget_unavailable_state_passes_through() {
+        use crate::ha::store::MemoryStore;
+
+        let store = MemoryStore::load(vec![make_test_entity("sensor.grid_power", "unavailable")])
+            .expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("sensor.grid_power", WidgetKind::PowerFlow);
+        let tiles = build_tiles(&store, &dashboard);
+        match &tiles[0] {
+            TileVM::Entity(vm) => assert_eq!(vm.state, "unavailable"),
+            other => panic!("expected EntityTileVM (PowerFlow fallback), got {other:?}"),
+        }
+    }
+
+    /// `compute_power_flow_tile_vm` for a positive grid reading produces
+    /// the typed Rust `PowerFlowTileVM` with `grid_w=Some(1234.5)`.
+    #[test]
+    fn compute_power_flow_tile_vm_grid_import() {
+        let entity = make_test_entity("sensor.grid_power", "1234.5");
+        let vm = compute_power_flow_tile_vm(
+            "Power Flow".to_owned(),
+            "mdi:lightning-bolt-circle".to_owned(),
+            2,
+            2,
+            TilePlacement::default_for(2, 2),
+            &entity,
+            PowerFlowAuxiliaryReadings::default(),
+        );
+        assert_eq!(vm.name, "Power Flow");
+        assert_eq!(vm.grid_w, Some(1234.5));
+        assert_eq!(vm.solar_w, None);
+        assert_eq!(vm.battery_w, None);
+        assert_eq!(vm.battery_pct, None);
+        assert_eq!(vm.home_w, None);
+        assert_eq!(vm.icon_id, "mdi:lightning-bolt-circle");
+        assert!(!vm.pending);
+    }
+
+    /// `compute_power_flow_tile_vm` preserves the export sign for a
+    /// negative grid reading.
+    #[test]
+    fn compute_power_flow_tile_vm_grid_export() {
+        let entity = make_test_entity("sensor.grid_power", "-300.0");
+        let vm = compute_power_flow_tile_vm(
+            "Power Flow".to_owned(),
+            "mdi:lightning-bolt-circle".to_owned(),
+            2,
+            2,
+            TilePlacement::default_for(2, 2),
+            &entity,
+            PowerFlowAuxiliaryReadings::default(),
+        );
+        assert_eq!(
+            vm.grid_w,
+            Some(-300.0),
+            "export must preserve negative sign"
+        );
+    }
+
+    /// `compute_power_flow_tile_vm` returns `grid_w=None` for an
+    /// `unavailable` grid entity (matches `PowerFlowVM::read_power_watts`
+    /// contract for the sentinel).
+    #[test]
+    fn compute_power_flow_tile_vm_grid_unavailable() {
+        let entity = make_test_entity("sensor.grid_power", "unavailable");
+        let vm = compute_power_flow_tile_vm(
+            "Power Flow".to_owned(),
+            "mdi:lightning-bolt-circle".to_owned(),
+            2,
+            2,
+            TilePlacement::default_for(2, 2),
+            &entity,
+            PowerFlowAuxiliaryReadings::default(),
+        );
+        assert_eq!(vm.grid_w, None, "unavailable grid must produce grid_w=None");
+    }
+
+    /// `compute_power_flow_tile_vm` forwards all supplied auxiliary readings
+    /// (solar / battery / battery_pct / home) onto the VM verbatim.
+    #[test]
+    fn compute_power_flow_tile_vm_threads_all_auxiliary_readings() {
+        let entity = make_test_entity("sensor.grid_power", "0");
+        let vm = compute_power_flow_tile_vm(
+            "Power Flow".to_owned(),
+            "mdi:lightning-bolt-circle".to_owned(),
+            2,
+            2,
+            TilePlacement::default_for(2, 2),
+            &entity,
+            PowerFlowAuxiliaryReadings {
+                solar_w: Some(2000.0),
+                battery_w: Some(-500.0),
+                battery_pct: Some(75.0),
+                home_w: Some(900.0),
+            },
+        );
+        assert_eq!(vm.grid_w, Some(0.0));
+        assert_eq!(vm.solar_w, Some(2000.0));
+        assert_eq!(
+            vm.battery_w,
+            Some(-500.0),
+            "battery discharge sign preserved"
+        );
+        assert_eq!(vm.battery_pct, Some(75.0));
+        assert_eq!(vm.home_w, Some(900.0));
+    }
+
+    /// `compute_power_flow_tile_vm` with an integer-shaped grid state
+    /// still parses via the `f64`/`i64` round-trip in
+    /// `PowerFlowVM::read_power_watts`.
+    #[test]
+    fn compute_power_flow_tile_vm_grid_integer_value() {
+        let entity = make_test_entity("sensor.grid_power", "500");
+        let vm = compute_power_flow_tile_vm(
+            "Power Flow".to_owned(),
+            "mdi:lightning-bolt-circle".to_owned(),
+            2,
+            2,
+            TilePlacement::default_for(2, 2),
+            &entity,
+            PowerFlowAuxiliaryReadings::default(),
+        );
+        assert_eq!(vm.grid_w, Some(500.0));
     }
 
     // -----------------------------------------------------------------------
