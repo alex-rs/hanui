@@ -1178,8 +1178,9 @@ mod tests {
         assert_eq!(store_entity_count(&empty), 0);
 
         let store = ha::fixture::load("examples/ha-states.json").expect("fixture load");
-        // The canonical fixture has 4 entities.
-        assert_eq!(store_entity_count(&store), 4);
+        // The canonical fixture covers every Phase 6 widget kind and carries
+        // 18 entities. Bump this constant when the fixture grows again.
+        assert_eq!(store_entity_count(&store), 18);
     }
 
     /// Phase 1 regression guard: the canonical `--fixture examples/ha-states.json`
