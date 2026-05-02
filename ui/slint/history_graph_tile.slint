@@ -1,0 +1,211 @@
+// history_graph_tile.slint — Phase 6 Wave 2 (TASK-106) tile for `type: history`.
+//
+// Renders a Home Assistant entity's recent history as a static polyline.
+// Per `locked_decisions.history_render_path`:
+//   * The trace is a Slint `Path` element rendered with `MoveTo` + `LineTo`
+//     commands. Slint exposes two surface forms for Path commands: a model-
+//     driven `MoveTo` / `LineTo` child set (NOT supported with `for`/`in`
+//     yet — see Slint upstream issue tracker) and a string-encoded `commands` property using
+//     the SVG mini-language (`M x y L x y L ...`). We use the string form
+//     because the model-driven form does not currently support iteration
+//     over a Rust-supplied `[Point]` model.
+//   * The Rust bridge composes the `commands` string from the LTTB-
+//     downsampled `HistoryWindow` produced by
+//     `src/ha/history.rs::HistoryWindow::from_points`. Composition runs at
+//     fetch time (NOT per frame) per `locked_decisions.history_render_path`,
+//     and the bridge throttles pushes to at most once per 60s via
+//     `HistoryThrottle`.
+//   * No animation — static polyline; refreshed at most once per 60s
+//     (debounced bridge-side per `HistoryThrottle`).
+//
+// View-model contract (see `src/ui/bridge.rs::HistoryGraphTileVM`):
+//   * The struct shape is mirrored 1:1 in Rust by the bridge. The Slint
+//     compiler generates a Rust struct named `HistoryGraphTileVM` whose
+//     fields match these names with kebab→snake conversion.
+//   * `state` is the entity's current HA state string, displayed verbatim
+//     above the graph (e.g. `"23.4"`, `"on"`, `"unavailable"`).
+//   * `path-commands` is the SVG-style mini-language string consumed by the
+//     `Path` element (`M x y L x y L ...`). Coordinates are in 0..=1 unit-
+//     square space; the Slint Path's `viewbox-width` / `viewbox-height` are
+//     1.0 so the polyline scales with `graph-area.width` /
+//     `graph-area.height`. An empty string (no points) renders nothing.
+//   * `change-count` is the number of plotted points; surfaced as a
+//     read-only label so users see "N samples" at a glance even when the
+//     polyline is dense.
+//   * `is-available` is `false` when the entity is unavailable / unknown;
+//     drives the three-state render (idle / active / unavailable).
+//   * `placement` is a NESTED struct (`HistoryGraphTilePlacement`) for 1:1
+//     mapping with `dashboard::schema::Placement` in Rust.
+//
+// Three-state render (per Phase 6 plan acceptance):
+//   * idle (data loaded, no recent change)        — text-secondary stroke, full opacity.
+//   * active (recent data point, change-count>0)  — accent stroke, full opacity.
+//   * unavailable                                 — state-unavailable stroke, reduced opacity (0.5).
+//
+// All colors come from theme tokens; no inline hex literals (CI hex-color
+// gate, `.github/workflows/ci.yml` § Gate 1).
+//
+// AnimationBudget integration:
+//   * No tile-internal animation; the polyline is static. Press feedback
+//     remains inherited from CardBase. Refresh debouncing is bridge-side.
+
+import { Theme } from "theme.slint";
+import { CardBase } from "card_base.slint";
+
+// Computed grid placement, mirrors `dashboard::schema::Placement` in Rust.
+// Re-declared per tile file for self-documentation; identical to other tile
+// placement structs.
+export struct HistoryGraphTilePlacement {
+    col: int,
+    row: int,
+    span-cols: int,
+    span-rows: int,
+}
+
+// Typed view-model for a history graph tile.
+//
+// Field semantics:
+//   * name           — user-visible entity label (friendly_name fallback to id).
+//   * state          — current HA state string forwarded verbatim.
+//   * change-count   — number of points encoded into `path-commands` (i32;
+//                      Slint has no usize). Drives the active/idle render
+//                      branch and the "N samples" footer.
+//   * is-available   — false when state is `"unavailable"` or `"unknown"`.
+//   * icon-id        — design-token id (e.g. "mdi:chart-line"); resolved
+//                      to bytes by the asset layer (TASK-010).
+//   * icon           — resolved Slint image written by the bridge (TASK-015).
+//   * preferred-columns / preferred-rows — author intent from YAML, used
+//                      by the grid packer (TASK-014).
+//   * placement      — packed grid coordinates and span. Static this phase.
+//   * pending        — true while an OptimisticEntry exists for this tile's
+//                      entity. Drives the per-tile spinner overlay on
+//                      CardBase (TASK-067), bound from
+//                      `LiveStore::pending_for_widget(widget_id)`.
+//   * path-commands  — SVG mini-language string ("M x y L x y L ..."). The
+//                      Rust bridge composes it from the downsampled history
+//                      window before pushing.
+export struct HistoryGraphTileVM {
+    name: string,
+    state: string,
+    change-count: int,
+    is-available: bool,
+    icon-id: string,
+    icon: image,
+    preferred-columns: int,
+    preferred-rows: int,
+    placement: HistoryGraphTilePlacement,
+    pending: bool,
+    path-commands: string,
+}
+
+// HistoryGraphTile — wraps CardBase with the history-graph content layout.
+//
+// Press feedback and gesture detection both live on CardBase (TASK-060):
+// the single TouchArea inside CardBase captures pointer events for the
+// whole tile. Tile-level TouchAreas were removed to avoid double-capture
+// (Risk #4).
+export component HistoryGraphTile inherits Rectangle {
+    in property <HistoryGraphTileVM> view-model;
+
+    // Resolved trace colour. Branches on the precomputed `is-available`
+    // boolean for the unavailable colour, then on `change-count > 0` for
+    // the active/idle split. No inline hex literals; every branch picks a
+    // token from `Theme`.
+    property <color> trace-color:
+        !view-model.is-available ? Theme.state-unavailable
+        : view-model.change-count > 0 ? Theme.accent
+        : Theme.text-secondary;
+
+    // Reduce opacity for the unavailable visual state (Phase 6 plan
+    // three-state render acceptance). Idle and active render at full
+    // opacity; only unavailable dims.
+    opacity: !view-model.is-available ? 0.5 : 1.0;
+
+    base := CardBase {
+        // Bind the per-tile pending-spinner gate (TASK-067). The Rust
+        // bridge writes `view-model.pending` from
+        // `LiveStore::pending_for_widget` (TASK-064 read API) on each
+        // refresh; this property feeds the spinner overlay declared on
+        // CardBase. Slint MUST read only this property — there is no
+        // parallel pending-state path (Risk #14).
+        pending: view-model.pending;
+
+        VerticalLayout {
+            spacing: Theme.space-2;
+
+            // Header row: icon + entity name. Icon is tinted with the
+            // resolved trace colour so a glance at the tile reveals
+            // active/idle/unavailable status.
+            HorizontalLayout {
+                spacing: Theme.space-2;
+                alignment: start;
+
+                Image {
+                    source: view-model.icon;
+                    width: Theme.font-xl;
+                    height: Theme.font-xl;
+                    colorize: trace-color;
+                }
+
+                Text {
+                    text: view-model.name;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-medium;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Hero state value. Sensors typically render numeric strings
+            // ("23.4"); booleans render "on"/"off". font-md is the right
+            // hero size — sensor-tile-like font-xxl would push the graph
+            // off the card.
+            Text {
+                text: view-model.state;
+                color: trace-color;
+                font-size: Theme.font-md;
+                font-weight: Theme.font-weight-bold;
+            }
+
+            // Graph area — the Path is positioned inside this Rectangle so
+            // the polyline scales with the card. The surrounding
+            // VerticalLayout reserves the card's remaining height for the
+            // trace; resizing the card resizes the graph area without
+            // re-running LTTB on the Rust side.
+            graph-area := Rectangle {
+                horizontal-stretch: 1;
+                vertical-stretch: 1;
+
+                // Polyline path. The `commands` string property holds an
+                // SVG mini-language polyline ("M x y L x y L ..."). The
+                // viewbox is the unit square; the bridge supplies
+                // coordinates in 0..=1 and Slint scales them to
+                // `graph-area.width` / `graph-area.height` for rendering.
+                // When the model is empty, `path-commands` is the empty
+                // string — Slint renders nothing, which is the correct
+                // no-data behaviour.
+                Path {
+                    stroke: trace-color;
+                    stroke-width: 2px;
+                    fill: transparent;
+                    width: parent.width;
+                    height: parent.height;
+                    viewbox-width: 1.0;
+                    viewbox-height: 1.0;
+                    commands: view-model.path-commands;
+                }
+            }
+
+            // Footer summary: "N samples" so the user knows whether the
+            // tile is showing a dense trace or a single recent point. The
+            // text is in text-secondary (muted) so the polyline remains
+            // the visual focus.
+            Text {
+                text: view-model.change-count + " samples";
+                color: Theme.text-secondary;
+                font-size: Theme.font-xs;
+                font-weight: Theme.font-weight-regular;
+            }
+        }
+    }
+}

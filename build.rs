@@ -349,4 +349,40 @@ fn main() {
         "cargo:rustc-env=HANUI_ALARM_PANEL_TILE_INCLUDE={}",
         alarm_panel_tile_output.display()
     );
+
+    // HistoryGraphTile component (TASK-106) — Phase 6 Wave 2 history-graph tile.
+    //
+    // Compiles `ui/slint/history_graph_tile.slint` to a separate output file so
+    // the bridge's `history_graph_tile_slint` submodule can reference the
+    // generated `HistoryGraphTile`, `HistoryGraphTileVM`, `HistoryPoint`, and
+    // `HistoryGraphTilePlacement` types without pulling in the full production
+    // `MainWindow` symbol set. Mirrors the pattern used by `cover_tile.slint`
+    // (TASK-102), `fan_tile.slint` (TASK-103), `lock_tile.slint` (TASK-104),
+    // and `alarm_panel_tile.slint` (TASK-105).
+    //
+    // This compile puts `history_graph_tile.slint` in the build graph:
+    // `cargo build` fails if the component has a syntax or type error
+    // (satisfying the "Slint component compile gate" acceptance criterion in
+    // TASK-106).
+    //
+    // The generated types are accessible to `src/ui/bridge.rs` via
+    // `include!(env!("HANUI_HISTORY_GRAPH_TILE_INCLUDE"))` inside the
+    // `history_graph_tile_slint` submodule.
+    let history_graph_tile_input = manifest_dir.join("ui/slint/history_graph_tile.slint");
+    let history_graph_tile_output = out_dir.join("history_graph_tile.rs");
+
+    let history_graph_tile_deps = slint_build::compile_with_output_path(
+        &history_graph_tile_input,
+        &history_graph_tile_output,
+        slint_build::CompilerConfiguration::default(),
+    )
+    .expect("compile ui/slint/history_graph_tile.slint with slint-build");
+
+    for dep in history_graph_tile_deps {
+        println!("cargo:rerun-if-changed={}", dep.display());
+    }
+    println!(
+        "cargo:rustc-env=HANUI_HISTORY_GRAPH_TILE_INCLUDE={}",
+        history_graph_tile_output.display()
+    );
 }

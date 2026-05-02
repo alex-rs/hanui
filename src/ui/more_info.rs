@@ -686,15 +686,27 @@ impl MoreInfoBody for MediaPlayerBody {
     }
 }
 
-/// More-info body for `history_graph` / `history` widgets.
+/// More-info body for `history_graph` / `history` widgets (TASK-106).
 ///
-/// Returns the entity's state. Phase 6b (`TASK-106`) will replace this with
-/// the rendered history graph.
+/// Surfaces the entity's current state plus the history-relevant
+/// attributes (`friendly_name`, `unit_of_measurement`, `device_class`)
+/// when the entity reports them. The full polyline render lives in the
+/// Slint tile component (`ui/slint/history_graph_tile.slint`); the
+/// modal body remains row-based so it stays drop-in compatible with the
+/// generic `body-rows` model in the Slint shell.
+///
+/// # Stateless
+///
+/// `HistoryBody` carries no fields; the body queries the live entity at
+/// `render_rows` time. Per `locked_decisions.more_info_modal`, the body
+/// is invoked exactly once per modal-open — so the per-call attribute
+/// reads are not on a hot path.
 #[derive(Debug, Default)]
 pub struct HistoryBody;
 
 impl HistoryBody {
-    /// Construct a [`HistoryBody`].
+    /// Construct a [`HistoryBody`]. Stateless; the constructor exists so
+    /// callers do not depend on `Default`.
     #[must_use]
     pub fn new() -> Self {
         HistoryBody
@@ -703,10 +715,54 @@ impl HistoryBody {
 
 impl MoreInfoBody for HistoryBody {
     fn render_rows(&self, entity: &Entity) -> Vec<ModalRow> {
-        vec![ModalRow {
+        // Capacity of 4 covers the worst case (state + friendly_name +
+        // unit_of_measurement + device_class) without growing.
+        let mut rows = Vec::with_capacity(4);
+
+        // State row — always emitted, matches the per-domain body
+        // contract every other body upholds.
+        rows.push(ModalRow {
             key: "state".to_owned(),
             value: entity.state.as_ref().to_owned(),
-        }]
+        });
+
+        // friendly_name row, only when the entity exposes the attribute.
+        // Routed through `crate::ui::history_graph::read_friendly_name_attribute`
+        // for the canonical typed-accessor path (Gate 2: never names the
+        // JSON crate).
+        if let Some(friendly) = crate::ui::history_graph::read_friendly_name_attribute(entity) {
+            rows.push(ModalRow {
+                key: "friendly_name".to_owned(),
+                value: friendly,
+            });
+        }
+
+        // unit_of_measurement row, only when the entity exposes the
+        // attribute. HA emits this for sensor entities (e.g. `"°C"`,
+        // `"kWh"`); the body forwards the raw string verbatim.
+        if let Some(unit) = crate::ui::history_graph::read_unit_of_measurement_attribute(entity) {
+            rows.push(ModalRow {
+                key: "unit_of_measurement".to_owned(),
+                value: unit,
+            });
+        }
+
+        // device_class row, only when the entity exposes the attribute.
+        // Read inline rather than via a typed accessor because no other
+        // module needs this value — adding a one-call helper to
+        // `history_graph.rs` would be over-abstraction.
+        if let Some(device_class) = entity
+            .attributes
+            .get("device_class")
+            .and_then(|v| v.as_str())
+        {
+            rows.push(ModalRow {
+                key: "device_class".to_owned(),
+                value: device_class.to_owned(),
+            });
+        }
+
+        rows
     }
 }
 
