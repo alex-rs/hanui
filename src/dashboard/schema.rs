@@ -1679,6 +1679,22 @@ views:
     }
 
     #[test]
+    fn dep_index_eq_same_arc_ptr_returns_true() {
+        // Covers the Arc::ptr_eq early-return path in dep_index_structurally_eq.
+        let mut map: HashMap<EntityId, crate::dashboard::visibility::DepBucket> = HashMap::new();
+        map.insert(EntityId::from("light.a"), vec![WidgetId::from("w1")]);
+        let shared_arc = Arc::new(map);
+
+        let mut da = minimal_dashboard();
+        da.dep_index = Arc::clone(&shared_arc);
+        let mut db = minimal_dashboard();
+        db.dep_index = Arc::clone(&shared_arc);
+
+        assert!(Arc::ptr_eq(&da.dep_index, &db.dep_index));
+        assert_eq!(da, db, "same Arc ptr must be equal");
+    }
+
+    #[test]
     fn dep_index_eq_different_map_lengths_returns_false() {
         let mut map_a: HashMap<EntityId, crate::dashboard::visibility::DepBucket> = HashMap::new();
         map_a.insert(EntityId::from("light.a"), vec![WidgetId::from("w1")]);
