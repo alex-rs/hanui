@@ -758,15 +758,35 @@ impl MoreInfoBody for ClimateBody {
     }
 }
 
-/// More-info body for `media_player` entities.
+/// More-info body for `media_player` entities (TASK-109).
 ///
-/// Returns the entity's state. Phase 6b (`TASK-109`) will replace this with a
-/// transport control bar, volume slider, and artwork display.
+/// Renders media-player-specific rows: state (the active playback
+/// state), the current track title and artist (when reported), the
+/// volume level (when reported, formatted as a percentage), and the
+/// optional `source` / `sound_mode` / `media_album_name` HA attributes
+/// (when supported by the integration). The Slint shell already binds
+/// `body-rows` to the modal's row list, so [`MediaPlayerBody`] reuses
+/// the generic rendering path — keeping the trait shape stable per
+/// TASK-098 + TASK-109.
+///
+/// Per the TASK-109 plan (Phase 6 6b): the **transport control bar**
+/// and **volume slider widget** are deferred to Phase 7 (dispatcher
+/// wiring). The Phase 6 body surfaces only the **current** snapshot of
+/// the entity (state, track info, volume value, source / sound_mode);
+/// the interactive controls live with the dispatcher.
+///
+/// # Stateless
+///
+/// `MediaPlayerBody` carries no fields; the body queries the live
+/// entity at `render_rows` time. Per `locked_decisions.more_info_modal`,
+/// the body is invoked exactly once per modal-open — so the per-call
+/// attribute reads are not on a hot path.
 #[derive(Debug, Default)]
 pub struct MediaPlayerBody;
 
 impl MediaPlayerBody {
-    /// Construct a [`MediaPlayerBody`].
+    /// Construct a [`MediaPlayerBody`]. Stateless; the constructor
+    /// exists so callers do not depend on `Default`.
     #[must_use]
     pub fn new() -> Self {
         MediaPlayerBody
@@ -775,10 +795,89 @@ impl MediaPlayerBody {
 
 impl MoreInfoBody for MediaPlayerBody {
     fn render_rows(&self, entity: &Entity) -> Vec<ModalRow> {
-        vec![ModalRow {
+        // Capacity of 7 covers the worst case (state + media_title +
+        // artist + album + volume_level + source + sound_mode) without
+        // growing.
+        let mut rows = Vec::with_capacity(7);
+
+        // State row — always emitted, matches the per-domain body
+        // contract every other body upholds. Carries the canonical
+        // playback state forwarded verbatim.
+        rows.push(ModalRow {
             key: "state".to_owned(),
             value: entity.state.as_ref().to_owned(),
-        }]
+        });
+
+        // Thread the canonical view-model derivation so the modal sees
+        // the same `media_title` / `artist` / `volume_level` values the
+        // tile renders. This keeps tile and modal in lockstep without
+        // duplicating the parsing rules.
+        let vm = crate::ui::media_player::MediaPlayerVM::from_entity(entity);
+
+        // media_title row, only when the entity reports the attribute.
+        // Forwarded verbatim — the user-facing track title is whatever
+        // the integration reports.
+        if let Some(title) = vm.media_title {
+            rows.push(ModalRow {
+                key: "media_title".to_owned(),
+                value: title,
+            });
+        }
+
+        // artist row, only when the entity reports `media_artist`.
+        // Forwarded verbatim.
+        if let Some(artist) = vm.artist {
+            rows.push(ModalRow {
+                key: "artist".to_owned(),
+                value: artist,
+            });
+        }
+
+        // album row, only when the entity reports `media_album_name`.
+        // Some integrations omit album; only surface when present.
+        if let Some(album) = crate::ui::media_player::read_album_attribute(entity) {
+            rows.push(ModalRow {
+                key: "album".to_owned(),
+                value: album,
+            });
+        }
+
+        // volume_level row, only when the entity reports the attribute.
+        // Rendered as a percentage (0–100) for human-readability —
+        // matching the tile's volume label format. The clamping is
+        // already applied by `MediaPlayerVM::from_entity`.
+        if let Some(vol) = vm.volume_level {
+            // Round-half-away-from-zero to match the tile renderer's
+            // `round(...)` behaviour. `f32::round` rounds half away
+            // from zero on stable Rust.
+            let pct = (vol * 100.0).round() as i32;
+            rows.push(ModalRow {
+                key: "volume_level".to_owned(),
+                value: format!("{pct}%"),
+            });
+        }
+
+        // source row, only when the entity reports `source`. Common
+        // values: `"HDMI 1"`, `"Spotify"`, `"Bluetooth"` — forwarded
+        // verbatim because integrations vary.
+        if let Some(source) = crate::ui::media_player::read_source_attribute(entity) {
+            rows.push(ModalRow {
+                key: "source".to_owned(),
+                value: source,
+            });
+        }
+
+        // sound_mode row, only when the entity reports `sound_mode`.
+        // Common values: `"Movie"`, `"Music"`, `"Stereo"` — forwarded
+        // verbatim because integrations vary.
+        if let Some(sound_mode) = crate::ui::media_player::read_sound_mode_attribute(entity) {
+            rows.push(ModalRow {
+                key: "sound_mode".to_owned(),
+                value: sound_mode,
+            });
+        }
+
+        rows
     }
 }
 

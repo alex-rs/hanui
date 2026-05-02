@@ -459,4 +459,41 @@ fn main() {
         "cargo:rustc-env=HANUI_CAMERA_SNAPSHOT_TILE_INCLUDE={}",
         camera_snapshot_tile_output.display()
     );
+
+    // MediaPlayerTile component (TASK-109) — Phase 6 Wave 2 media-player tile.
+    //
+    // Compiles `ui/slint/media_player_tile.slint` to a separate output file so
+    // the bridge's `media_player_tile_slint` submodule can reference the
+    // generated `MediaPlayerTile`, `MediaPlayerTileVM`, and
+    // `MediaPlayerTilePlacement` types without pulling in the full production
+    // `MainWindow` symbol set. Mirrors the pattern used by `cover_tile.slint`
+    // (TASK-102), `fan_tile.slint` (TASK-103), `lock_tile.slint` (TASK-104),
+    // `alarm_panel_tile.slint` (TASK-105), `history_graph_tile.slint`
+    // (TASK-106), `camera_snapshot_tile.slint` (TASK-107), and
+    // `climate_tile.slint` (TASK-108).
+    //
+    // This compile puts `media_player_tile.slint` in the build graph: `cargo
+    // build` fails if the component has a syntax or type error (satisfying
+    // the "Slint component compile gate" acceptance criterion in TASK-109).
+    //
+    // The generated types are accessible to `src/ui/bridge.rs` via
+    // `include!(env!("HANUI_MEDIA_PLAYER_TILE_INCLUDE"))` inside the
+    // `media_player_tile_slint` submodule.
+    let media_player_tile_input = manifest_dir.join("ui/slint/media_player_tile.slint");
+    let media_player_tile_output = out_dir.join("media_player_tile.rs");
+
+    let media_player_tile_deps = slint_build::compile_with_output_path(
+        &media_player_tile_input,
+        &media_player_tile_output,
+        slint_build::CompilerConfiguration::default(),
+    )
+    .expect("compile ui/slint/media_player_tile.slint with slint-build");
+
+    for dep in media_player_tile_deps {
+        println!("cargo:rerun-if-changed={}", dep.display());
+    }
+    println!(
+        "cargo:rustc-env=HANUI_MEDIA_PLAYER_TILE_INCLUDE={}",
+        media_player_tile_output.display()
+    );
 }

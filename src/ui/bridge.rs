@@ -539,6 +539,67 @@ pub struct ClimateTileVM {
 }
 
 // ---------------------------------------------------------------------------
+// MediaPlayerTileVM (TASK-109)
+// ---------------------------------------------------------------------------
+
+/// View-model for a `MediaPlayerTile` widget, mirroring the Slint
+/// `MediaPlayerTileVM` struct in `ui/slint/media_player_tile.slint`.
+///
+/// Built by [`compute_media_player_tile_vm`], which threads through
+/// [`crate::ui::media_player::MediaPlayerVM::from_entity`] to derive the
+/// `is_playing` boolean and forward the optional `media_title` /
+/// `artist` / `volume_level` reads from the entity attributes.
+///
+/// The `icon: image` Slint field is absent here; it is written by the
+/// Slint bridge during property wiring (the same pattern used for every
+/// other per-kind tile VM).
+///
+/// Note (TASK-109 scope): the `MainWindow` Slint component does not yet
+/// declare a `media-player-tiles` array property —
+/// `ui/slint/main_window.slint` is in this ticket's `must_not_touch`
+/// list. `compute_media_player_tile_vm` is invoked indirectly via
+/// [`build_tiles`] so media-player entities exercise the
+/// `MediaPlayerVM::from_entity` path on every state change, and the
+/// result flows into the existing fallback `EntityTileVM` render with
+/// the raw HA state string. A subsequent ticket will amend
+/// `main_window.slint` to render a per-kind `MediaPlayerTile` model
+/// directly.
+///
+/// `pending` is the per-tile spinner gate added in TASK-067; see
+/// [`LightTileVM`] for the full contract.
+///
+/// # No `Vec` fields (lesson from TASK-103 / TASK-105 / TASK-107 / TASK-108)
+///
+/// Like `MediaPlayerVM`, this struct deliberately carries no `Vec`
+/// fields. The transport-set / source list / sound-mode list live on
+/// [`crate::dashboard::schema::WidgetOptions::MediaPlayer`] and are read
+/// at modal-open / dispatch time, NOT stored on the per-frame tile VM.
+/// Allocating a `Vec` here that the tile renderer never reads would be
+/// wasted work on every state change.
+///
+/// # Float fields and `Eq`
+///
+/// `volume_level` is `Option<f32>` — `f32: !Eq`, so this struct is
+/// `PartialEq` but not `Eq` (matches `ClimateTileVM`). Bridge equality
+/// checks rely on `PartialEq`; no consumer of this VM stores it in a
+/// hash-keyed container.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MediaPlayerTileVM {
+    pub name: String,
+    pub state: String,
+    pub is_playing: bool,
+    pub media_title: Option<String>,
+    pub artist: Option<String>,
+    pub volume_level: Option<f32>,
+    pub icon_id: String,
+    pub preferred_columns: i32,
+    pub preferred_rows: i32,
+    pub placement: TilePlacement,
+    /// Per-tile spinner gate (TASK-067). Default `false`.
+    pub pending: bool,
+}
+
+// ---------------------------------------------------------------------------
 // TileVM enum
 // ---------------------------------------------------------------------------
 
@@ -1038,22 +1099,49 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                                     pending: false,
                                 })
                             }
-                            // Phase 6 adds MediaPlayer + PowerFlow. Until
-                            // dedicated Slint tile components exist
-                            // (TASK-109), these are rendered as
-                            // EntityTileVM — the generic entity tile covers
-                            // the state display until per-kind tiles ship.
-                            WidgetKind::EntityTile
-                            | WidgetKind::MediaPlayer
-                            | WidgetKind::PowerFlow => TileVM::Entity(EntityTileVM {
-                                name,
-                                state,
-                                icon_id,
-                                preferred_columns,
-                                preferred_rows,
-                                placement,
-                                pending: false,
-                            }),
+                            // TASK-109: media-player entities flow through
+                            // `MediaPlayerVM::from_entity` so the per-frame
+                            // derived `is_playing` boolean and the optional
+                            // `media_title` / `artist` / `volume_level` reads
+                            // are exercised on every state change. Until
+                            // `main_window.slint` grows a `media-player-tiles`
+                            // array property (subsequent ticket), the
+                            // media-player tile renders as the generic
+                            // `EntityTileVM` fallback — the canonical HA
+                            // state string is forwarded verbatim. The
+                            // `MediaPlayerVM` is exposed via
+                            // `compute_media_player_tile_vm` for the
+                            // per-kind rendering path that follows when
+                            // `main_window.slint` gains the array property.
+                            WidgetKind::MediaPlayer => {
+                                let _media_player_vm =
+                                    crate::ui::media_player::MediaPlayerVM::from_entity(&entity);
+                                TileVM::Entity(EntityTileVM {
+                                    name,
+                                    state,
+                                    icon_id,
+                                    preferred_columns,
+                                    preferred_rows,
+                                    placement,
+                                    pending: false,
+                                })
+                            }
+                            // Phase 6 adds PowerFlow. Until a dedicated
+                            // Slint tile component exists, this is rendered
+                            // as EntityTileVM — the generic entity tile
+                            // covers the state display until per-kind tiles
+                            // ship.
+                            WidgetKind::EntityTile | WidgetKind::PowerFlow => {
+                                TileVM::Entity(EntityTileVM {
+                                    name,
+                                    state,
+                                    icon_id,
+                                    preferred_columns,
+                                    preferred_rows,
+                                    placement,
+                                    pending: false,
+                                })
+                            }
                         }
                     }
 
@@ -2555,6 +2643,38 @@ pub mod climate_tile_slint {
 pub use climate_tile_slint::{ClimateTile, ClimateTilePlacement as SlintClimateTilePlacement};
 
 // ---------------------------------------------------------------------------
+// MediaPlayerTile slint submodule (TASK-109)
+// ---------------------------------------------------------------------------
+//
+// `ui/slint/media_player_tile.slint` is compiled by `build.rs` (TASK-109)
+// to a separate generated Rust file exposed via the
+// `HANUI_MEDIA_PLAYER_TILE_INCLUDE` env var — the same pattern as
+// `cover_tile.slint` (TASK-102), `fan_tile.slint` (TASK-103),
+// `lock_tile.slint` (TASK-104), `alarm_panel_tile.slint` (TASK-105),
+// `history_graph_tile.slint` (TASK-106), `camera_snapshot_tile.slint`
+// (TASK-107), and `climate_tile.slint` (TASK-108). This module picks it
+// up via `include!` so the generated `MediaPlayerTile`,
+// `MediaPlayerTileVM`, and `MediaPlayerTilePlacement` types are available
+// for the `compute_media_player_tile_vm` projection function below
+// without polluting the production `slint_ui` namespace (which would
+// clash with the same-named Rust struct declared earlier in this file).
+//
+// Future work: once `main_window.slint` grows a `media-player-tiles`
+// array property, this module's types will be re-exported through the
+// production `slint_ui` namespace instead. The separate compile is the
+// minimal-blast path that satisfies TASK-109's "Slint compile gate"
+// acceptance criterion (media_player_tile.slint must be in the build
+// graph) without amending any of the protected `must_not_touch` Slint
+// files.
+pub mod media_player_tile_slint {
+    include!(env!("HANUI_MEDIA_PLAYER_TILE_INCLUDE"));
+}
+
+pub use media_player_tile_slint::{
+    MediaPlayerTile, MediaPlayerTilePlacement as SlintMediaPlayerTilePlacement,
+};
+
+// ---------------------------------------------------------------------------
 // compute_cover_tile_vm (TASK-102)
 // ---------------------------------------------------------------------------
 
@@ -3081,6 +3201,66 @@ pub fn compute_climate_tile_vm(
         is_active: climate_vm.is_active,
         current_temperature: climate_vm.current_temperature,
         target_temperature: climate_vm.target_temperature,
+        icon_id,
+        preferred_columns,
+        preferred_rows,
+        placement,
+        pending: false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// compute_media_player_tile_vm (TASK-109)
+// ---------------------------------------------------------------------------
+
+/// Project a typed Rust [`MediaPlayerTileVM`] from a live entity snapshot,
+/// threading through
+/// [`crate::ui::media_player::MediaPlayerVM::from_entity`] for the
+/// per-frame derived `is_playing` boolean and the optional `media_title` /
+/// `artist` / `volume_level` reads.
+///
+/// # Hot-path discipline
+///
+/// Called at entity-change time (NOT per render). The result is a typed
+/// `MediaPlayerTileVM` Rust struct; the further `String -> SharedString`
+/// / `icon_id -> Image` conversions are deferred to a follow-up ticket
+/// once `main_window.slint` declares the `media-player-tiles` array
+/// property.
+///
+/// # No `Vec` allocation on the per-frame path
+///
+/// Per the TASK-103 / TASK-105 / TASK-107 / TASK-108 audit lesson: this
+/// projection writes only scalar fields. The
+/// `WidgetOptions::MediaPlayer.transport_set` and any source / sound-mode
+/// lists live on the dashboard config and are read at modal-open /
+/// dispatch time — they do NOT travel through this VM.
+///
+/// # Naming
+///
+/// Returns the Rust [`MediaPlayerTileVM`] (defined earlier in this
+/// file). The Slint-shape projection (`SlintMediaPlayerTileVM` from
+/// [`media_player_tile_slint::MediaPlayerTileVM`]) is not built here
+/// because there is no `media-player-tiles` `MainWindow` property to
+/// write into yet — that shape conversion lives next to the
+/// `set_media_player_tiles` call site once it exists.
+#[must_use]
+pub fn compute_media_player_tile_vm(
+    name: String,
+    icon_id: String,
+    preferred_columns: i32,
+    preferred_rows: i32,
+    placement: TilePlacement,
+    entity: &crate::ha::entity::Entity,
+) -> MediaPlayerTileVM {
+    let media_player_vm = crate::ui::media_player::MediaPlayerVM::from_entity(entity);
+
+    MediaPlayerTileVM {
+        name,
+        state: media_player_vm.state,
+        is_playing: media_player_vm.is_playing,
+        media_title: media_player_vm.media_title,
+        artist: media_player_vm.artist,
+        volume_level: media_player_vm.volume_level,
         icon_id,
         preferred_columns,
         preferred_rows,
@@ -8855,6 +9035,334 @@ mod tests {
         );
         assert_eq!(vm.state, "boost");
         assert!(vm.is_active, "vendor mode → is_active=true");
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_media_player_tile_vm + build_tiles MediaPlayer arm (TASK-109)
+    // -----------------------------------------------------------------------
+
+    /// `build_tiles` dispatches `WidgetKind::MediaPlayer` through the
+    /// `MediaPlayerVM::from_entity` path and produces an `EntityTileVM`
+    /// fallback (no `media-player-tiles` array property exists yet on
+    /// `main_window.slint`). The state string is forwarded verbatim per
+    /// TASK-109 AC.
+    #[test]
+    fn build_tiles_media_player_widget_uses_state() {
+        use crate::ha::store::MemoryStore;
+
+        let store = MemoryStore::load(vec![make_test_entity("media_player.tv", "playing")])
+            .expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("media_player.tv", WidgetKind::MediaPlayer);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1, "one widget → one tile");
+        match &tiles[0] {
+            TileVM::Entity(vm) => {
+                assert_eq!(vm.state, "playing", "media-player state forwarded verbatim");
+            }
+            other => panic!("expected EntityTileVM (MediaPlayer fallback), got {other:?}"),
+        }
+    }
+
+    /// `build_tiles` for a `WidgetKind::MediaPlayer` widget routes a
+    /// `"paused"` state through the bridge without altering the state
+    /// string. The `is_playing` derivation is exercised by
+    /// `MediaPlayerVM::from_entity`.
+    #[test]
+    fn build_tiles_media_player_widget_paused_state_passes_through() {
+        use crate::ha::store::MemoryStore;
+
+        let store = MemoryStore::load(vec![make_test_entity("media_player.tv", "paused")])
+            .expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("media_player.tv", WidgetKind::MediaPlayer);
+        let tiles = build_tiles(&store, &dashboard);
+        match &tiles[0] {
+            TileVM::Entity(vm) => assert_eq!(vm.state, "paused"),
+            other => panic!("expected EntityTileVM (MediaPlayer fallback), got {other:?}"),
+        }
+    }
+
+    /// `build_tiles` for a `WidgetKind::MediaPlayer` widget routes an
+    /// `"unavailable"` entity through the bridge without altering the
+    /// state string — the unavailable visual is driven downstream by
+    /// `MediaPlayerVM::is_playing=false`.
+    #[test]
+    fn build_tiles_media_player_widget_unavailable_state_passes_through() {
+        use crate::ha::store::MemoryStore;
+
+        let store = MemoryStore::load(vec![make_test_entity("media_player.tv", "unavailable")])
+            .expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("media_player.tv", WidgetKind::MediaPlayer);
+        let tiles = build_tiles(&store, &dashboard);
+        match &tiles[0] {
+            TileVM::Entity(vm) => assert_eq!(vm.state, "unavailable"),
+            other => panic!("expected EntityTileVM (MediaPlayer fallback), got {other:?}"),
+        }
+    }
+
+    /// `compute_media_player_tile_vm` for a playing media-player produces
+    /// the typed Rust `MediaPlayerTileVM` with `is_playing=true` and
+    /// surfaces the track-title / artist attributes.
+    #[test]
+    fn compute_media_player_tile_vm_playing_state_with_track_info() {
+        let raw = entity_with_attr("playing", "media_title", "\"Track A\"");
+        // entity_with_attr builds a one-key map; merge multiple keys by
+        // re-parsing the full snippet.
+        let snippet = r#"{"media_title":"Track A","media_artist":"Artist B","volume_level":0.5}"#;
+        let map = serde_yaml_ng::from_str(snippet).expect("test snippet must parse");
+        let entity = Entity {
+            id: EntityId::from("media_player.tv"),
+            attributes: Arc::new(map),
+            ..raw
+        };
+        let vm = compute_media_player_tile_vm(
+            "Living Room TV".to_owned(),
+            "mdi:television".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.name, "Living Room TV");
+        assert_eq!(vm.state, "playing");
+        assert!(vm.is_playing, "playing → is_playing=true");
+        assert_eq!(vm.media_title.as_deref(), Some("Track A"));
+        assert_eq!(vm.artist.as_deref(), Some("Artist B"));
+        assert_eq!(vm.volume_level, Some(0.5));
+        assert_eq!(vm.icon_id, "mdi:television");
+        assert!(!vm.pending);
+    }
+
+    /// `compute_media_player_tile_vm` for an idle media-player flips
+    /// `is_playing=false` and produces no track info.
+    #[test]
+    fn compute_media_player_tile_vm_idle_state() {
+        let entity = make_test_entity("media_player.tv", "idle");
+        let vm = compute_media_player_tile_vm(
+            "Living Room TV".to_owned(),
+            "mdi:television".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.state, "idle");
+        assert!(!vm.is_playing, "idle → is_playing=false");
+        assert!(vm.media_title.is_none());
+        assert!(vm.artist.is_none());
+        assert!(vm.volume_level.is_none());
+    }
+
+    /// `compute_media_player_tile_vm` for an unavailable media-player
+    /// produces the unavailable sentinel (`is_playing=false`, no track
+    /// info).
+    #[test]
+    fn compute_media_player_tile_vm_unavailable_state() {
+        let entity = make_test_entity("media_player.tv", "unavailable");
+        let vm = compute_media_player_tile_vm(
+            "Living Room TV".to_owned(),
+            "mdi:television".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.state, "unavailable");
+        assert!(!vm.is_playing, "unavailable → is_playing=false");
+        assert!(vm.media_title.is_none());
+        assert!(vm.artist.is_none());
+        assert!(vm.volume_level.is_none());
+    }
+
+    /// `compute_media_player_tile_vm` clamps an above-range
+    /// `volume_level` to 1.0.
+    #[test]
+    fn compute_media_player_tile_vm_clamps_volume_level_above_one() {
+        let entity = entity_with_attr("playing", "volume_level", "1.7");
+        let entity = Entity {
+            id: EntityId::from("media_player.tv"),
+            ..entity
+        };
+        let vm = compute_media_player_tile_vm(
+            "TV".to_owned(),
+            "mdi:television".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(
+            vm.volume_level,
+            Some(1.0),
+            "above-range volume must clamp to 1.0"
+        );
+    }
+
+    /// `compute_media_player_tile_vm` clamps a below-range (negative)
+    /// `volume_level` to 0.0. Defends the lower bound at the bridge
+    /// level so a future refactor that bypasses
+    /// `MediaPlayerVM::from_entity` cannot silently drop the lower
+    /// clamp.
+    #[test]
+    fn compute_media_player_tile_vm_clamps_volume_level_below_zero() {
+        let entity = entity_with_attr("playing", "volume_level", "-0.25");
+        let entity = Entity {
+            id: EntityId::from("media_player.tv"),
+            ..entity
+        };
+        let vm = compute_media_player_tile_vm(
+            "TV".to_owned(),
+            "mdi:television".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(
+            vm.volume_level,
+            Some(0.0),
+            "negative volume must clamp to 0.0"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // MediaPlayerBody more-info richer impl (TASK-109)
+    // -----------------------------------------------------------------------
+
+    /// `MediaPlayerBody::render_rows` always emits the state row.
+    #[test]
+    fn media_player_body_emits_state_row() {
+        use crate::ui::more_info::{MediaPlayerBody, MoreInfoBody};
+        let entity = make_test_entity("media_player.tv", "playing");
+        let rows = MediaPlayerBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "state" && r.value == "playing"),
+            "MediaPlayerBody must always emit a state row; got {rows:?}"
+        );
+    }
+
+    /// `MediaPlayerBody::render_rows` emits a `media_title` row when the
+    /// `media_title` attribute is present.
+    #[test]
+    fn media_player_body_emits_media_title_row_when_attribute_present() {
+        use crate::ui::more_info::{MediaPlayerBody, MoreInfoBody};
+        let entity = entity_with_attr("playing", "media_title", "\"Hey Jude\"");
+        let entity = Entity {
+            id: EntityId::from("media_player.tv"),
+            ..entity
+        };
+        let rows = MediaPlayerBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "media_title" && r.value == "Hey Jude"),
+            "MediaPlayerBody must emit a media_title row when set; got {rows:?}"
+        );
+    }
+
+    /// `MediaPlayerBody::render_rows` skips the `media_title` row when
+    /// the attribute is absent.
+    #[test]
+    fn media_player_body_skips_media_title_row_when_attribute_absent() {
+        use crate::ui::more_info::{MediaPlayerBody, MoreInfoBody};
+        let entity = make_test_entity("media_player.tv", "idle");
+        let rows = MediaPlayerBody::new().render_rows(&entity);
+        assert!(
+            !rows.iter().any(|r| r.key == "media_title"),
+            "no media_title attribute → no media_title row; got {rows:?}"
+        );
+    }
+
+    /// `MediaPlayerBody::render_rows` emits an `artist` row when the
+    /// `media_artist` attribute is present.
+    #[test]
+    fn media_player_body_emits_artist_row_when_attribute_present() {
+        use crate::ui::more_info::{MediaPlayerBody, MoreInfoBody};
+        let entity = entity_with_attr("playing", "media_artist", "\"The Beatles\"");
+        let entity = Entity {
+            id: EntityId::from("media_player.tv"),
+            ..entity
+        };
+        let rows = MediaPlayerBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "artist" && r.value == "The Beatles"),
+            "MediaPlayerBody must emit an artist row when set; got {rows:?}"
+        );
+    }
+
+    /// `MediaPlayerBody::render_rows` emits a `volume_level` row when
+    /// the attribute is present, formatted as a percentage.
+    #[test]
+    fn media_player_body_emits_volume_level_row_when_attribute_present() {
+        use crate::ui::more_info::{MediaPlayerBody, MoreInfoBody};
+        let entity = entity_with_attr("playing", "volume_level", "0.42");
+        let entity = Entity {
+            id: EntityId::from("media_player.tv"),
+            ..entity
+        };
+        let rows = MediaPlayerBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "volume_level" && r.value == "42%"),
+            "MediaPlayerBody must emit a volume_level row when set; got {rows:?}"
+        );
+    }
+
+    /// `MediaPlayerBody::render_rows` emits a `source` row when the
+    /// `source` attribute is present.
+    #[test]
+    fn media_player_body_emits_source_row_when_attribute_present() {
+        use crate::ui::more_info::{MediaPlayerBody, MoreInfoBody};
+        let entity = entity_with_attr("playing", "source", "\"HDMI 1\"");
+        let entity = Entity {
+            id: EntityId::from("media_player.tv"),
+            ..entity
+        };
+        let rows = MediaPlayerBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "source" && r.value == "HDMI 1"),
+            "MediaPlayerBody must emit a source row when set; got {rows:?}"
+        );
+    }
+
+    /// `MediaPlayerBody::render_rows` emits a `sound_mode` row when the
+    /// `sound_mode` attribute is present.
+    #[test]
+    fn media_player_body_emits_sound_mode_row_when_attribute_present() {
+        use crate::ui::more_info::{MediaPlayerBody, MoreInfoBody};
+        let entity = entity_with_attr("playing", "sound_mode", "\"Movie\"");
+        let entity = Entity {
+            id: EntityId::from("media_player.tv"),
+            ..entity
+        };
+        let rows = MediaPlayerBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "sound_mode" && r.value == "Movie"),
+            "MediaPlayerBody must emit a sound_mode row when set; got {rows:?}"
+        );
+    }
+
+    /// `MediaPlayerBody::render_rows` emits an `album` row when the
+    /// `media_album_name` attribute is present.
+    #[test]
+    fn media_player_body_emits_album_row_when_attribute_present() {
+        use crate::ui::more_info::{MediaPlayerBody, MoreInfoBody};
+        let entity = entity_with_attr("playing", "media_album_name", "\"Abbey Road\"");
+        let entity = Entity {
+            id: EntityId::from("media_player.tv"),
+            ..entity
+        };
+        let rows = MediaPlayerBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "album" && r.value == "Abbey Road"),
+            "MediaPlayerBody must emit an album row when set; got {rows:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

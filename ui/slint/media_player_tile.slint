@@ -1,0 +1,223 @@
+// media_player_tile.slint — Phase 6 Wave 2 (TASK-109) tile for `type: media_player`.
+//
+// Renders a Home Assistant media-player entity (TVs, AV receivers, smart
+// speakers, streaming devices) with a three-state visual: idle (state ==
+// "idle" / "off"), active (state == "playing"), and unavailable. The Rust
+// bridge produces a `MediaPlayerTileVM` per media-player widget via
+// `crate::ui::media_player::MediaPlayerVM::from_entity` followed by a
+// Slint-shape projection in
+// `src/ui/bridge.rs::compute_media_player_tile_vm`.
+//
+// Per the TASK-109 plan (Phase 6 6b): the **transport buttons** and
+// **volume slider** are deferred to Phase 7 (dispatcher wiring). The
+// Phase 6 tile shows the entity name, the canonical playback state
+// ("playing" / "paused" / "idle" / "off" / "unavailable"), the current
+// track title (when present), and the artist (when present). The richer
+// transport-control UI lives in the more-info modal body
+// (`MediaPlayerBody` in `src/ui/more_info.rs`) and the Phase 7 dispatcher.
+//
+// All colors come from theme tokens; no inline hex literals (CI hex-color
+// gate, `.github/workflows/ci.yml` § Gate 1). Visual primitives only — no
+// SVG-based icons in the tile body itself; the icon image is resolved by
+// the Rust asset layer (TASK-010) and bound via `MediaPlayerTileVM.icon`.
+//
+// View-model contract (see `src/ui/bridge.rs::MediaPlayerTileVM`):
+//   * The struct shape is mirrored 1:1 in Rust by the bridge. The Slint
+//     compiler generates a Rust struct named `MediaPlayerTileVM` whose
+//     fields match these names with kebab→snake conversion.
+//   * `state` is the canonical HA state string forwarded verbatim
+//     (`"playing"`, `"paused"`, `"idle"`, `"off"`, `"standby"`,
+//     `"buffering"`, `"unavailable"`, or any vendor-specific value).
+//   * `is-playing` is precomputed (true only for `"playing"`).
+//   * `media-title` / `artist` are `string` values; the companion
+//     `has-media-title` / `has-artist` booleans gate whether to render
+//     the corresponding label, because Slint strings have no native
+//     `Option<>` and an empty string would still consume a layout slot.
+//   * `volume-level` is a `float` in 0.0..=1.0; the companion
+//     `has-volume-level` boolean gates whether the volume label is
+//     rendered.
+//   * `placement` is a NESTED struct (`MediaPlayerTilePlacement`) for 1:1
+//     mapping with `dashboard::schema::Placement` in Rust.
+//
+// Three-state render (per Phase 6 plan acceptance):
+//   * idle (state == "idle" / "off")     — text-secondary icon tint, full opacity.
+//   * active (is-playing == true)        — accent icon tint, full opacity.
+//   * unavailable                        — state-unavailable tint, reduced opacity (0.5).
+//
+// AnimationBudget integration:
+//   * No tile-internal animation. Press feedback is inherited from CardBase.
+//     The active-count gate is a global concern (see card_base.slint) — this
+//     tile holds no animated property of its own. Transport button press
+//     animation will land with the Phase 7 dispatcher wiring.
+
+import { Theme } from "theme.slint";
+import { CardBase } from "card_base.slint";
+
+// Computed grid placement, mirrors `dashboard::schema::Placement` in Rust.
+// Re-declared per tile file for self-documentation; identical to
+// `LightTilePlacement` / `SensorTilePlacement` / `EntityTilePlacement` /
+// `CoverTilePlacement` / `FanTilePlacement` / `LockTilePlacement` /
+// `AlarmTilePlacement` / `HistoryGraphTilePlacement` /
+// `CameraTilePlacement` / `ClimateTilePlacement`.
+export struct MediaPlayerTilePlacement {
+    col: int,
+    row: int,
+    span-cols: int,
+    span-rows: int,
+}
+
+// Typed view-model for a media-player tile.
+//
+// Field semantics:
+//   * name              — user-visible entity label (friendly_name fallback to id).
+//   * state             — canonical HA state string forwarded verbatim
+//                         (`"playing"`, `"paused"`, `"idle"`, `"off"`,
+//                         `"unavailable"`, or vendor string).
+//   * is-playing        — derived: true only for `"playing"`. Drives the
+//                         "active" icon tint.
+//   * media-title       — current track title; only meaningful when
+//                         `has-media-title` is true.
+//   * has-media-title   — gates the title label (Slint strings have no
+//                         `Option<>`).
+//   * artist            — current track artist; only meaningful when
+//                         `has-artist` is true.
+//   * has-artist        — gates the artist label.
+//   * volume-level      — current volume in 0.0..=1.0; only meaningful
+//                         when `has-volume-level` is true.
+//   * has-volume-level  — gates the volume label.
+//   * icon-id           — design-token id (e.g. "mdi:speaker"); resolved
+//                         to bytes by the asset layer (TASK-010).
+//   * icon              — resolved Slint image written by the bridge
+//                         (TASK-015).
+//   * preferred-columns / preferred-rows — author intent from YAML, used
+//                         by the grid packer (TASK-014).
+//   * placement         — packed grid coordinates and span. Static this phase.
+//   * pending           — true while an OptimisticEntry exists for this
+//                         tile's entity. Drives the per-tile spinner overlay
+//                         on CardBase (TASK-067), bound from
+//                         `LiveStore::pending_for_widget(widget_id)`.
+export struct MediaPlayerTileVM {
+    name: string,
+    state: string,
+    is-playing: bool,
+    media-title: string,
+    has-media-title: bool,
+    artist: string,
+    has-artist: bool,
+    volume-level: float,
+    has-volume-level: bool,
+    icon-id: string,
+    icon: image,
+    preferred-columns: int,
+    preferred-rows: int,
+    placement: MediaPlayerTilePlacement,
+    pending: bool,
+}
+
+// MediaPlayerTile — wraps CardBase with the media-player content layout.
+//
+// Press feedback and gesture detection both live on CardBase (TASK-060):
+// the single TouchArea inside CardBase captures pointer events for the
+// whole tile and exposes `pressed` as an out-property this tile reads
+// for visual feedback. Tile-level TouchAreas were removed to avoid
+// double-capture (Risk #4).
+//
+// Transport buttons + volume slider are intentionally NOT in this tile —
+// those interactions live in the more-info modal (Phase 6) and the
+// dispatcher wiring (Phase 7). The Phase 6 tile renders state-only.
+export component MediaPlayerTile inherits Rectangle {
+    in property <MediaPlayerTileVM> view-model;
+
+    // Resolved icon tint colour. Branches on availability first, then on
+    // is-playing, falling back to text-secondary for the idle state.
+    // No inline hex literals; every branch picks a token from `Theme`.
+    property <color> icon-color:
+        view-model.state == "unavailable" ? Theme.state-unavailable
+        : view-model.is-playing ? Theme.accent
+        : Theme.text-secondary;
+
+    // Reduce opacity for the unavailable visual state (Phase 6 plan
+    // three-state render acceptance). Idle and active render at full
+    // opacity; only unavailable dims.
+    opacity: view-model.state == "unavailable" ? 0.5 : 1.0;
+
+    base := CardBase {
+        // Bind the per-tile pending-spinner gate (TASK-067). The Rust
+        // bridge writes `view-model.pending` from
+        // `LiveStore::pending_for_widget` (TASK-064 read API) on each
+        // refresh; this property feeds the spinner overlay declared on
+        // CardBase. Slint MUST read only this property — there is no
+        // parallel pending-state path (Risk #14).
+        pending: view-model.pending;
+
+        VerticalLayout {
+            spacing: Theme.space-2;
+
+            // Header row: icon + entity name. Icon is tinted with the
+            // resolved icon colour so a glance at the tile reveals
+            // playing / idle / unavailable status.
+            HorizontalLayout {
+                spacing: Theme.space-2;
+                alignment: start;
+
+                Image {
+                    source: view-model.icon;
+                    width: Theme.font-xl;
+                    height: Theme.font-xl;
+                    colorize: icon-color;
+                }
+
+                Text {
+                    text: view-model.name;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-md;
+                    font-weight: Theme.font-weight-medium;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Playback state label. The state string is rendered in the
+            // resolved icon colour for redundancy with the icon tint
+            // (accessibility: do not rely on colour alone). Mode strings
+            // are short ("playing" / "paused" / "idle") so font-md is
+            // the right hero size — sensor-tile-like font-xxl would
+            // push the title / artist labels off the card.
+            Text {
+                text: view-model.state;
+                color: icon-color;
+                font-size: Theme.font-md;
+                font-weight: Theme.font-weight-bold;
+            }
+
+            // Track-title row, only when the entity reports `media_title`.
+            // Rendered as the primary track label below the state.
+            if view-model.has-media-title: Text {
+                text: view-model.media-title;
+                color: Theme.text-primary;
+                font-size: Theme.font-sm;
+                font-weight: Theme.font-weight-medium;
+            }
+
+            // Artist row, only when the entity reports `media_artist`.
+            // Rendered in text-secondary so it visually subordinates to
+            // the track title above.
+            if view-model.has-artist: Text {
+                text: view-model.artist;
+                color: Theme.text-secondary;
+                font-size: Theme.font-sm;
+                font-weight: Theme.font-weight-regular;
+            }
+
+            // Volume label, only when the entity reports `volume_level`.
+            // Rendered as a percent (0–100) for human-readability.
+            // The volume slider widget itself lives in the more-info
+            // modal — the tile only surfaces the current value.
+            if view-model.has-volume-level: Text {
+                text: "vol " + round(view-model.volume-level * 100) + "%";
+                color: Theme.text-secondary;
+                font-size: Theme.font-sm;
+                font-weight: Theme.font-weight-regular;
+            }
+        }
+    }
+}
