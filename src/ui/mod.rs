@@ -13,6 +13,7 @@
 //! per-tile spinner update path that binds to
 //! [`crate::ha::live_store::LiveStore::pending_for_widget`].
 
+pub mod alarm;
 pub mod bridge;
 pub mod cover;
 pub mod fan;

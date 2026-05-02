@@ -531,15 +531,51 @@ impl MoreInfoBody for LockBody {
     }
 }
 
-/// More-info body for `alarm_control_panel` entities.
+/// More-info body for `alarm_control_panel` entities (TASK-105).
 ///
-/// Returns the entity's state. Phase 6a (`TASK-105`) will replace this with a
-/// PIN entry + arm-mode selector.
+/// Renders alarm-specific rows: state, `changed_by` (when reported),
+/// `code_format` (when reported), and `code_arm_required` (when reported).
+/// The Slint shell already binds `body-rows` to the modal's row list, so
+/// [`AlarmBody`] reuses the generic rendering path — keeping the trait
+/// shape stable per TASK-098 + TASK-105.
+///
+/// # Arm-mode buttons + disarm button
+///
+/// Per TASK-105 acceptance #6, the modal surfaces arm-mode buttons (home /
+/// away / night / vacation / custom_bypass per
+/// `locked_decisions.alarm_arm_service_vocabulary`) and a disarm button.
+/// The button widgets themselves are dispatcher-side: tapping a button
+/// dispatches `Action::AlarmArm { entity_id, mode }` /
+/// `Action::AlarmDisarm { entity_id }` from TASK-099 through the Phase 3
+/// dispatcher; the dispatcher reads the policy from
+/// `WidgetOptions::Alarm.pin_policy` at dispatch time. This body
+/// surfaces only the *current* snapshot of the entity (state +
+/// HA-reported attributes), keeping the modal informative without
+/// duplicating the dispatcher's policy lookup.
+///
+/// # PIN entry semantics
+///
+/// PIN entry fires per `WidgetOptions::Alarm.pin_policy` — the dispatcher
+/// owns this branch. Per `locked_decisions.pin_policy_migration`:
+///   * `PinPolicy::None`              — neither arm nor disarm prompts.
+///   * `PinPolicy::Required`          — both arm and disarm prompt.
+///   * `PinPolicy::RequiredOnDisarm`  — only disarm prompts.
+///
+/// See `src/actions/dispatcher.rs::dispatch_alarm_arm_or_disarm` for the
+/// dispatch-side policy check.
+///
+/// # Stateless
+///
+/// `AlarmBody` carries no fields; the body queries the live entity at
+/// `render_rows` time. Per locked_decisions.more_info_modal, the body
+/// is invoked exactly once per modal-open — so the per-call attribute
+/// reads are not on a hot path.
 #[derive(Debug, Default)]
 pub struct AlarmBody;
 
 impl AlarmBody {
-    /// Construct an [`AlarmBody`].
+    /// Construct an [`AlarmBody`]. Stateless; the constructor exists so callers
+    /// do not depend on `Default`.
     #[must_use]
     pub fn new() -> Self {
         AlarmBody
@@ -548,10 +584,57 @@ impl AlarmBody {
 
 impl MoreInfoBody for AlarmBody {
     fn render_rows(&self, entity: &Entity) -> Vec<ModalRow> {
-        vec![ModalRow {
+        // Capacity of 4 covers the worst case (state + changed_by +
+        // code_format + code_arm_required) without growing.
+        let mut rows = Vec::with_capacity(4);
+
+        // State row — always emitted, matches the per-domain body
+        // contract every other body upholds.
+        rows.push(ModalRow {
             key: "state".to_owned(),
             value: entity.state.as_ref().to_owned(),
-        }]
+        });
+
+        // changed_by row, only when the entity exposes the attribute. HA
+        // surfaces the user / code id that triggered the last state
+        // change; the body forwards the raw string.
+        if let Some(changed_by) = crate::ui::alarm::read_changed_by_attribute(entity) {
+            rows.push(ModalRow {
+                key: "changed_by".to_owned(),
+                value: changed_by,
+            });
+        }
+
+        // code_format row, only when the entity exposes the attribute.
+        // Standard HA values are "number" / "any"; the body forwards the
+        // raw string. Distinct from the schema's `CodeFormat` enum
+        // (which is widget-config, not entity-attribute) — this row
+        // surfaces what the entity itself reports.
+        if let Some(code_format) = crate::ui::alarm::read_code_format_attribute(entity) {
+            rows.push(ModalRow {
+                key: "code_format".to_owned(),
+                value: code_format,
+            });
+        }
+
+        // code_arm_required row, only when the boolean attribute is
+        // present. Surfacing this in the modal lets the user verify the
+        // alarm panel's HA-side policy without opening the entity in
+        // HA's own UI. Distinct from `WidgetOptions::Alarm.pin_policy`
+        // (which is the dashboard-author's policy), but informative
+        // when the two diverge.
+        if let Some(arm_required) = crate::ui::alarm::read_code_arm_required_attribute(entity) {
+            rows.push(ModalRow {
+                key: "code_arm_required".to_owned(),
+                value: if arm_required {
+                    "true".to_owned()
+                } else {
+                    "false".to_owned()
+                },
+            });
+        }
+
+        rows
     }
 }
 

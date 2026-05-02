@@ -317,6 +317,58 @@ pub struct LockTileVM {
 }
 
 // ---------------------------------------------------------------------------
+// AlarmTileVM (TASK-105)
+// ---------------------------------------------------------------------------
+
+/// View-model for an `AlarmPanelTile` widget, mirroring the Slint
+/// `AlarmTileVM` struct in `ui/slint/alarm_panel_tile.slint`.
+///
+/// Built by [`compute_alarm_tile_vm`], which threads through
+/// [`crate::ui::alarm::AlarmVM::from_entity`] to derive the `is_armed` /
+/// `is_triggered` / `is_pending` booleans from the canonical HA state.
+///
+/// The `icon: image` Slint field is absent here; it is written by the
+/// Slint bridge during property wiring (the same pattern used for
+/// `LightTileVM` / `SensorTileVM` / `EntityTileVM` / `CoverTileVM` /
+/// `FanTileVM` / `LockTileVM`).
+///
+/// Note (TASK-105 scope): the `MainWindow` Slint component does not yet
+/// declare an `alarm-tiles` array property — `ui/slint/main_window.slint`
+/// is in this ticket's `must_not_touch` list. `compute_alarm_tile_vm` is
+/// invoked indirectly via [`build_tiles`] so alarm entities exercise the
+/// `AlarmVM::from_entity` path on every state change, and the result
+/// flows into the existing fallback `EntityTileVM` render with the raw
+/// HA state string. A subsequent ticket will amend `main_window.slint`
+/// to render a per-kind `AlarmPanelTile` model directly.
+///
+/// `pending` is the per-tile spinner gate added in TASK-067; see
+/// [`LightTileVM`] for the full contract. Distinct from `is_pending`
+/// (the HA-state pending) — Risk #14 already disambiguates the two
+/// concepts in the Slint tile field naming.
+///
+/// # No `Vec` fields (lesson from TASK-103)
+///
+/// Like `AlarmVM`, this struct deliberately carries no `Vec` fields.
+/// Arm-mode lists, code formats, and dispatcher-side preset vocabularies
+/// are NOT stored on the per-frame tile VM — they are read at modal-open
+/// / dispatch time from the widget options or from HA attributes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlarmTileVM {
+    pub name: String,
+    pub state: String,
+    pub is_armed: bool,
+    pub is_triggered: bool,
+    pub is_pending: bool,
+    pub icon_id: String,
+    pub preferred_columns: i32,
+    pub preferred_rows: i32,
+    pub placement: TilePlacement,
+    /// Per-tile spinner gate (TASK-067). Default `false`. Distinct from
+    /// `is_pending` (the HA-state pending).
+    pub pending: bool,
+}
+
+// ---------------------------------------------------------------------------
 // TileVM enum
 // ---------------------------------------------------------------------------
 
@@ -701,16 +753,40 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                                     pending: false,
                                 })
                             }
-                            // Phase 4 schema adds Camera, History, Alarm
-                            // variants. Phase 6 adds MediaPlayer, Climate,
-                            // PowerFlow. Until dedicated Slint tile components exist
-                            // (TASK-105..TASK-109), these are rendered as EntityTileVM —
+                            // TASK-105: alarm entities flow through
+                            // `AlarmVM::from_entity` so the per-frame derived
+                            // state (is_armed / is_triggered / is_pending) is
+                            // available to the bridge. Until `main_window.slint`
+                            // grows an `alarm-tiles` array property (subsequent
+                            // ticket), the alarm tile renders as the generic
+                            // `EntityTileVM` fallback — the canonical HA state
+                            // string is forwarded verbatim (`"disarmed"`,
+                            // `"armed_home"`, `"triggered"`, etc.). The
+                            // `AlarmVM` itself is exposed via
+                            // `compute_alarm_tile_vm` for the per-kind
+                            // rendering path that follows when
+                            // `main_window.slint` gains the array property.
+                            WidgetKind::Alarm => {
+                                let _alarm_vm = crate::ui::alarm::AlarmVM::from_entity(&entity);
+                                TileVM::Entity(EntityTileVM {
+                                    name,
+                                    state,
+                                    icon_id,
+                                    preferred_columns,
+                                    preferred_rows,
+                                    placement,
+                                    pending: false,
+                                })
+                            }
+                            // Phase 4 schema adds Camera, History variants.
+                            // Phase 6 adds MediaPlayer, Climate, PowerFlow.
+                            // Until dedicated Slint tile components exist
+                            // (TASK-106..TASK-109), these are rendered as EntityTileVM —
                             // the generic entity tile covers the state display until
                             // per-kind tiles ship.
                             WidgetKind::EntityTile
                             | WidgetKind::Camera
                             | WidgetKind::History
-                            | WidgetKind::Alarm
                             | WidgetKind::MediaPlayer
                             | WidgetKind::Climate
                             | WidgetKind::PowerFlow => TileVM::Entity(EntityTileVM {
@@ -2104,6 +2180,35 @@ pub mod lock_tile_slint {
 pub use lock_tile_slint::{LockTile, LockTilePlacement as SlintLockTilePlacement};
 
 // ---------------------------------------------------------------------------
+// AlarmPanelTile Slint module (TASK-105)
+// ---------------------------------------------------------------------------
+//
+// `ui/slint/alarm_panel_tile.slint` is compiled by `build.rs` (TASK-105)
+// to a separate generated Rust file exposed via the
+// `HANUI_ALARM_PANEL_TILE_INCLUDE` env var — the same pattern as
+// `cover_tile.slint` (TASK-102), `fan_tile.slint` (TASK-103),
+// `lock_tile.slint` (TASK-104), `pin_entry.slint` (TASK-100),
+// `view_switcher.slint` (TASK-086), and `gesture_test_window.slint`
+// (TASK-060). This module picks it up via `include!` so the generated
+// `AlarmPanelTile`, `AlarmTileVM`, and `AlarmTilePlacement` types are
+// available for the `compute_alarm_tile_vm` projection function below
+// without polluting the production `slint_ui` namespace (which would
+// clash with the same-named Rust struct declared earlier in this file).
+//
+// Future work: once `main_window.slint` grows an `alarm-tiles` array
+// property, this module's types will be re-exported through the
+// production `slint_ui` namespace instead. The separate compile is the
+// minimal-blast path that satisfies TASK-105's "Slint compile gate"
+// acceptance criterion (alarm_panel_tile.slint must be in the build
+// graph) without amending any of the protected `must_not_touch` Slint
+// files.
+pub mod alarm_panel_tile_slint {
+    include!(env!("HANUI_ALARM_PANEL_TILE_INCLUDE"));
+}
+
+pub use alarm_panel_tile_slint::{AlarmPanelTile, AlarmTilePlacement as SlintAlarmTilePlacement};
+
+// ---------------------------------------------------------------------------
 // compute_cover_tile_vm (TASK-102)
 // ---------------------------------------------------------------------------
 
@@ -2284,6 +2389,62 @@ pub fn compute_lock_tile_vm(
         name,
         state: entity.state.as_ref().to_owned(),
         is_locked: lock_vm.is_locked,
+        icon_id,
+        preferred_columns,
+        preferred_rows,
+        placement,
+        pending: false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// compute_alarm_tile_vm (TASK-105)
+// ---------------------------------------------------------------------------
+
+/// Project a typed Rust [`AlarmTileVM`] from a live entity snapshot,
+/// threading through [`crate::ui::alarm::AlarmVM::from_entity`] for the
+/// per-frame derived state (`is_armed` / `is_triggered` / `is_pending`).
+///
+/// # Hot-path discipline
+///
+/// Called at entity-change time (NOT per render). The result is a typed
+/// `AlarmTileVM` Rust struct; the further `String -> SharedString` /
+/// `icon_id -> Image` conversions are deferred to a follow-up ticket once
+/// `main_window.slint` declares the `alarm-tiles` array property.
+///
+/// # No `Vec` allocation
+///
+/// Per the TASK-103 audit lesson: this projection allocates only the
+/// scalar `state`/`name`/`icon_id` strings the tile actually renders.
+/// PIN policy is NOT read here — it is a dispatcher concern, looked up
+/// via the dispatcher's per-widget `alarm_settings` table at dispatch
+/// time. The tile VM stays lean.
+///
+/// # Naming
+///
+/// Returns the Rust [`AlarmTileVM`] (defined earlier in this file). The
+/// Slint-shape projection (`SlintAlarmTileVM` from
+/// [`alarm_panel_tile_slint::AlarmTileVM`]) is not built here because there
+/// is no `alarm-tiles` `MainWindow` property to write into yet — that
+/// shape conversion lives next to the `set_alarm_tiles` call site once
+/// it exists.
+#[must_use]
+pub fn compute_alarm_tile_vm(
+    name: String,
+    icon_id: String,
+    preferred_columns: i32,
+    preferred_rows: i32,
+    placement: TilePlacement,
+    entity: &crate::ha::entity::Entity,
+) -> AlarmTileVM {
+    let alarm_vm = crate::ui::alarm::AlarmVM::from_entity(entity);
+
+    AlarmTileVM {
+        name,
+        state: alarm_vm.state,
+        is_armed: alarm_vm.is_armed,
+        is_triggered: alarm_vm.is_triggered,
+        is_pending: alarm_vm.is_pending,
         icon_id,
         preferred_columns,
         preferred_rows,
