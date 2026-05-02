@@ -386,6 +386,43 @@ fn main() {
         history_graph_tile_output.display()
     );
 
+    // ClimateTile component (TASK-108) — Phase 6 Wave 2 climate tile.
+    //
+    // Compiles `ui/slint/climate_tile.slint` to a separate output file so
+    // the bridge's `climate_tile_slint` submodule can reference the
+    // generated `ClimateTile`, `ClimateTileVM`, and `ClimateTilePlacement`
+    // types without pulling in the full production `MainWindow` symbol set.
+    // Mirrors the pattern used by `cover_tile.slint` (TASK-102),
+    // `fan_tile.slint` (TASK-103), `lock_tile.slint` (TASK-104),
+    // `alarm_panel_tile.slint` (TASK-105), `history_graph_tile.slint`
+    // (TASK-106), and `camera_snapshot_tile.slint` (TASK-107).
+    //
+    // This compile puts `climate_tile.slint` in the build graph: `cargo
+    // build` fails if the component has a syntax or type error
+    // (satisfying the "Slint component compile gate" acceptance criterion
+    // in TASK-108).
+    //
+    // The generated types are accessible to `src/ui/bridge.rs` via
+    // `include!(env!("HANUI_CLIMATE_TILE_INCLUDE"))` inside the
+    // `climate_tile_slint` submodule.
+    let climate_tile_input = manifest_dir.join("ui/slint/climate_tile.slint");
+    let climate_tile_output = out_dir.join("climate_tile.rs");
+
+    let climate_tile_deps = slint_build::compile_with_output_path(
+        &climate_tile_input,
+        &climate_tile_output,
+        slint_build::CompilerConfiguration::default(),
+    )
+    .expect("compile ui/slint/climate_tile.slint with slint-build");
+
+    for dep in climate_tile_deps {
+        println!("cargo:rerun-if-changed={}", dep.display());
+    }
+    println!(
+        "cargo:rustc-env=HANUI_CLIMATE_TILE_INCLUDE={}",
+        climate_tile_output.display()
+    );
+
     // CameraSnapshotTile component (TASK-107) — Phase 6 Wave 2 camera-snapshot tile.
     //
     // Compiles `ui/slint/camera_snapshot_tile.slint` to a separate output file
