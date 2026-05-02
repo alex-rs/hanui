@@ -23,5 +23,6 @@ pub mod history_graph;
 pub mod lock;
 pub mod media_player;
 pub mod more_info;
+pub mod power_flow;
 pub mod toast;
 pub mod view_router;

@@ -1059,29 +1059,13 @@ impl MoreInfoBody for CameraBody {
     }
 }
 
-/// More-info body for `power_flow` / `power_flow_card_plus` widgets.
-///
-/// Returns the entity's state. Phase 6d (`TASK-094`) will replace this with
-/// the full power-flow diagram.
-#[derive(Debug, Default)]
-pub struct PowerFlowBody;
-
-impl PowerFlowBody {
-    /// Construct a [`PowerFlowBody`].
-    #[must_use]
-    pub fn new() -> Self {
-        PowerFlowBody
-    }
-}
-
-impl MoreInfoBody for PowerFlowBody {
-    fn render_rows(&self, entity: &Entity) -> Vec<ModalRow> {
-        vec![ModalRow {
-            key: "state".to_owned(),
-            value: entity.state.as_ref().to_owned(),
-        }]
-    }
-}
+// `PowerFlowBody` lives in `src/ui/power_flow.rs` (TASK-094) so the
+// power-flow tile and its modal body share the same `read_power_watts`
+// / `read_battery_pct` parsers without circular imports. Re-exported
+// here so `body_for_widget` and the conformance assertion below can
+// reference it through the same `more_info::*` path every other body
+// uses.
+pub use crate::ui::power_flow::PowerFlowBody;
 
 // Compile-time per-domain body conformance assertions.
 // If any of the new bodies ever drift out of conformance with the
@@ -1129,8 +1113,8 @@ const _PER_DOMAIN_BODIES_ARE_MORE_INFO_BODY: fn() = || {
 #[must_use]
 pub fn body_for_widget(
     kind: WidgetKind,
-    _options: Option<&WidgetOptions>,
-    _store: Arc<LiveStore>,
+    options: Option<&WidgetOptions>,
+    store: Arc<LiveStore>,
 ) -> Box<dyn MoreInfoBody> {
     match kind {
         // Per-domain body stubs — each returns domain-relevant attribute rows.
@@ -1143,7 +1127,49 @@ pub fn body_for_widget(
         WidgetKind::MediaPlayer => Box::new(MediaPlayerBody::new()),
         WidgetKind::History => Box::new(HistoryBody::new()),
         WidgetKind::Camera => Box::new(CameraBody::new()),
-        WidgetKind::PowerFlow => Box::new(PowerFlowBody::new()),
+        WidgetKind::PowerFlow => {
+            // TASK-094: resolve the auxiliary entities (solar / battery /
+            // battery_soc / home) from the live store at modal-open
+            // time. The grid entity is the *primary* entity — its
+            // state arrives through `Entity` argument on
+            // `render_rows`, so we do not pre-resolve it here.
+            //
+            // When `options` is absent or the widget configures no
+            // auxiliary entities, all four values stay `None` and the
+            // body emits only the `grid_w` row.
+            use crate::ha::entity::EntityId;
+            use crate::ha::store::EntityStore;
+            use crate::ui::power_flow::PowerFlowVM;
+
+            let resolve_power = |opt: Option<&str>| -> Option<f32> {
+                let id = opt?;
+                let entity = store.get(&EntityId::from(id))?;
+                PowerFlowVM::read_power_watts(&entity)
+            };
+            let resolve_pct = |opt: Option<&str>| -> Option<f32> {
+                let id = opt?;
+                let entity = store.get(&EntityId::from(id))?;
+                PowerFlowVM::read_battery_pct(&entity)
+            };
+
+            let (solar_w, battery_w, battery_pct, home_w) = match options {
+                Some(WidgetOptions::PowerFlow {
+                    solar_entity,
+                    battery_entity,
+                    battery_soc_entity,
+                    home_entity,
+                    ..
+                }) => (
+                    resolve_power(solar_entity.as_deref()),
+                    resolve_power(battery_entity.as_deref()),
+                    resolve_pct(battery_soc_entity.as_deref()),
+                    resolve_power(home_entity.as_deref()),
+                ),
+                _ => (None, None, None, None),
+            };
+
+            Box::new(PowerFlowBody::new(solar_w, battery_w, battery_pct, home_w))
+        }
         // Fallback: widget kinds without a per-domain body use AttributesBody.
         WidgetKind::LightTile | WidgetKind::SensorTile | WidgetKind::EntityTile => {
             Box::new(AttributesBody::new())
@@ -1458,8 +1484,10 @@ mod tests {
     #[test]
     fn body_for_widget_returns_per_domain_body() {
         let store = Arc::new(LiveStore::new());
-        // Exercise all nine per-domain match arms so the factory is fully
-        // covered; the exhaustive match ensures compile-time completeness.
+        // Eight bodies (all except PowerFlow) emit the entity state as
+        // their first row — exercise that contract here. PowerFlow has
+        // its own row schema (grid_w, solar_w, ...) and is covered by
+        // `body_for_widget_returns_power_flow_body`.
         let cases: &[(WidgetKind, &str, &str)] = &[
             (WidgetKind::Cover, "cover.garage_door", "closed"),
             (WidgetKind::Fan, "fan.bedroom", "on"),
@@ -1469,7 +1497,6 @@ mod tests {
             (WidgetKind::MediaPlayer, "media_player.tv", "playing"),
             (WidgetKind::History, "sensor.temperature", "21.5"),
             (WidgetKind::Camera, "camera.front_door", "idle"),
-            (WidgetKind::PowerFlow, "sensor.grid_power", "1.2"),
         ];
         for (kind, id, state) in cases {
             let body = body_for_widget(kind.clone(), None, Arc::clone(&store));
@@ -1479,6 +1506,23 @@ mod tests {
             assert_eq!(rows[0].key, "state");
             assert_eq!(rows[0].value, *state);
         }
+    }
+
+    /// `body_for_widget` for `WidgetKind::PowerFlow` returns a
+    /// [`PowerFlowBody`] whose first row is `grid_w` (TASK-094) — the
+    /// primary entity is the grid sensor, not a generic "state" row.
+    #[test]
+    fn body_for_widget_returns_power_flow_body() {
+        let store = Arc::new(LiveStore::new());
+        let body = body_for_widget(WidgetKind::PowerFlow, None, Arc::clone(&store));
+        let entity = minimal_entity("sensor.grid_power", "1500");
+        let rows = body.render_rows(&entity);
+        assert!(
+            !rows.is_empty(),
+            "PowerFlow body must return non-empty rows"
+        );
+        assert_eq!(rows[0].key, "grid_w");
+        assert_eq!(rows[0].value, "1500.0 W");
     }
 
     /// `body_for_widget` falls back to `AttributesBody` for `LightTile`,
@@ -1584,13 +1628,16 @@ mod tests {
         assert_eq!(rows[0].value, "idle");
     }
 
+    /// `PowerFlowBody` with no auxiliary entities still surfaces the
+    /// grid_w row (the primary entity passed to `render_rows` is the
+    /// grid sensor, parsed via `read_power_watts`).
     #[test]
     fn power_flow_body_attribute_rows_non_empty() {
         let entity = minimal_entity("sensor.grid_power", "1.2");
-        let rows = PowerFlowBody::new().render_rows(&entity);
+        let rows = PowerFlowBody::new(None, None, None, None).render_rows(&entity);
         assert!(!rows.is_empty(), "PowerFlowBody must return non-empty rows");
-        assert_eq!(rows[0].key, "state");
-        assert_eq!(rows[0].value, "1.2");
+        assert_eq!(rows[0].key, "grid_w");
+        assert_eq!(rows[0].value, "1.2 W");
     }
 
     // -----------------------------------------------------------------------
