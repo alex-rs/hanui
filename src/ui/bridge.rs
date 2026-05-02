@@ -7523,4 +7523,60 @@ mod tests {
         assert!(!rows.iter().any(|r| r.key == "jammed"));
         assert!(!rows.iter().any(|r| r.key == "code_format"));
     }
+
+    // -----------------------------------------------------------------------
+    // compute_alarm_tile_vm (TASK-105)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compute_alarm_tile_vm_disarmed_state() {
+        let entity = make_test_entity("alarm_control_panel.home", "disarmed");
+        let vm = compute_alarm_tile_vm(
+            "Home Alarm".to_owned(),
+            "mdi:shield".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.name, "Home Alarm");
+        assert_eq!(vm.state, "disarmed");
+        assert!(!vm.is_armed, "disarmed → is_armed=false");
+        assert!(!vm.is_triggered);
+        assert!(!vm.is_pending);
+        assert!(!vm.pending);
+    }
+
+    #[test]
+    fn compute_alarm_tile_vm_armed_away_state() {
+        let entity = make_test_entity("alarm_control_panel.home", "armed_away");
+        let vm = compute_alarm_tile_vm(
+            "Away".to_owned(),
+            "mdi:shield-lock".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert_eq!(vm.state, "armed_away");
+        assert!(vm.is_armed, "armed_away → is_armed=true");
+        assert!(!vm.is_triggered);
+        assert!(!vm.is_pending);
+    }
+
+    #[test]
+    fn compute_alarm_tile_vm_triggered_state() {
+        let entity = make_test_entity("alarm_control_panel.home", "triggered");
+        let vm = compute_alarm_tile_vm(
+            "Triggered".to_owned(),
+            "mdi:shield-alert".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+        );
+        assert!(vm.is_triggered, "triggered → is_triggered=true");
+        assert!(!vm.is_armed, "triggered is not an armed_* state");
+        assert!(!vm.is_pending);
+    }
 }

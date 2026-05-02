@@ -1058,6 +1058,21 @@ mod tests {
         }
     }
 
+    /// Construct an entity with a single JSON-valued attribute.
+    /// Uses `serde_yaml_ng::from_str` (avoids naming the JSON crate path
+    /// per Gate 2 in CI repo-rules for `src/ui/**`).
+    fn entity_with_attr(id: &str, state: &str, key: &str, value_str: &str) -> Entity {
+        let snippet = format!("{{\"{key}\":{value_str}}}");
+        let map = serde_yaml_ng::from_str(&snippet).expect("test snippet must parse");
+        Entity {
+            id: EntityId::from(id),
+            state: Arc::from(state),
+            attributes: Arc::new(map),
+            last_changed: jiff::Timestamp::UNIX_EPOCH,
+            last_updated: jiff::Timestamp::UNIX_EPOCH,
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Existing tests (unchanged)
     // -----------------------------------------------------------------------
@@ -1277,5 +1292,73 @@ mod tests {
             "open_with_body must compute rows via the new body"
         );
         assert_eq!(state.rows()[0].key, "state");
+    }
+
+    // -----------------------------------------------------------------------
+    // AlarmBody attribute-row branches (TASK-105)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn alarm_body_emits_changed_by_row_when_present() {
+        let entity = entity_with_attr(
+            "alarm_control_panel.home",
+            "disarmed",
+            "changed_by",
+            "\"user_1\"",
+        );
+        let rows = AlarmBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "changed_by" && r.value == "user_1"),
+            "changed_by attribute must produce a row: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn alarm_body_emits_code_format_row_when_present() {
+        let entity = entity_with_attr(
+            "alarm_control_panel.home",
+            "armed_away",
+            "code_format",
+            "\"number\"",
+        );
+        let rows = AlarmBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "code_format" && r.value == "number"),
+            "code_format attribute must produce a row: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn alarm_body_emits_code_arm_required_true() {
+        let entity = entity_with_attr(
+            "alarm_control_panel.home",
+            "disarmed",
+            "code_arm_required",
+            "true",
+        );
+        let rows = AlarmBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "code_arm_required" && r.value == "true"),
+            "code_arm_required=true must produce 'true' row: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn alarm_body_emits_code_arm_required_false() {
+        let entity = entity_with_attr(
+            "alarm_control_panel.home",
+            "disarmed",
+            "code_arm_required",
+            "false",
+        );
+        let rows = AlarmBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "code_arm_required" && r.value == "false"),
+            "code_arm_required=false must produce 'false' row: {rows:?}"
+        );
     }
 }
