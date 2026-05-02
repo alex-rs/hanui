@@ -533,11 +533,16 @@ mod tests {
         // `tile_count` in its log, and the previous 3-widget fixture made
         // Phase 6 widgets invisible from `--fixture`. Count guards future
         // accidental shrinkage of the fixture.
+        //
+        // Length is bound to a local so coverage attributes the call to a
+        // line that always executes (vs. the assert-message format args,
+        // which only evaluate on assertion failure and would leave the call
+        // line marked uncovered).
         let d = fixture_dashboard();
+        let widget_count = all_widgets(&d).len();
         assert!(
-            all_widgets(&d).len() >= 12,
-            "fixture must showcase at least 12 widgets (saw {})",
-            all_widgets(&d).len()
+            widget_count >= 12,
+            "fixture must showcase at least 12 widgets (saw {widget_count})"
         );
     }
 
@@ -619,21 +624,30 @@ mod tests {
             .unwrap_or_else(|| panic!("widget {id} must exist in fixture_dashboard"))
     }
 
+    /// Covers the `find_widget` `unwrap_or_else` closure (the panic path is
+    /// otherwise unreachable because all other tests pass valid widget ids).
+    #[test]
+    #[should_panic(expected = "widget no_such_widget must exist in fixture_dashboard")]
+    fn find_widget_panics_when_id_is_missing() {
+        let d = fixture_dashboard();
+        let _ = find_widget(&d, "no_such_widget");
+    }
+
     #[test]
     fn cover_widget_carries_cover_options() {
         let d = fixture_dashboard();
         let w = find_widget(&d, "patio_cover");
         assert_eq!(w.widget_type, WidgetKind::Cover);
-        match &w.options {
+        // Whole-options equality (PartialEq is derived). Avoids `if let`
+        // destructuring whose implicit else-branch would leave the closing
+        // brace marked as an uncovered region.
+        assert_eq!(
+            w.options,
             Some(WidgetOptions::Cover {
-                position_min,
-                position_max,
-            }) => {
-                assert_eq!(*position_min, 0);
-                assert_eq!(*position_max, 100);
-            }
-            other => panic!("expected WidgetOptions::Cover, got {other:?}"),
-        }
+                position_min: 0,
+                position_max: 100,
+            })
+        );
     }
 
     #[test]
@@ -641,16 +655,13 @@ mod tests {
         let d = fixture_dashboard();
         let w = find_widget(&d, "living_room_fan");
         assert_eq!(w.widget_type, WidgetKind::Fan);
-        match &w.options {
+        assert_eq!(
+            w.options,
             Some(WidgetOptions::Fan {
-                speed_count,
-                preset_modes,
-            }) => {
-                assert_eq!(*speed_count, 3);
-                assert_eq!(preset_modes.len(), 3);
-            }
-            other => panic!("expected WidgetOptions::Fan, got {other:?}"),
-        }
+                speed_count: 3,
+                preset_modes: vec!["low".to_string(), "medium".to_string(), "high".to_string(),],
+            })
+        );
     }
 
     #[test]
@@ -658,22 +669,16 @@ mod tests {
         let d = fixture_dashboard();
         let w = find_widget(&d, "front_door_lock");
         assert_eq!(w.widget_type, WidgetKind::Lock);
-        match &w.options {
+        assert_eq!(
+            w.options,
             Some(WidgetOptions::Lock {
-                pin_policy,
-                require_confirmation_on_unlock,
-            }) => {
-                assert!(matches!(
-                    pin_policy,
-                    PinPolicy::Required {
-                        length: 4,
-                        code_format: CodeFormat::Number,
-                    }
-                ));
-                assert!(*require_confirmation_on_unlock);
-            }
-            other => panic!("expected WidgetOptions::Lock, got {other:?}"),
-        }
+                pin_policy: PinPolicy::Required {
+                    length: 4,
+                    code_format: CodeFormat::Number,
+                },
+                require_confirmation_on_unlock: true,
+            })
+        );
     }
 
     #[test]
@@ -681,16 +686,13 @@ mod tests {
         let d = fixture_dashboard();
         let w = find_widget(&d, "garage_door_lock");
         assert_eq!(w.widget_type, WidgetKind::Lock);
-        match &w.options {
+        assert_eq!(
+            w.options,
             Some(WidgetOptions::Lock {
-                pin_policy,
-                require_confirmation_on_unlock,
-            }) => {
-                assert!(matches!(pin_policy, PinPolicy::None));
-                assert!(!*require_confirmation_on_unlock);
-            }
-            other => panic!("expected WidgetOptions::Lock, got {other:?}"),
-        }
+                pin_policy: PinPolicy::None,
+                require_confirmation_on_unlock: false,
+            })
+        );
     }
 
     #[test]
@@ -698,18 +700,15 @@ mod tests {
         let d = fixture_dashboard();
         let w = find_widget(&d, "home_alarm");
         assert_eq!(w.widget_type, WidgetKind::Alarm);
-        match &w.options {
-            Some(WidgetOptions::Alarm { pin_policy }) => {
-                assert!(matches!(
-                    pin_policy,
-                    PinPolicy::RequiredOnDisarm {
-                        length: 4,
-                        code_format: CodeFormat::Number,
-                    }
-                ));
-            }
-            other => panic!("expected WidgetOptions::Alarm, got {other:?}"),
-        }
+        assert_eq!(
+            w.options,
+            Some(WidgetOptions::Alarm {
+                pin_policy: PinPolicy::RequiredOnDisarm {
+                    length: 4,
+                    code_format: CodeFormat::Number,
+                },
+            })
+        );
     }
 
     #[test]
@@ -717,16 +716,13 @@ mod tests {
         let d = fixture_dashboard();
         let w = find_widget(&d, "energy_history");
         assert_eq!(w.widget_type, WidgetKind::History);
-        match &w.options {
+        assert_eq!(
+            w.options,
             Some(WidgetOptions::History {
-                window_seconds,
-                max_points,
-            }) => {
-                assert_eq!(*window_seconds, 86_400);
-                assert_eq!(*max_points, 120);
-            }
-            other => panic!("expected WidgetOptions::History, got {other:?}"),
-        }
+                window_seconds: 86_400,
+                max_points: 120,
+            })
+        );
     }
 
     #[test]
@@ -734,19 +730,13 @@ mod tests {
         let d = fixture_dashboard();
         let w = find_widget(&d, "bedroom_camera");
         assert_eq!(w.widget_type, WidgetKind::Camera);
-        match &w.options {
+        assert_eq!(
+            w.options,
             Some(WidgetOptions::Camera {
-                interval_seconds,
-                url,
-            }) => {
-                assert_eq!(*interval_seconds, 10);
-                assert!(
-                    url.starts_with("http://"),
-                    "camera URL must be set, got {url:?}"
-                );
-            }
-            other => panic!("expected WidgetOptions::Camera, got {other:?}"),
-        }
+                interval_seconds: 10,
+                url: "http://homeassistant.local:8123/api/camera_proxy/camera.bedroom".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -754,19 +744,20 @@ mod tests {
         let d = fixture_dashboard();
         let w = find_widget(&d, "living_room_thermostat");
         assert_eq!(w.widget_type, WidgetKind::Climate);
-        match &w.options {
+        assert_eq!(
+            w.options,
             Some(WidgetOptions::Climate {
-                min_temp,
-                max_temp,
-                step,
-                hvac_modes,
-            }) => {
-                assert!(*min_temp < *max_temp);
-                assert!(*step > 0.0);
-                assert!(!hvac_modes.is_empty());
-            }
-            other => panic!("expected WidgetOptions::Climate, got {other:?}"),
-        }
+                min_temp: 16.0,
+                max_temp: 30.0,
+                step: 0.5,
+                hvac_modes: vec![
+                    "heat".to_string(),
+                    "cool".to_string(),
+                    "heat_cool".to_string(),
+                    "off".to_string(),
+                ],
+            })
+        );
     }
 
     #[test]
@@ -774,17 +765,19 @@ mod tests {
         let d = fixture_dashboard();
         let w = find_widget(&d, "living_room_tv");
         assert_eq!(w.widget_type, WidgetKind::MediaPlayer);
-        match &w.options {
+        assert_eq!(
+            w.options,
             Some(WidgetOptions::MediaPlayer {
-                transport_set,
-                volume_step,
-            }) => {
-                assert!(transport_set.contains(&MediaTransport::Play));
-                assert!(transport_set.contains(&MediaTransport::Pause));
-                assert!(*volume_step > 0.0);
-            }
-            other => panic!("expected WidgetOptions::MediaPlayer, got {other:?}"),
-        }
+                transport_set: vec![
+                    MediaTransport::Play,
+                    MediaTransport::Pause,
+                    MediaTransport::Stop,
+                    MediaTransport::Next,
+                    MediaTransport::Prev,
+                ],
+                volume_step: 0.05,
+            })
+        );
     }
 
     #[test]
@@ -794,26 +787,17 @@ mod tests {
         assert_eq!(w.widget_type, WidgetKind::PowerFlow);
         // PowerFlow uses the multi-entity `WidgetOptions::PowerFlow` payload,
         // not the single-entity `widget.entity` field.
-        assert!(
-            w.entity.is_none(),
-            "PowerFlow widget must leave `entity` unset"
-        );
-        match &w.options {
+        assert!(w.entity.is_none());
+        assert_eq!(
+            w.options,
             Some(WidgetOptions::PowerFlow {
-                grid_entity,
-                solar_entity,
-                battery_entity,
-                battery_soc_entity,
-                home_entity,
-            }) => {
-                assert_eq!(grid_entity, "sensor.grid_power");
-                assert_eq!(solar_entity.as_deref(), Some("sensor.solar_power"));
-                assert_eq!(battery_entity.as_deref(), Some("sensor.battery_power"));
-                assert_eq!(battery_soc_entity.as_deref(), Some("sensor.battery_soc"));
-                assert_eq!(home_entity.as_deref(), Some("sensor.home_power"));
-            }
-            other => panic!("expected WidgetOptions::PowerFlow, got {other:?}"),
-        }
+                grid_entity: "sensor.grid_power".to_string(),
+                solar_entity: Some("sensor.solar_power".to_string()),
+                battery_entity: Some("sensor.battery_power".to_string()),
+                battery_soc_entity: Some("sensor.battery_soc".to_string()),
+                home_entity: Some("sensor.home_power".to_string()),
+            })
+        );
     }
 
     // -----------------------------------------------------------------------
