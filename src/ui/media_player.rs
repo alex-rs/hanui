@@ -522,6 +522,7 @@ mod tests {
     ///   - `Option<String>` artist (24)
     ///   - `Option<f32>` volume_level (8)
     ///   - `bool` is_playing (1, padded)
+    ///
     /// Total fits comfortably in 96 bytes; a `Vec<String>` field would
     /// add at least 24 bytes.
     #[test]
