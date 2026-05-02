@@ -1,0 +1,8 @@
+title: Demo
+views:
+  - title: Cameras
+    path: cameras
+    cards:
+      - type: picture-entity
+        entity: camera.front_door
+        name: Front Door

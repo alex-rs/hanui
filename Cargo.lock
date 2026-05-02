@@ -2633,6 +2633,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lovelace-import"
+version = "0.1.0"
+dependencies = [
+ "hanui",
+ "serde_yaml_ng",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "lru"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

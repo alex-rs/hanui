@@ -1,0 +1,9 @@
+title: Demo
+views:
+  - title: Misc
+    path: misc
+    cards:
+      - type: light
+        entity: light.kitchen
+      - type: button
+        name: Imaginary card

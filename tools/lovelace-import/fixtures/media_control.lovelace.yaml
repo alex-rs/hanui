@@ -1,0 +1,8 @@
+title: Demo
+views:
+  - title: Media
+    path: media
+    cards:
+      - type: media-control
+        entity: media_player.living_room
+        name: Living Room

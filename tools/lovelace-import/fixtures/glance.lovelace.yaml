@@ -1,0 +1,12 @@
+title: Demo
+views:
+  - title: Sensors
+    path: sensors
+    cards:
+      - type: glance
+        title: At a glance
+        entities:
+          - sensor.outdoor_temperature
+          - sensor.indoor_humidity
+          - entity: binary_sensor.front_door
+            name: Front Door

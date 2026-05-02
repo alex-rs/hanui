@@ -1,0 +1,22 @@
+version: 1
+device_profile: desktop
+default_view: climate
+views:
+- id: climate
+  title: Climate
+  layout: sections
+  sections:
+  - id: main
+    title: Imported
+    grid:
+      columns: 4
+      gap: 8
+    widgets:
+    - id: imported_0
+      type: climate
+      entity: climate.living_room
+      entities: []
+      name: Living Room
+      layout:
+        preferred_columns: 2
+        preferred_rows: 2

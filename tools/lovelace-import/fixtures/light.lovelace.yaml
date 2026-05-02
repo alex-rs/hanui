@@ -1,0 +1,8 @@
+title: Demo
+views:
+  - title: Lights
+    path: lights
+    cards:
+      - type: light
+        entity: light.kitchen
+        name: Kitchen

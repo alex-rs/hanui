@@ -1,3 +1,12 @@
+# Phase 6 sub-phase 6c (TASK-111) introduces a Cargo workspace so the Lovelace
+# importer (`tools/lovelace-import/`) can live as a separate dev-time member
+# without inflating the main `hanui` binary's dependency tree. Per
+# `locked_decisions.lovelace_workspace_cargo_shape` in
+# `docs/plans/2026-04-30-phase-6-advanced-widgets.md`.
+[workspace]
+members = [".", "tools/lovelace-import"]
+resolver = "2"
+
 [package]
 name = "hanui"
 version = "0.1.0"

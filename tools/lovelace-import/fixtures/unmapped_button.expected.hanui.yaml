@@ -1,0 +1,24 @@
+version: 1
+device_profile: desktop
+default_view: misc
+views:
+- id: misc
+  title: Misc
+  layout: sections
+  sections:
+  - id: main
+    title: Imported
+    grid:
+      columns: 4
+      gap: 8
+    widgets:
+    - id: imported_0
+      type: light_tile
+      entity: light.kitchen
+      entities: []
+      layout:
+        preferred_columns: 2
+        preferred_rows: 2
+# UNMAPPED: the following Lovelace cards have no hanui mapping;
+# fix these by hand before deploying.
+# UNMAPPED: view=Misc card=1 type=button

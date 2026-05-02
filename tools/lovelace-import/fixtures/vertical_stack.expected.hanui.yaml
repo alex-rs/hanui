@@ -1,0 +1,30 @@
+version: 1
+device_profile: desktop
+default_view: bedroom
+views:
+- id: bedroom
+  title: Bedroom
+  layout: sections
+  sections:
+  - id: main
+    title: Imported
+    grid:
+      columns: 4
+      gap: 8
+    widgets:
+    - id: imported_0
+      type: light_tile
+      entity: light.bedroom_main
+      entities: []
+      name: Bedroom Main
+      layout:
+        preferred_columns: 2
+        preferred_rows: 2
+    - id: imported_1
+      type: light_tile
+      entity: light.bedroom_lamp
+      entities: []
+      name: Bedside Lamp
+      layout:
+        preferred_columns: 2
+        preferred_rows: 2

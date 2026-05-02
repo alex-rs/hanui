@@ -1,0 +1,29 @@
+version: 1
+device_profile: desktop
+default_view: hallway
+views:
+- id: hallway
+  title: Hallway
+  layout: sections
+  sections:
+  - id: main
+    title: Imported
+    grid:
+      columns: 4
+      gap: 8
+    widgets:
+    - id: imported_0
+      type: entity_tile
+      entities:
+      - sensor.hallway_temperature
+      - sensor.hallway_humidity
+      layout:
+        preferred_columns: 2
+        preferred_rows: 2
+    - id: imported_1
+      type: light_tile
+      entity: light.hallway
+      entities: []
+      layout:
+        preferred_columns: 2
+        preferred_rows: 2

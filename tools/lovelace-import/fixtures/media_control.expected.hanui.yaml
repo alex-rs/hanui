@@ -1,0 +1,22 @@
+version: 1
+device_profile: desktop
+default_view: media
+views:
+- id: media
+  title: Media
+  layout: sections
+  sections:
+  - id: main
+    title: Imported
+    grid:
+      columns: 4
+      gap: 8
+    widgets:
+    - id: imported_0
+      type: media_player
+      entity: media_player.living_room
+      entities: []
+      name: Living Room
+      layout:
+        preferred_columns: 2
+        preferred_rows: 2

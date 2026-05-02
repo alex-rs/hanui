@@ -1,0 +1,13 @@
+title: Demo
+views:
+  - title: Bedroom
+    path: bedroom
+    cards:
+      - type: vertical-stack
+        cards:
+          - type: light
+            entity: light.bedroom_main
+            name: Bedroom Main
+          - type: light
+            entity: light.bedroom_lamp
+            name: Bedside Lamp

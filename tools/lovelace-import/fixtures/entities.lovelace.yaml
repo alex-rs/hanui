@@ -1,0 +1,12 @@
+title: Demo
+views:
+  - title: Living Room
+    path: living_room
+    cards:
+      - type: entities
+        title: Quick toggles
+        entities:
+          - light.kitchen
+          - switch.outlet_1
+          - entity: sensor.living_room_temperature
+            name: Temperature

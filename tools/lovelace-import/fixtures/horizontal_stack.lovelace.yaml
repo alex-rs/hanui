@@ -1,0 +1,13 @@
+title: Demo
+views:
+  - title: Hallway
+    path: hallway
+    cards:
+      - type: horizontal-stack
+        cards:
+          - type: glance
+            entities:
+              - sensor.hallway_temperature
+              - sensor.hallway_humidity
+          - type: light
+            entity: light.hallway
