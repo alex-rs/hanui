@@ -716,3 +716,37 @@ options:
 
 The `code_format: "Number"` or `code_format: "Any"` string form is no longer valid.
 Use `pin_policy: none` or `pin_policy: { required: { length: N, code_format: number|any } }`.
+
+---
+
+## Runtime-only fields (not part of the YAML schema)
+
+Some fields on the in-memory `Dashboard` struct exist for runtime indexing only.
+They are annotated `#[serde(default, skip)]` in `src/dashboard/schema.rs`, are
+NOT serialized to nor deserialized from YAML, and MUST NOT appear in any
+`dashboard.yaml` file authored by an operator. The Phase 4/6 round-trip test
+(`round_trip_dashboard_yaml_is_byte_equal` in `src/dashboard/schema.rs`) pins
+this contract.
+
+### `dep_index`
+
+**Type**: `Arc<HashMap<EntityId, Vec<WidgetId>>>` (runtime-only)
+**Authored by**: `src/dashboard/visibility.rs::build_dep_index` (Phase 6b TASK-110)
+**User-facing**: no — populated by the loader after the YAML is parsed and
+validated.
+
+The reverse `EntityId → Vec<WidgetId>` index used by the bridge layer to resolve,
+in O(1), which widgets need a visibility re-evaluation when a given entity
+changes state. Per `locked_decisions.dep_index_partial_eq`, the manual
+`PartialEq` impl for `Dashboard` compares this field structurally (NOT by
+`Arc::ptr_eq`).
+
+### `call_service_allowlist`
+
+**Type**: `Arc<BTreeSet<(String, String)>>` (runtime-only)
+**Authored by**: `src/dashboard/validate.rs::validate` (Phase 4 TASK-083)
+**User-facing**: no — populated by the validator after the YAML is parsed.
+
+The per-config allowlist of `(domain, service)` pairs used at runtime to gate
+`CallService` action dispatches. See
+`locked_decisions.call_service_allowlist_runtime_access`.

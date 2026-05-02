@@ -182,6 +182,7 @@ impl BridgeSink for RecordingSink {
 fn single_entity_dashboard(entity_id: &str) -> Dashboard {
     Dashboard {
         call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+        dep_index: std::sync::Arc::default(),
         version: 1,
         device_profile: ProfileKey::Rpi4,
         home_assistant: None,
@@ -456,6 +457,7 @@ fn three_entity_dashboard(ids: [&str; 3]) -> Dashboard {
         .collect();
     Dashboard {
         call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+        dep_index: std::sync::Arc::default(),
         version: 1,
         device_profile: ProfileKey::Rpi4,
         home_assistant: None,

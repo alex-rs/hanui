@@ -432,6 +432,7 @@ fn make_dashboard_with_n_widgets(
         .collect();
     Dashboard {
         call_service_allowlist: Arc::new(std::collections::BTreeSet::new()),
+        dep_index: std::sync::Arc::default(),
         version: 1,
         device_profile: ProfileKey::OpiZero3,
         home_assistant: None,

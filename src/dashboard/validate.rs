@@ -595,6 +595,7 @@ mod tests {
                 sections: vec![],
             }],
             call_service_allowlist: Arc::default(),
+            dep_index: std::sync::Arc::default(),
         }
     }
 
@@ -1620,6 +1621,7 @@ views:
                 sections: vec![section],
             }],
             call_service_allowlist: Arc::default(),
+            dep_index: std::sync::Arc::default(),
         };
 
         // Use more than max_widgets_per_view to trigger MaxWidgetsPerViewExceeded.
