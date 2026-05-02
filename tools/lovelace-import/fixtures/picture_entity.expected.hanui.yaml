@@ -1,0 +1,22 @@
+version: 1
+device_profile: desktop
+default_view: cameras
+views:
+- id: cameras
+  title: Cameras
+  layout: sections
+  sections:
+  - id: main
+    title: Imported
+    grid:
+      columns: 4
+      gap: 8
+    widgets:
+    - id: imported_0
+      type: camera
+      entity: camera.front_door
+      entities: []
+      name: Front Door
+      layout:
+        preferred_columns: 2
+        preferred_rows: 2

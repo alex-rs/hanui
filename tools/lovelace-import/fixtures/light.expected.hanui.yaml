@@ -1,0 +1,22 @@
+version: 1
+device_profile: desktop
+default_view: lights
+views:
+- id: lights
+  title: Lights
+  layout: sections
+  sections:
+  - id: main
+    title: Imported
+    grid:
+      columns: 4
+      gap: 8
+    widgets:
+    - id: imported_0
+      type: light_tile
+      entity: light.kitchen
+      entities: []
+      name: Kitchen
+      layout:
+        preferred_columns: 2
+        preferred_rows: 2

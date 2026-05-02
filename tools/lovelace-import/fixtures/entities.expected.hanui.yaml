@@ -1,0 +1,23 @@
+version: 1
+device_profile: desktop
+default_view: living_room
+views:
+- id: living_room
+  title: Living Room
+  layout: sections
+  sections:
+  - id: main
+    title: Imported
+    grid:
+      columns: 4
+      gap: 8
+    widgets:
+    - id: imported_0
+      type: entity_tile
+      entities:
+      - light.kitchen
+      - switch.outlet_1
+      - sensor.living_room_temperature
+      layout:
+        preferred_columns: 2
+        preferred_rows: 2

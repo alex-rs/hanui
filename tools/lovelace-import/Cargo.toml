@@ -1,0 +1,52 @@
+# Lovelace importer — Phase 6 sub-phase 6c (TASK-111).
+#
+# Standalone CLI that converts Home Assistant Lovelace dashboard YAML into
+# hanui dashboard YAML. Lives as a separate workspace member (NOT a `[[bin]]`
+# in the main `hanui` crate) per `locked_decisions.lovelace_workspace_cargo_shape`
+# in `docs/plans/2026-04-30-phase-6-advanced-widgets.md` — the importer is a
+# dev-time migration tool, not a runtime dependency. Folding it into the main
+# binary would inflate the runtime image's dependency tree.
+#
+# Direct lib dependency on `hanui` (path-relative) per Risk #15 mitigation: the
+# importer calls `hanui::dashboard::validate::validate(...)` and YAML-parses
+# its output through `hanui::dashboard::schema::Dashboard` so the importer's
+# emission is self-checked against the same validator the runtime uses. No
+# subprocess hop.
+
+[package]
+name = "lovelace-import"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Convert Home Assistant Lovelace YAML into hanui dashboard YAML."
+# Keep this crate out of the workspace's auto-discovered example/bin/test
+# scanning surface beyond what is declared below — the dir tree only contains
+# the listed targets.
+autobins = false
+autoexamples = false
+autotests = false
+
+[[bin]]
+name = "lovelace-import"
+path = "src/main.rs"
+
+[lib]
+name = "lovelace_import"
+path = "src/lib.rs"
+
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+
+[dependencies]
+# Direct lib dependency: lets us call validator and reuse Dashboard types.
+# This is the Risk #15 mitigation — the importer's emission is self-checked
+# against the same validator the runtime uses, no subprocess hop.
+hanui = { path = "../.." }
+# YAML I/O — same crate the main project uses (NOT the archived dtolnay/serde_yaml).
+serde_yaml_ng = "0.10"
+# `thiserror` powers the `ImportError` enum in `src/lib.rs`. We deliberately
+# avoid pulling `anyhow` / `clap` / `serde_derive` here: the CLI flag surface
+# is small enough to hand-parse and the structured error type is the public
+# library boundary.
+thiserror = "1"

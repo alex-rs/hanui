@@ -1,0 +1,23 @@
+version: 1
+device_profile: desktop
+default_view: sensors
+views:
+- id: sensors
+  title: Sensors
+  layout: sections
+  sections:
+  - id: main
+    title: Imported
+    grid:
+      columns: 4
+      gap: 8
+    widgets:
+    - id: imported_0
+      type: entity_tile
+      entities:
+      - sensor.outdoor_temperature
+      - sensor.indoor_humidity
+      - binary_sensor.front_door
+      layout:
+        preferred_columns: 2
+        preferred_rows: 2
