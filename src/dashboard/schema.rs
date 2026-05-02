@@ -26,12 +26,15 @@
 //! `visibility_predicate_vocabulary`, `cover_position_bounds`,
 //! `history_render_path`, `confirmation_on_lock_unlock`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::actions::map::WidgetId;
 use crate::actions::Action;
+use crate::dashboard::visibility::DepBucket;
+use crate::ha::entity::EntityId;
 
 // ---------------------------------------------------------------------------
 // CallServiceAllowlist
@@ -623,7 +626,18 @@ pub struct View {
 ///
 /// Deserialized from YAML via `serde_yaml_ng`. All map-shaped fields use
 /// `BTreeMap` per `locked_decisions.no_hashmap_in_deserialized_types`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// # Manual `PartialEq`
+///
+/// `PartialEq` is implemented manually below (NOT derived) per
+/// `locked_decisions.dep_index_partial_eq`. The [`Dashboard::dep_index`] field
+/// is an [`Arc`] wrapping a `HashMap`; deriving `PartialEq` would compare the
+/// `Arc` by structural equality, but two independently-built Arcs from the
+/// same source YAML must compare equal so the existing
+/// `round_trip_dashboard_yaml_is_byte_equal` test continues to pass.
+/// The manual impl compares the inner map structurally, ignoring `Arc`
+/// pointer identity, and is order-insensitive within each bucket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dashboard {
     /// `version` — schema version integer.
     pub version: u32,
@@ -653,6 +667,89 @@ pub struct Dashboard {
     /// services that the config never declared.
     #[serde(default, skip)]
     pub call_service_allowlist: Arc<CallServiceAllowlist>,
+    /// Reverse `EntityId → Vec<WidgetId>` index built by
+    /// [`crate::dashboard::visibility::build_dep_index`] at load time.
+    ///
+    /// **Not serialized to / deserialized from YAML** (`#[serde(default, skip)]`).
+    /// A freshly-deserialized `Dashboard` carries an empty index; the loader
+    /// populates it after parsing so the bridge can resolve, in O(1), which
+    /// widgets need a visibility re-evaluation when a given entity changes
+    /// state.
+    ///
+    /// Per `locked_decisions.dep_index_partial_eq`, `Arc::ptr_eq` is NOT used
+    /// in the manual `PartialEq` for `Dashboard` — the inner map is compared
+    /// structurally so independently-built Arcs from the same YAML compare
+    /// equal.
+    #[serde(default, skip)]
+    pub dep_index: Arc<HashMap<EntityId, DepBucket>>,
+}
+
+// ---------------------------------------------------------------------------
+// Manual PartialEq for Dashboard
+// ---------------------------------------------------------------------------
+
+impl PartialEq for Dashboard {
+    fn eq(&self, other: &Self) -> bool {
+        // Plain-derived comparison for every field except `dep_index`. We
+        // hand-roll the comparison here rather than splitting Dashboard into
+        // a helper struct so callers continue to use Dashboard literals.
+        if self.version != other.version
+            || self.device_profile != other.device_profile
+            || self.home_assistant != other.home_assistant
+            || self.theme != other.theme
+            || self.default_view != other.default_view
+            || self.views != other.views
+            || self.call_service_allowlist != other.call_service_allowlist
+        {
+            return false;
+        }
+        // `dep_index`: structural compare of the inner map. Two
+        // independently-built Arcs over the same content must compare equal,
+        // so we explicitly do NOT use `Arc::ptr_eq`.
+        dep_index_structurally_eq(&self.dep_index, &other.dep_index)
+    }
+}
+
+impl Eq for Dashboard {}
+
+/// Compare two dep_index maps structurally, ignoring `Arc` pointer identity
+/// and ignoring widget-id order within each bucket.
+///
+/// Per `locked_decisions.dep_index_partial_eq`: "Two Dashboards equal iff
+/// their dep_index maps have the same keys and the same SmallVec contents
+/// (order-insensitive within a SmallVec since widget ID order in a bucket
+/// does not affect evaluation correctness)."
+fn dep_index_structurally_eq(
+    a: &Arc<HashMap<EntityId, DepBucket>>,
+    b: &Arc<HashMap<EntityId, DepBucket>>,
+) -> bool {
+    if Arc::ptr_eq(a, b) {
+        return true;
+    }
+    if a.len() != b.len() {
+        return false;
+    }
+    for (key, bucket_a) in a.iter() {
+        let bucket_b = match b.get(key) {
+            Some(v) => v,
+            None => return false,
+        };
+        if bucket_a.len() != bucket_b.len() {
+            return false;
+        }
+        // Order-insensitive: every element of bucket_a must appear in bucket_b
+        // the same number of times. We sort clones rather than building a
+        // multiset because dep buckets are tiny (<= DEP_INLINE_CAP in the
+        // common case).
+        let mut sa: Vec<&WidgetId> = bucket_a.iter().collect();
+        let mut sb: Vec<&WidgetId> = bucket_b.iter().collect();
+        sa.sort_by(|x, y| x.as_str().cmp(y.as_str()));
+        sb.sort_by(|x, y| x.as_str().cmp(y.as_str()));
+        if sa != sb {
+            return false;
+        }
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -883,6 +980,98 @@ views:
             first, second,
             "Dashboard round-trip must produce byte-equal values"
         );
+    }
+
+    /// Per `locked_decisions.dep_index_partial_eq`: two `Dashboard` values
+    /// with identical content but independently-built `Arc<dep_index>` instances
+    /// (different `Arc` pointers) must compare equal. This pins the manual
+    /// `PartialEq` against accidental `Arc::ptr_eq` regression.
+    #[test]
+    fn dashboard_partial_eq_compares_dep_index_structurally() {
+        use crate::actions::map::WidgetId;
+        use crate::dashboard::visibility::DepBucket;
+        use crate::ha::entity::EntityId;
+        use std::collections::HashMap;
+
+        let mut a_map: HashMap<EntityId, DepBucket> = HashMap::new();
+        a_map.insert(
+            EntityId::from("light.kitchen"),
+            vec![WidgetId::from("w1"), WidgetId::from("w2")],
+        );
+        let mut b_map: HashMap<EntityId, DepBucket> = HashMap::new();
+        // Same content but inserted in reverse (order-insensitive within bucket).
+        b_map.insert(
+            EntityId::from("light.kitchen"),
+            vec![WidgetId::from("w2"), WidgetId::from("w1")],
+        );
+
+        // Two independently-built Arcs.
+        let a = Dashboard {
+            version: 1,
+            device_profile: ProfileKey::Desktop,
+            home_assistant: None,
+            theme: None,
+            default_view: "home".to_string(),
+            views: vec![],
+            call_service_allowlist: Arc::default(),
+            dep_index: Arc::new(a_map),
+        };
+        let b = Dashboard {
+            version: 1,
+            device_profile: ProfileKey::Desktop,
+            home_assistant: None,
+            theme: None,
+            default_view: "home".to_string(),
+            views: vec![],
+            call_service_allowlist: Arc::default(),
+            dep_index: Arc::new(b_map),
+        };
+        // Pointer identity of the two Arcs must NOT be required for equality.
+        assert!(!Arc::ptr_eq(&a.dep_index, &b.dep_index));
+        assert_eq!(a, b);
+
+        // Now a different bucket content — must NOT be equal.
+        let mut c_map: HashMap<EntityId, DepBucket> = HashMap::new();
+        c_map.insert(EntityId::from("light.kitchen"), vec![WidgetId::from("w1")]);
+        let c = Dashboard {
+            dep_index: Arc::new(c_map),
+            ..a.clone()
+        };
+        assert_ne!(a, c);
+
+        // Different keys — also not equal.
+        let mut d_map: HashMap<EntityId, DepBucket> = HashMap::new();
+        d_map.insert(
+            EntityId::from("light.bedroom"),
+            vec![WidgetId::from("w1"), WidgetId::from("w2")],
+        );
+        let d = Dashboard {
+            dep_index: Arc::new(d_map),
+            ..a.clone()
+        };
+        assert_ne!(a, d);
+    }
+
+    /// Same as round_trip_dashboard_yaml_is_byte_equal but explicitly populates
+    /// the dep_index (as the loader does in production) to confirm the round-
+    /// trip remains byte-equal once the dep_index is non-empty on both sides.
+    #[test]
+    fn round_trip_yaml_byte_equal_with_dep_index() {
+        use crate::dashboard::visibility::build_dep_index;
+
+        let mut first: Dashboard =
+            serde_yaml_ng::from_str(FIXTURE_YAML).expect("first parse must succeed");
+        first.dep_index = Arc::new(build_dep_index(&first));
+
+        let serialized = serde_yaml_ng::to_string(&first).expect("serialization must succeed");
+        let mut second: Dashboard =
+            serde_yaml_ng::from_str(&serialized).expect("second parse must succeed");
+        second.dep_index = Arc::new(build_dep_index(&second));
+
+        // The manual PartialEq compares dep_index structurally; two
+        // independently-built indices over the same widget list must be equal.
+        assert!(!Arc::ptr_eq(&first.dep_index, &second.dep_index));
+        assert_eq!(first, second);
     }
 
     #[test]

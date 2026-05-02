@@ -3755,6 +3755,7 @@ mod tests {
         // whatever fixture_dashboard() points at.
         let dashboard = Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,
@@ -3819,6 +3820,7 @@ mod tests {
 
         let dashboard = Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,
@@ -3878,6 +3880,7 @@ mod tests {
 
         let dashboard = Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,
@@ -3950,6 +3953,7 @@ mod tests {
         // binary_sensor.foo has an empty attributes map (no friendly_name).
         let dashboard = Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,
@@ -4009,6 +4013,7 @@ mod tests {
 
         let dashboard = Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,
@@ -4898,6 +4903,7 @@ mod tests {
         };
         Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,
@@ -4981,6 +4987,7 @@ mod tests {
         };
         let dashboard = Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,
@@ -5155,6 +5162,7 @@ mod tests {
         };
         Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,
@@ -5228,6 +5236,7 @@ mod tests {
         // Same entity referenced by a Light tile AND an Entity tile.
         let dashboard = Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,
@@ -5317,6 +5326,7 @@ mod tests {
         };
         let dashboard = Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,
@@ -5803,6 +5813,7 @@ mod tests {
         };
         let dashboard = Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,
@@ -6010,6 +6021,7 @@ mod tests {
         };
         let dashboard = Arc::new(Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,
@@ -6091,6 +6103,7 @@ mod tests {
 
         let dashboard = Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,
@@ -6529,6 +6542,7 @@ mod tests {
         };
         let dashboard = Arc::new(Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,
@@ -6734,6 +6748,7 @@ mod tests {
                 },
             ],
             call_service_allowlist: Default::default(),
+            dep_index: std::sync::Arc::default(),
         }
     }
 
@@ -6766,6 +6781,7 @@ mod tests {
                 },
             ],
             call_service_allowlist: Default::default(),
+            dep_index: std::sync::Arc::default(),
         }
     }
 
@@ -7192,6 +7208,7 @@ mod tests {
         };
         Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,

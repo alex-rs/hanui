@@ -208,7 +208,7 @@ pub fn load(
     }
 
     // Step 4: parse YAML into typed Dashboard.
-    let dashboard: Dashboard = serde_yaml_ng::from_slice(&bytes).map_err(|e| {
+    let mut dashboard: Dashboard = serde_yaml_ng::from_slice(&bytes).map_err(|e| {
         // Extract a bounded excerpt from the error message; never return the
         // full YAML (which might contain token-adjacent context).
         let msg = e.to_string();
@@ -261,6 +261,16 @@ pub fn load(
     if !errors.is_empty() {
         return Err(LoadError::Validation { issues: errors });
     }
+
+    // Step 7: build the entity → widget dependency index for the
+    // visibility evaluator (TASK-110). The bridge holds an `Arc<Dashboard>`
+    // and reads `dashboard.dep_index` on each `state_changed` event to
+    // resolve, in O(1), which widgets need a visibility re-evaluation.
+    //
+    // Per `locked_decisions.dep_index_partial_eq`, the field has
+    // `#[serde(default, skip)]`; we populate it AFTER serde parsing.
+    let dep_index = crate::dashboard::visibility::build_dep_index(&dashboard);
+    dashboard.dep_index = std::sync::Arc::new(dep_index);
 
     Ok(dashboard)
 }

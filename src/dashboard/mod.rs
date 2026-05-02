@@ -4,3 +4,4 @@ pub mod loader;
 pub mod profiles;
 pub mod schema;
 pub mod validate;
+pub mod visibility;

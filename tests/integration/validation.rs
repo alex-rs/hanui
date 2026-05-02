@@ -38,6 +38,7 @@ fn minimal_dashboard() -> Dashboard {
             sections: vec![],
         }],
         call_service_allowlist: Arc::default(),
+        dep_index: std::sync::Arc::default(),
     }
 }
 
@@ -625,6 +626,7 @@ fn token_env_value_does_not_leak_into_issues() {
             sections: vec![section],
         }],
         call_service_allowlist: Arc::default(),
+        dep_index: std::sync::Arc::default(),
     };
 
     // Trigger MaxWidgetsPerViewExceeded.

@@ -39,6 +39,7 @@ const FIXTURE_VISIBILITY: &str = "always";
 pub fn fixture_dashboard() -> Dashboard {
     Dashboard {
         call_service_allowlist: Arc::new(BTreeSet::new()),
+        dep_index: std::sync::Arc::default(),
         version: 1,
         device_profile: ProfileKey::Rpi4,
         home_assistant: None,

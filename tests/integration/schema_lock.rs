@@ -1236,6 +1236,7 @@ fn every_doc_field_round_trips() {
             }],
         }],
         call_service_allowlist: Arc::default(),
+        dep_index: std::sync::Arc::default(),
     };
 
     // Serialize to YAML and re-parse.

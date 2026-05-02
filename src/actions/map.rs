@@ -380,6 +380,7 @@ mod tests {
         };
         let dashboard = Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,
@@ -453,6 +454,7 @@ mod tests {
         }
         let dashboard = Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,
@@ -526,6 +528,7 @@ mod tests {
         }
         let dashboard = Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,
@@ -576,6 +579,7 @@ mod tests {
         use crate::dashboard::schema::{Dashboard, Layout, ProfileKey, Section, View};
         let dashboard = Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,
@@ -635,6 +639,7 @@ mod tests {
 
         let dashboard = Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,
@@ -705,6 +710,7 @@ mod tests {
         // case where all three action fields are absent from the YAML.
         let dashboard = Dashboard {
             call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
             version: 1,
             device_profile: ProfileKey::Rpi4,
             home_assistant: None,
