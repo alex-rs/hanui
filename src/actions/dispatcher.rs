@@ -333,6 +333,19 @@ pub enum DispatchOutcome {
         /// Entity targeted by the deferred lock/unlock.
         entity_id: EntityId,
     },
+    /// [`Action::AlarmArm`] / [`Action::AlarmDisarm`] (TASK-105) with a
+    /// PIN policy that mandates a prompt: the dispatcher invoked
+    /// [`crate::actions::pin::PinEntryHost::request_pin`] and the actual
+    /// `alarm_control_panel.alarm_arm_*` / `alarm_control_panel.alarm_disarm`
+    /// service call is deferred until the user submits a PIN. Per
+    /// `locked_decisions.pin_entry_dispatch` the code is consumed exactly
+    /// once via FnOnce and never persisted — the on_submit closure builds
+    /// the call_service frame with the code in `data.code` and `try_send`s
+    /// the OutboundCommand on `command_tx`.
+    AlarmAwaitingPinEntry {
+        /// Entity targeted by the deferred arm/disarm.
+        entity_id: EntityId,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -588,6 +601,31 @@ pub enum LockOperation {
     Unlock,
 }
 
+/// Discriminator for the alarm dispatch helper (TASK-105).
+///
+/// Mirrors [`LockOperation`]: kept as a small typed enum so the
+/// `dispatch_alarm_arm_or_disarm` helper does not have to re-pattern-match
+/// `Action::AlarmArm` / `Action::AlarmDisarm` from the inside. The arm
+/// mode (`home`/`away`/`night`/`vacation`/`custom_bypass`) is forwarded
+/// to the service-map translator via `Action::AlarmArm.mode`; we keep
+/// the mode here so the helper can build the correct service name
+/// (`alarm_arm_home`, etc.) per
+/// `locked_decisions.alarm_arm_service_vocabulary`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlarmOperation {
+    /// `alarm_control_panel.alarm_arm_*` — the specific service is
+    /// resolved at dispatch time from `mode` per
+    /// `locked_decisions.alarm_arm_service_vocabulary`.
+    Arm {
+        /// Arm mode: `home` / `away` / `night` / `vacation` /
+        /// `custom_bypass`. Unknown values surface as
+        /// [`crate::actions::ActionError::UnknownAlarmArmMode`].
+        mode: String,
+    },
+    /// `alarm_control_panel.alarm_disarm`.
+    Disarm,
+}
+
 // ---------------------------------------------------------------------------
 // LockDispatchSettings (TASK-104)
 // ---------------------------------------------------------------------------
@@ -626,6 +664,54 @@ impl LockDispatchSettings {
         LockDispatchSettings {
             pin_policy: crate::dashboard::schema::PinPolicy::None,
             require_confirmation_on_unlock: false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AlarmDispatchSettings (TASK-105)
+// ---------------------------------------------------------------------------
+
+/// Per-widget Alarm dispatch settings, mirroring the relevant fields of
+/// [`crate::dashboard::schema::WidgetOptions::Alarm`].
+///
+/// Populated at startup by the bridge from the loaded `Dashboard` and
+/// installed on the dispatcher via [`Dispatcher::with_alarm_settings`].
+/// The dispatcher reads this table during `Action::AlarmArm` /
+/// `Action::AlarmDisarm` dispatch to decide whether to invoke the PIN
+/// entry flow before building the service-call frame.
+///
+/// # Why a separate type
+///
+/// The dispatcher does not depend directly on `WidgetOptions::Alarm`
+/// because that variant lives in `src/dashboard/schema.rs` (in TASK-105's
+/// `must_not_touch` list). Re-using the [`PinPolicy`] re-export from
+/// `crate::dashboard::schema` is fine — only the type *shape* is
+/// imported, not modified.
+///
+/// # Per `locked_decisions.pin_policy_migration`
+///
+/// `PinPolicy::RequiredOnDisarm` is valid ONLY on Alarm widgets — the
+/// validator rejects Lock widgets that carry it
+/// (`ValidationRule::PinPolicyRequiredOnDisarmOnLock`). The alarm
+/// dispatcher fully respects all three variants:
+///   * `None` — neither arm nor disarm prompts.
+///   * `Required` — both arm and disarm prompt.
+///   * `RequiredOnDisarm` — only disarm prompts; arm dispatches directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlarmDispatchSettings {
+    /// PIN policy for this widget (mirrors `WidgetOptions::Alarm.pin_policy`).
+    pub pin_policy: crate::dashboard::schema::PinPolicy,
+}
+
+impl AlarmDispatchSettings {
+    /// Default settings: no PIN. Used for widgets whose `WidgetOptions`
+    /// block is absent or non-Alarm — the dispatcher falls back to a
+    /// direct service-call dispatch with no modal flow.
+    #[must_use]
+    pub fn permissive() -> Self {
+        AlarmDispatchSettings {
+            pin_policy: crate::dashboard::schema::PinPolicy::None,
         }
     }
 }
@@ -738,6 +824,18 @@ pub struct Dispatcher {
     /// Empty by default — a missing entry resolves to
     /// [`LockDispatchSettings::permissive`] (no PIN, no confirmation).
     lock_settings: Arc<HashMap<WidgetId, LockDispatchSettings>>,
+
+    /// Per-widget alarm dispatch settings (TASK-105). Populated at startup
+    /// from the loaded `Dashboard`'s `WidgetOptions::Alarm` blocks. The
+    /// dispatcher reads `pin_policy` at `Action::AlarmArm` /
+    /// `Action::AlarmDisarm` dispatch time. Wrapped in `Arc<HashMap<...>>`
+    /// for the same reason as `lock_settings` — Clone-cheap. Empty by
+    /// default — a missing entry resolves to
+    /// [`AlarmDispatchSettings::permissive`] (no PIN), and the dispatcher
+    /// returns [`DispatchError::NotImplementedYet`] for an unwired widget
+    /// when the policy would have required PIN entry but the host is
+    /// unavailable.
+    alarm_settings: Arc<HashMap<WidgetId, AlarmDispatchSettings>>,
 }
 
 // Custom `Debug` so the `dyn ViewRouter` field (which does not implement
@@ -828,6 +926,7 @@ impl Dispatcher {
             pin_host: None,
             confirm_host: None,
             lock_settings: Arc::new(HashMap::new()),
+            alarm_settings: Arc::new(HashMap::new()),
         }
     }
 
@@ -851,6 +950,7 @@ impl Dispatcher {
             pin_host: None,
             confirm_host: None,
             lock_settings: Arc::new(HashMap::new()),
+            alarm_settings: Arc::new(HashMap::new()),
         }
     }
 
@@ -1067,6 +1167,25 @@ impl Dispatcher {
         self
     }
 
+    /// Install the per-widget alarm dispatch settings table (TASK-105).
+    ///
+    /// The bridge populates this from each `WidgetOptions::Alarm` block in
+    /// the loaded `Dashboard`. Widgets without an entry resolve to
+    /// [`AlarmDispatchSettings::permissive`] at lookup time (no PIN) —
+    /// matching the schema's default field values.
+    ///
+    /// The table is wrapped in `Arc<HashMap<...>>` internally so the
+    /// dispatcher's `Clone` impl bumps a refcount rather than copying the
+    /// map for every gesture callback.
+    #[must_use]
+    pub fn with_alarm_settings(
+        mut self,
+        settings: HashMap<WidgetId, AlarmDispatchSettings>,
+    ) -> Self {
+        self.alarm_settings = Arc::new(settings);
+        self
+    }
+
     /// Route a gesture on a widget through the action map.
     ///
     /// Per the ticket acceptance criteria, this is the canonical
@@ -1265,14 +1384,25 @@ impl Dispatcher {
                 LockOperation::Unlock,
                 EntityId::from(entity_id.as_str()),
             ),
-            Action::AlarmArm { .. } => Err(DispatchError::NotImplementedYet {
-                what: "AlarmArm",
-                ticket: "TASK-109",
-            }),
-            Action::AlarmDisarm { .. } => Err(DispatchError::NotImplementedYet {
-                what: "AlarmDisarm",
-                ticket: "TASK-109",
-            }),
+            // TASK-105: alarm dispatch — routes through
+            // `dispatch_alarm_arm_or_disarm` which consults the per-widget
+            // `AlarmDispatchSettings.pin_policy` to decide whether to
+            // prompt for PIN before building the service-call frame.
+            // `RequiredOnDisarm` only prompts on disarm; `Required`
+            // prompts on both arm and disarm; `None` skips the prompt
+            // entirely.
+            Action::AlarmArm { entity_id, mode } => self.dispatch_alarm_arm_or_disarm(
+                widget_id,
+                entry,
+                AlarmOperation::Arm { mode: mode.clone() },
+                EntityId::from(entity_id.as_str()),
+            ),
+            Action::AlarmDisarm { entity_id } => self.dispatch_alarm_arm_or_disarm(
+                widget_id,
+                entry,
+                AlarmOperation::Disarm,
+                EntityId::from(entity_id.as_str()),
+            ),
         }
     }
 
@@ -1738,6 +1868,249 @@ impl Dispatcher {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // AlarmArm / AlarmDisarm dispatch (TASK-105)
+    // -----------------------------------------------------------------------
+
+    /// Dispatch [`Action::AlarmArm`] or [`Action::AlarmDisarm`] (TASK-105).
+    ///
+    /// # Flow
+    ///
+    /// Per `locked_decisions.pin_policy_migration`,
+    /// `locked_decisions.pin_entry_dispatch`, and
+    /// `locked_decisions.alarm_arm_service_vocabulary`:
+    ///
+    /// 1. Look up [`AlarmDispatchSettings`] for `widget_id`. Missing
+    ///    entries resolve to [`AlarmDispatchSettings::permissive`] (no
+    ///    PIN).
+    /// 2. Decide whether to prompt for PIN, by combining the operation
+    ///    and the policy:
+    ///
+    ///    |                | None | Required          | RequiredOnDisarm   |
+    ///    |----------------|------|-------------------|--------------------|
+    ///    | `Arm { mode }` | WS   | prompt -> WS      | WS (no prompt)     |
+    ///    | `Disarm`       | WS   | prompt -> WS      | prompt -> WS       |
+    ///
+    /// 3. If PIN required AND a `PinEntryHost` is wired: invoke
+    ///    `pin_host.request_pin(code_format, on_submit)`. The on_submit
+    ///    closure consumes the entered code via FnOnce, builds the
+    ///    `alarm_control_panel.alarm_arm_*` /
+    ///    `alarm_control_panel.alarm_disarm` `OutboundFrame` with
+    ///    `data.code = code`, and `try_send`s on `command_tx`. Return
+    ///    [`DispatchOutcome::AlarmAwaitingPinEntry`] synchronously. The
+    ///    code is dropped at end of the closure scope; no field stores
+    ///    it.
+    /// 4. If PIN required but NO host wired: fail-closed, return
+    ///    [`DispatchError::NotImplementedYet`] so the user sees a typed
+    ///    error rather than a silent skip.
+    /// 5. Else: dispatch directly via [`dispatch_call_service`]. The
+    ///    arm-mode-to-service translation uses
+    ///    [`crate::actions::service_map::action_to_service_call`].
+    ///    Unknown arm modes surface as
+    ///    [`DispatchError::NotImplementedYet`] — the service-map's
+    ///    [`crate::actions::ActionError`] is mapped to a typed dispatch
+    ///    error rather than panicking.
+    ///
+    /// # PIN code never leaks (Risk #7)
+    ///
+    /// The on_submit closure is the *only* code path that touches the
+    /// entered string. It builds a JSON object literal with the code as a
+    /// string value, hands it to `OutboundFrame.data`, and the closure
+    /// then drops. No `tracing::*` call line in this function emits the
+    /// code field — the unit test
+    /// `alarm_pin_code_not_in_tracing_spans` (in this module) installs a
+    /// capturing subscriber and asserts that the synthetic code never
+    /// appears in any captured event line.
+    ///
+    /// # Audit row (per `locked_decisions.audit_substrate_placement`)
+    ///
+    /// On PIN submit, an audit row is emitted with `event="pin.submitted"`,
+    /// `outcome="submitted"`, `scheme=None`, `error_kind=None`. The code
+    /// value, length, and format hint are intentionally NOT in the row.
+    fn dispatch_alarm_arm_or_disarm(
+        &self,
+        widget_id: &WidgetId,
+        entry: &WidgetActionEntry,
+        operation: AlarmOperation,
+        entity_id: EntityId,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        // Look up the per-widget alarm settings; missing → permissive default.
+        let settings = self
+            .alarm_settings
+            .get(widget_id)
+            .cloned()
+            .unwrap_or_else(AlarmDispatchSettings::permissive);
+
+        debug!(
+            widget = %widget_id,
+            entity = %entity_id,
+            ?operation,
+            "dispatch_alarm_arm_or_disarm: routing"
+        );
+
+        // Decide whether to prompt for PIN. The matrix is:
+        //   * None: never.
+        //   * Required: always (both arm and disarm).
+        //   * RequiredOnDisarm: only on disarm (alarm-only — Lock widgets
+        //     reject this variant per
+        //     ValidationRule::PinPolicyRequiredOnDisarmOnLock).
+        let prompt_format: Option<crate::actions::pin::CodeFormat> =
+            match (&settings.pin_policy, &operation) {
+                (crate::dashboard::schema::PinPolicy::None, _) => None,
+                (
+                    crate::dashboard::schema::PinPolicy::Required {
+                        length: _length,
+                        code_format,
+                    },
+                    _,
+                ) => Some(*code_format),
+                (
+                    crate::dashboard::schema::PinPolicy::RequiredOnDisarm { .. },
+                    AlarmOperation::Arm { .. },
+                ) => None,
+                (
+                    crate::dashboard::schema::PinPolicy::RequiredOnDisarm {
+                        length: _length,
+                        code_format,
+                    },
+                    AlarmOperation::Disarm,
+                ) => Some(*code_format),
+            };
+
+        // Resolve the HA service name from the operation. For Arm, we
+        // delegate to the service map so unknown modes surface a typed
+        // error consistent with TASK-099.
+        let service_name: &'static str = match &operation {
+            AlarmOperation::Arm { mode } => match mode.as_str() {
+                "home" => "alarm_arm_home",
+                "away" => "alarm_arm_away",
+                "night" => "alarm_arm_night",
+                "vacation" => "alarm_arm_vacation",
+                "custom_bypass" => "alarm_arm_custom_bypass",
+                _ => {
+                    warn!(
+                        widget = %widget_id,
+                        entity = %entity_id,
+                        "alarm arm: unknown mode rejected"
+                    );
+                    return Err(DispatchError::NotImplementedYet {
+                        what: "AlarmArm with unknown mode",
+                        ticket: "TASK-105",
+                    });
+                }
+            },
+            AlarmOperation::Disarm => "alarm_disarm",
+        };
+
+        match prompt_format {
+            None => {
+                // Direct dispatch — no PIN prompt. Reuse
+                // `dispatch_call_service` so the optimistic / offline /
+                // backpressure paths apply uniformly.
+                self.dispatch_call_service(
+                    "alarm_control_panel",
+                    service_name,
+                    Some(entry.entity_id.as_str()),
+                    None,
+                    None,
+                )
+            }
+            Some(code_format) => {
+                let Some(pin_host) = self.pin_host.as_ref() else {
+                    warn!(
+                        widget = %widget_id,
+                        entity = %entity_id,
+                        "alarm action requires PIN entry but no PinEntryHost is wired (fail-closed)"
+                    );
+                    return Err(DispatchError::NotImplementedYet {
+                        what: "Alarm-with-PIN",
+                        ticket: "TASK-105",
+                    });
+                };
+
+                // Capture the channel for the on_submit closure. We do
+                // NOT capture `self` (which would extend the dispatcher's
+                // borrow lifetime beyond the closure's `'static` bound).
+                let command_tx = self
+                    .command_tx
+                    .clone()
+                    .ok_or(DispatchError::ChannelNotWired)?;
+                let entity_id_for_frame = entity_id.clone();
+                let service_name_owned = service_name.to_owned();
+
+                pin_host.request_pin(
+                    code_format,
+                    Box::new(move |code: String| {
+                        // SECURITY (locked_decisions.pin_entry_dispatch):
+                        // `code` is consumed exactly once. No tracing call
+                        // here emits the code value. The value is moved
+                        // into `data` and the closure drops at end of
+                        // scope. `tracing-redact` provides the runtime
+                        // safety net; the structural FnOnce + scope-bound
+                        // drop is the primary control.
+                        //
+                        // We construct a `serde_json::Value` payload via
+                        // `serde_json::json!` because the OutboundFrame's
+                        // `data` field is typed as `serde_json::Value`.
+                        // `src/actions/**` is NOT gated against the JSON
+                        // crate (the Gate-2 grep covers `src/ui/**`
+                        // only); naming the path here is fine.
+                        let frame = OutboundFrame {
+                            domain: "alarm_control_panel".to_owned(),
+                            service: service_name_owned.clone(),
+                            target: Some(serde_json::json!({
+                                "entity_id": entity_id_for_frame.as_str(),
+                            })),
+                            data: Some(serde_json::json!({ "code": code })),
+                        };
+                        // `code` is moved into the `data` JSON object.
+                        // The local binding `code` no longer holds the
+                        // string after `json!` consumes it.
+
+                        let (ack_tx, _ack_rx) = oneshot::channel::<AckResult>();
+                        let cmd = OutboundCommand { frame, ack_tx };
+                        // `try_send` so we never block the Slint event
+                        // loop. A full channel surfaces as a debug log;
+                        // the PIN value is NOT in the log line.
+                        if let Err(send_err) = command_tx.try_send(cmd) {
+                            warn!(
+                                entity = %entity_id_for_frame,
+                                error = ?send_err.to_string(),
+                                "alarm pin_submit: command_tx send failed"
+                            );
+                        }
+                        // Audit row per
+                        // locked_decisions.audit_substrate_placement.
+                        // No code, no length, no format hint, no
+                        // entity_id — `AuditEvent`'s field types are
+                        // structurally restricted to the sealed
+                        // `AuditField` whitelist.
+                        //
+                        // SECURITY (opencode-review iter-1): `serde_json::Value`
+                        // (the type held by `OutboundFrame.data`) implements
+                        // `Debug` as JSON-encoded text, so a `format!("{:?}",
+                        // frame.data)` on this `frame` would render `{"code":
+                        // "<the pin>"}`. The unit test
+                        // `alarm_pin_code_not_in_tracing_spans` is a runtime
+                        // padlock that asserts no tracing event in this code
+                        // path emits the PIN. Future contributors MUST NOT add
+                        // a `Debug`-printf of `frame` / `frame.data` /
+                        // `cmd.frame` anywhere on this path. The runtime test
+                        // catches it; the comment is the upstream warning.
+                        crate::audit::emit(crate::audit::AuditEvent {
+                            event: "pin.submitted",
+                            outcome: "submitted",
+                            error_kind: None,
+                            scheme: None,
+                        });
+                    }),
+                );
+
+                Ok(DispatchOutcome::AlarmAwaitingPinEntry { entity_id })
+            }
+        }
+    }
+
     /// Route a dispatch attempt through the offline queue (TASK-065).
     ///
     /// Returns `Some(_)` when the action is consumed by the offline path
@@ -1802,8 +2175,24 @@ impl Dispatcher {
                     ticket: "TASK-104",
                 }))
             }
+            // TASK-105: AlarmArm / AlarmDisarm are wired in the live
+            // dispatch path but the offline queue cannot accept them
+            // (`OfflineQueue::enqueue` rejects them as `UnsupportedVariant`
+            // — `src/actions/queue.rs` is in TASK-105's `must_not_touch`
+            // list). When offline we therefore surface
+            // `NotImplementedYet` directly so the user sees a typed error
+            // rather than a phantom queue entry. The PIN entry flow lives
+            // ONLY on the live path — offline replay does not show the
+            // PIN modal, and there is no offline replay for AlarmArm /
+            // AlarmDisarm until a future ticket extends the queue.
+            Action::AlarmArm { .. } | Action::AlarmDisarm { .. } => {
+                Some(Err(DispatchError::NotImplementedYet {
+                    what: "Alarm-arm-or-disarm-offline",
+                    ticket: "TASK-105",
+                }))
+            }
             // Phase 6 typed variants (TASK-099): dispatcher wiring is deferred
-            // to TASK-105, TASK-108, TASK-109. Until those tickets wire the
+            // to TASK-108 / TASK-109. Until those tickets wire the
             // per-variant dispatch paths, returning `None` here lets the main
             // `dispatch` match return `DispatchError::NotImplementedYet`
             // regardless of connection state. No offline-queued toast fires,
@@ -1814,9 +2203,7 @@ impl Dispatcher {
             | Action::SetMediaVolume { .. }
             | Action::MediaTransport { .. }
             | Action::SetCoverPosition { .. }
-            | Action::SetFanSpeed { .. }
-            | Action::AlarmArm { .. }
-            | Action::AlarmDisarm { .. } => None,
+            | Action::SetFanSpeed { .. } => None,
 
             // Idempotent WS-bound — try to enqueue. The queue's own
             // [`OfflineQueue::enqueue`] runs the runtime allowlist check
@@ -4523,10 +4910,16 @@ mod tests {
         assert!(cmd.frame.data.is_none());
     }
 
+    /// TASK-105 took ownership of the alarm-dispatch path. Without explicit
+    /// `with_alarm_settings`, the dispatcher applies the
+    /// [`AlarmDispatchSettings::permissive`] default (`PinPolicy::None`),
+    /// which dispatches directly via `dispatch_call_service`. The resulting
+    /// frame targets `alarm_control_panel.alarm_arm_<mode>` with
+    /// `entity_id` only — no PIN, no `data` payload.
     #[test]
-    fn phase6_alarm_arm_dispatch_returns_not_implemented_yet() {
+    fn phase6_alarm_arm_dispatch_with_default_policy_dispatches_directly() {
         let services = handle_from(ServiceRegistry::new());
-        let (dispatcher, _rx) = make_dispatcher_with_recorder(services);
+        let (dispatcher, mut rx) = make_dispatcher_with_recorder(services);
         let action = Action::AlarmArm {
             entity_id: "alarm_control_panel.home".to_owned(),
             mode: "home".to_owned(),
@@ -4542,22 +4935,25 @@ mod tests {
         );
         let store = store_with(vec![]);
 
-        let err = dispatcher
+        let outcome = dispatcher
             .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
-            .expect_err("AlarmArm must return NotImplementedYet");
-        match err {
-            DispatchError::NotImplementedYet { what, ticket } => {
-                assert_eq!(what, "AlarmArm");
-                assert_eq!(ticket, "TASK-109");
-            }
-            other => panic!("expected NotImplementedYet, got {other:?}"),
+            .expect("AlarmArm with permissive default must dispatch directly");
+        match outcome {
+            DispatchOutcome::Sent { .. } => {}
+            other => panic!("expected DispatchOutcome::Sent, got {other:?}"),
         }
+        let cmd = rx.try_recv().expect("recorder must have received");
+        assert_eq!(cmd.frame.domain, "alarm_control_panel");
+        assert_eq!(cmd.frame.service, "alarm_arm_home");
+        assert!(cmd.frame.data.is_none(), "no PIN under permissive default");
     }
 
+    /// Same direct-dispatch behaviour for `AlarmDisarm` under the default
+    /// permissive policy.
     #[test]
-    fn phase6_alarm_disarm_dispatch_returns_not_implemented_yet() {
+    fn phase6_alarm_disarm_dispatch_with_default_policy_dispatches_directly() {
         let services = handle_from(ServiceRegistry::new());
-        let (dispatcher, _rx) = make_dispatcher_with_recorder(services);
+        let (dispatcher, mut rx) = make_dispatcher_with_recorder(services);
         let action = Action::AlarmDisarm {
             entity_id: "alarm_control_panel.home".to_owned(),
         };
@@ -4572,16 +4968,17 @@ mod tests {
         );
         let store = store_with(vec![]);
 
-        let err = dispatcher
+        let outcome = dispatcher
             .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
-            .expect_err("AlarmDisarm must return NotImplementedYet");
-        match err {
-            DispatchError::NotImplementedYet { what, ticket } => {
-                assert_eq!(what, "AlarmDisarm");
-                assert_eq!(ticket, "TASK-109");
-            }
-            other => panic!("expected NotImplementedYet, got {other:?}"),
+            .expect("AlarmDisarm with permissive default must dispatch directly");
+        match outcome {
+            DispatchOutcome::Sent { .. } => {}
+            other => panic!("expected DispatchOutcome::Sent, got {other:?}"),
         }
+        let cmd = rx.try_recv().expect("recorder must have received");
+        assert_eq!(cmd.frame.domain, "alarm_control_panel");
+        assert_eq!(cmd.frame.service, "alarm_disarm");
+        assert!(cmd.frame.data.is_none(), "no PIN under permissive default");
     }
 
     // ------ offline path (maybe_route_offline returns None → dispatch arm) ------
@@ -4841,15 +5238,17 @@ mod tests {
         let err = dispatcher
             .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
             .expect_err("AlarmArm offline must return NotImplementedYet");
+        // TASK-105 routes offline alarm dispatches through the same
+        // "queue can't accept this variant" rejection as Lock/Unlock.
         assert!(
             matches!(
                 err,
                 DispatchError::NotImplementedYet {
-                    what: "AlarmArm",
+                    what: "Alarm-arm-or-disarm-offline",
                     ..
                 }
             ),
-            "expected NotImplementedYet for AlarmArm, got {err:?}"
+            "expected NotImplementedYet for Alarm-arm-or-disarm-offline, got {err:?}"
         );
     }
 
@@ -4877,11 +5276,11 @@ mod tests {
             matches!(
                 err,
                 DispatchError::NotImplementedYet {
-                    what: "AlarmDisarm",
+                    what: "Alarm-arm-or-disarm-offline",
                     ..
                 }
             ),
-            "expected NotImplementedYet for AlarmDisarm, got {err:?}"
+            "expected NotImplementedYet for Alarm-arm-or-disarm-offline, got {err:?}"
         );
     }
 
@@ -5450,5 +5849,689 @@ mod tests {
         // (channel closed), error is logged but no panic.
         confirm_host.accept();
         // Reaching here without panic is the assertion.
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-105 — Alarm dispatch with PIN entry
+    // -----------------------------------------------------------------------
+    //
+    // Reuses the [`MockPinEntryHost`] mock defined for TASK-104. The alarm
+    // dispatcher consults the per-widget [`AlarmDispatchSettings.pin_policy`]
+    // table and applies the matrix:
+    //
+    //   |                | None | Required          | RequiredOnDisarm   |
+    //   |----------------|------|-------------------|--------------------|
+    //   | Arm            | WS   | prompt -> WS      | WS (no prompt)     |
+    //   | Disarm         | WS   | prompt -> WS      | prompt -> WS       |
+    //
+    // Tests below cover each cell at least once, the fail-closed path
+    // (RequiredOnDisarm with no pin_host wired), the cancellation path
+    // (FnOnce dropped without firing), and the unknown-mode error.
+
+    /// `RequiredOnDisarm` + `AlarmArm` — arm dispatches WITHOUT a PIN
+    /// prompt. The mock host is never invoked; the WS frame is enqueued
+    /// synchronously.
+    #[test]
+    fn required_on_disarm_arm_no_pin_prompt() {
+        let services = handle_from(ServiceRegistry::new());
+        let (tx, mut rx) = mpsc::channel::<OutboundCommand>(8);
+        let pin_host = Arc::new(MockPinEntryHost::new());
+
+        let mut settings = HashMap::new();
+        settings.insert(
+            WidgetId::from("w"),
+            AlarmDispatchSettings {
+                pin_policy: PinPolicy::RequiredOnDisarm {
+                    length: 4,
+                    code_format: CodeFormat::Number,
+                },
+            },
+        );
+
+        let dispatcher = Dispatcher::with_command_tx(services, tx)
+            .with_pin_host_arc(pin_host.clone() as Arc<dyn PinEntryHost>)
+            .with_alarm_settings(settings);
+
+        let action = Action::AlarmArm {
+            entity_id: "alarm_control_panel.home".to_owned(),
+            mode: "home".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with(
+                "alarm_control_panel.home",
+                action,
+                Action::None,
+                Action::None,
+            ),
+        );
+        let store = store_with(vec![]);
+
+        let outcome = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect("RequiredOnDisarm arm must succeed without prompt");
+        match outcome {
+            DispatchOutcome::Sent { .. } => {}
+            other => panic!("expected DispatchOutcome::Sent, got {other:?}"),
+        }
+        assert!(
+            pin_host.received_format().is_none(),
+            "arm under RequiredOnDisarm must NOT prompt for PIN"
+        );
+
+        let cmd = rx
+            .try_recv()
+            .expect("WS command must have been enqueued synchronously");
+        assert_eq!(cmd.frame.domain, "alarm_control_panel");
+        assert_eq!(cmd.frame.service, "alarm_arm_home");
+        assert!(cmd.frame.data.is_none(), "no PIN code under arm-no-prompt");
+    }
+
+    /// `RequiredOnDisarm` + `AlarmDisarm` — disarm DOES prompt for PIN.
+    /// The mock host captures the closure; once `submit` fires the WS
+    /// command is enqueued with the entered PIN under `data.code`.
+    #[test]
+    fn required_on_disarm_disarm_prompts_pin() {
+        let services = handle_from(ServiceRegistry::new());
+        let (tx, mut rx) = mpsc::channel::<OutboundCommand>(8);
+        let pin_host = Arc::new(MockPinEntryHost::new());
+
+        let mut settings = HashMap::new();
+        settings.insert(
+            WidgetId::from("w"),
+            AlarmDispatchSettings {
+                pin_policy: PinPolicy::RequiredOnDisarm {
+                    length: 4,
+                    code_format: CodeFormat::Number,
+                },
+            },
+        );
+
+        let dispatcher = Dispatcher::with_command_tx(services, tx)
+            .with_pin_host_arc(pin_host.clone() as Arc<dyn PinEntryHost>)
+            .with_alarm_settings(settings);
+
+        let action = Action::AlarmDisarm {
+            entity_id: "alarm_control_panel.home".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with(
+                "alarm_control_panel.home",
+                action,
+                Action::None,
+                Action::None,
+            ),
+        );
+        let store = store_with(vec![]);
+
+        let outcome = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect("RequiredOnDisarm disarm must return AlarmAwaitingPinEntry");
+        match outcome {
+            DispatchOutcome::AlarmAwaitingPinEntry { ref entity_id } => {
+                assert_eq!(entity_id.as_str(), "alarm_control_panel.home");
+            }
+            other => panic!("expected AlarmAwaitingPinEntry, got {other:?}"),
+        }
+        assert_eq!(
+            pin_host.received_format(),
+            Some(CodeFormat::Number),
+            "disarm MUST prompt for PIN with the configured code_format"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no OutboundCommand should be sent until on_submit fires"
+        );
+
+        // Simulate the user typing in the PIN and pressing OK.
+        pin_host.submit("1234".to_owned());
+
+        let cmd = rx
+            .try_recv()
+            .expect("WS command must be enqueued after PIN submit");
+        assert_eq!(cmd.frame.domain, "alarm_control_panel");
+        assert_eq!(cmd.frame.service, "alarm_disarm");
+        assert_eq!(
+            cmd.frame.target,
+            Some(serde_json::json!({ "entity_id": "alarm_control_panel.home" }))
+        );
+        assert_eq!(
+            cmd.frame.data,
+            Some(serde_json::json!({ "code": "1234" })),
+            "code must be injected into data.code by on_submit"
+        );
+    }
+
+    /// `Required` + `AlarmArm` — both arm and disarm prompt under
+    /// `Required`. This test covers the arm-prompt branch.
+    #[test]
+    fn required_alarm_arm_prompts_pin() {
+        let services = handle_from(ServiceRegistry::new());
+        let (tx, mut rx) = mpsc::channel::<OutboundCommand>(8);
+        let pin_host = Arc::new(MockPinEntryHost::new());
+
+        let mut settings = HashMap::new();
+        settings.insert(
+            WidgetId::from("w"),
+            AlarmDispatchSettings {
+                pin_policy: PinPolicy::Required {
+                    length: 6,
+                    code_format: CodeFormat::Any,
+                },
+            },
+        );
+
+        let dispatcher = Dispatcher::with_command_tx(services, tx)
+            .with_pin_host_arc(pin_host.clone() as Arc<dyn PinEntryHost>)
+            .with_alarm_settings(settings);
+
+        let action = Action::AlarmArm {
+            entity_id: "alarm_control_panel.home".to_owned(),
+            mode: "away".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with(
+                "alarm_control_panel.home",
+                action,
+                Action::None,
+                Action::None,
+            ),
+        );
+        let store = store_with(vec![]);
+
+        let outcome = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect("Required arm must return AlarmAwaitingPinEntry");
+        assert!(
+            matches!(outcome, DispatchOutcome::AlarmAwaitingPinEntry { .. }),
+            "expected AlarmAwaitingPinEntry, got {outcome:?}"
+        );
+        assert_eq!(pin_host.received_format(), Some(CodeFormat::Any));
+        assert!(rx.try_recv().is_err(), "no WS frame before PIN submit");
+
+        pin_host.submit("hunter2".to_owned());
+
+        let cmd = rx
+            .try_recv()
+            .expect("WS command must be enqueued after PIN submit");
+        assert_eq!(cmd.frame.domain, "alarm_control_panel");
+        assert_eq!(cmd.frame.service, "alarm_arm_away");
+        assert_eq!(
+            cmd.frame.data,
+            Some(serde_json::json!({ "code": "hunter2" }))
+        );
+    }
+
+    /// `Required` + `AlarmDisarm` — disarm prompts under `Required` too
+    /// (not just under `RequiredOnDisarm`). Covers the
+    /// (`PinPolicy::Required`, `AlarmOperation::Disarm`) cell of the
+    /// matrix.
+    #[test]
+    fn required_alarm_disarm_prompts_pin() {
+        let services = handle_from(ServiceRegistry::new());
+        let (tx, mut rx) = mpsc::channel::<OutboundCommand>(8);
+        let pin_host = Arc::new(MockPinEntryHost::new());
+
+        let mut settings = HashMap::new();
+        settings.insert(
+            WidgetId::from("w"),
+            AlarmDispatchSettings {
+                pin_policy: PinPolicy::Required {
+                    length: 4,
+                    code_format: CodeFormat::Number,
+                },
+            },
+        );
+
+        let dispatcher = Dispatcher::with_command_tx(services, tx)
+            .with_pin_host_arc(pin_host.clone() as Arc<dyn PinEntryHost>)
+            .with_alarm_settings(settings);
+
+        let action = Action::AlarmDisarm {
+            entity_id: "alarm_control_panel.home".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with(
+                "alarm_control_panel.home",
+                action,
+                Action::None,
+                Action::None,
+            ),
+        );
+        let store = store_with(vec![]);
+
+        let outcome = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect("Required disarm must return AlarmAwaitingPinEntry");
+        assert!(
+            matches!(outcome, DispatchOutcome::AlarmAwaitingPinEntry { .. }),
+            "expected AlarmAwaitingPinEntry, got {outcome:?}"
+        );
+        assert_eq!(pin_host.received_format(), Some(CodeFormat::Number));
+
+        pin_host.submit("0000".to_owned());
+
+        let cmd = rx
+            .try_recv()
+            .expect("WS command must be enqueued after PIN submit");
+        assert_eq!(cmd.frame.service, "alarm_disarm");
+        assert_eq!(cmd.frame.data, Some(serde_json::json!({ "code": "0000" })));
+    }
+
+    /// `Required` + `AlarmArm` — fail-closed branch when the policy
+    /// mandates a prompt but no `PinEntryHost` is wired. Covers the
+    /// (`Required`, `Arm`) fail-closed path that
+    /// `required_on_disarm_disarm_no_host_fails_closed` does not exercise.
+    #[test]
+    fn required_alarm_arm_no_host_fails_closed() {
+        let services = handle_from(ServiceRegistry::new());
+        let (tx, mut rx) = mpsc::channel::<OutboundCommand>(8);
+
+        let mut settings = HashMap::new();
+        settings.insert(
+            WidgetId::from("w"),
+            AlarmDispatchSettings {
+                pin_policy: PinPolicy::Required {
+                    length: 4,
+                    code_format: CodeFormat::Number,
+                },
+            },
+        );
+
+        let dispatcher = Dispatcher::with_command_tx(services, tx).with_alarm_settings(settings);
+        let action = Action::AlarmArm {
+            entity_id: "alarm_control_panel.home".to_owned(),
+            mode: "home".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with(
+                "alarm_control_panel.home",
+                action,
+                Action::None,
+                Action::None,
+            ),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("Required arm with no host must fail-closed");
+        assert!(
+            matches!(
+                err,
+                DispatchError::NotImplementedYet {
+                    what: "Alarm-with-PIN",
+                    ticket: "TASK-105",
+                }
+            ),
+            "expected fail-closed Alarm-with-PIN, got {err:?}"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// `None` + `AlarmDisarm` — no PIN prompt; dispatch directly with no
+    /// `data` payload. Covers the `PinPolicy::None` branch.
+    #[test]
+    fn none_policy_alarm_disarm_no_prompt() {
+        let services = handle_from(ServiceRegistry::new());
+        let (tx, mut rx) = mpsc::channel::<OutboundCommand>(8);
+        let pin_host = Arc::new(MockPinEntryHost::new());
+
+        let mut settings = HashMap::new();
+        settings.insert(
+            WidgetId::from("w"),
+            AlarmDispatchSettings {
+                pin_policy: PinPolicy::None,
+            },
+        );
+
+        let dispatcher = Dispatcher::with_command_tx(services, tx)
+            .with_pin_host_arc(pin_host.clone() as Arc<dyn PinEntryHost>)
+            .with_alarm_settings(settings);
+
+        let action = Action::AlarmDisarm {
+            entity_id: "alarm_control_panel.home".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with(
+                "alarm_control_panel.home",
+                action,
+                Action::None,
+                Action::None,
+            ),
+        );
+        let store = store_with(vec![]);
+
+        let outcome = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect("None policy disarm must dispatch without prompt");
+        match outcome {
+            DispatchOutcome::Sent { .. } => {}
+            other => panic!("expected DispatchOutcome::Sent, got {other:?}"),
+        }
+        assert!(
+            pin_host.received_format().is_none(),
+            "None policy must NOT prompt"
+        );
+        let cmd = rx
+            .try_recv()
+            .expect("WS command must be enqueued synchronously");
+        assert_eq!(cmd.frame.service, "alarm_disarm");
+        assert!(cmd.frame.data.is_none(), "None policy emits no PIN");
+    }
+
+    /// Cancellation path — when the user dismisses the modal without
+    /// submitting, no WS frame is emitted. Covers the FnOnce-cancel
+    /// branch where the captured closure is dropped without firing.
+    #[test]
+    fn alarm_pin_modal_cancel_does_not_emit_ws_frame() {
+        let services = handle_from(ServiceRegistry::new());
+        let (tx, mut rx) = mpsc::channel::<OutboundCommand>(8);
+        let pin_host = Arc::new(MockPinEntryHost::new());
+
+        let mut settings = HashMap::new();
+        settings.insert(
+            WidgetId::from("w"),
+            AlarmDispatchSettings {
+                pin_policy: PinPolicy::RequiredOnDisarm {
+                    length: 4,
+                    code_format: CodeFormat::Number,
+                },
+            },
+        );
+
+        let dispatcher = Dispatcher::with_command_tx(services, tx)
+            .with_pin_host_arc(pin_host.clone() as Arc<dyn PinEntryHost>)
+            .with_alarm_settings(settings);
+
+        let action = Action::AlarmDisarm {
+            entity_id: "alarm_control_panel.home".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with(
+                "alarm_control_panel.home",
+                action,
+                Action::None,
+                Action::None,
+            ),
+        );
+        let store = store_with(vec![]);
+
+        let _ = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect("dispatch must return AlarmAwaitingPinEntry");
+        assert_eq!(pin_host.received_format(), Some(CodeFormat::Number));
+
+        // Simulate cancel: drop the captured closure without invoking it.
+        drop(pin_host.pending.lock().unwrap().take());
+
+        // No WS frame must have been emitted.
+        assert!(
+            rx.try_recv().is_err(),
+            "cancelled modal must not emit a WS frame"
+        );
+    }
+
+    /// Fail-closed: when `pin_policy: RequiredOnDisarm` is set on the
+    /// widget but no `PinEntryHost` is wired into the dispatcher, the
+    /// disarm path returns `NotImplementedYet { what: "Alarm-with-PIN" }`
+    /// rather than silently skipping the modal.
+    #[test]
+    fn required_on_disarm_disarm_no_host_fails_closed() {
+        let services = handle_from(ServiceRegistry::new());
+        let (tx, mut rx) = mpsc::channel::<OutboundCommand>(8);
+
+        let mut settings = HashMap::new();
+        settings.insert(
+            WidgetId::from("w"),
+            AlarmDispatchSettings {
+                pin_policy: PinPolicy::RequiredOnDisarm {
+                    length: 4,
+                    code_format: CodeFormat::Number,
+                },
+            },
+        );
+
+        // Note: NO with_pin_host_arc — the host is intentionally unwired.
+        let dispatcher = Dispatcher::with_command_tx(services, tx).with_alarm_settings(settings);
+
+        let action = Action::AlarmDisarm {
+            entity_id: "alarm_control_panel.home".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with(
+                "alarm_control_panel.home",
+                action,
+                Action::None,
+                Action::None,
+            ),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("RequiredOnDisarm disarm with no host must fail-closed");
+        assert!(
+            matches!(
+                err,
+                DispatchError::NotImplementedYet {
+                    what: "Alarm-with-PIN",
+                    ticket: "TASK-105",
+                }
+            ),
+            "expected fail-closed Alarm-with-PIN, got {err:?}"
+        );
+        // No WS frame.
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Required + AlarmDisarm on a dispatcher with NO `command_tx` wired
+    /// (the pre-TASK-072 state) — the PIN-dispatch path returns
+    /// `ChannelNotWired` synchronously and never invokes the host. Covers
+    /// the early-return at the start of the `Some(code_format)` branch in
+    /// `dispatch_alarm_arm_or_disarm` (per the opencode-review iter-1
+    /// gap report).
+    #[test]
+    fn required_alarm_disarm_channel_not_wired_returns_err() {
+        let services = handle_from(ServiceRegistry::new());
+        // NOTE: `Dispatcher::new` (not `with_command_tx`) — `command_tx` is
+        // `None`. The PIN path must short-circuit before invoking the host.
+        let pin_host = Arc::new(MockPinEntryHost::new());
+
+        let mut settings = HashMap::new();
+        settings.insert(
+            WidgetId::from("w"),
+            AlarmDispatchSettings {
+                pin_policy: PinPolicy::Required {
+                    length: 4,
+                    code_format: CodeFormat::Number,
+                },
+            },
+        );
+
+        let dispatcher = Dispatcher::new(services)
+            .with_pin_host_arc(pin_host.clone() as Arc<dyn PinEntryHost>)
+            .with_alarm_settings(settings);
+        let action = Action::AlarmDisarm {
+            entity_id: "alarm_control_panel.home".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with(
+                "alarm_control_panel.home",
+                action,
+                Action::None,
+                Action::None,
+            ),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("Required disarm with no command_tx must return ChannelNotWired");
+        assert!(
+            matches!(err, DispatchError::ChannelNotWired),
+            "expected ChannelNotWired, got {err:?}"
+        );
+        assert!(
+            pin_host.received_format().is_none(),
+            "pin_host MUST NOT be invoked when channel is not wired (early-return)"
+        );
+    }
+
+    /// `AlarmArm` with an unknown mode — the dispatcher rejects the
+    /// mode before any WS frame or PIN prompt fires. Covers the
+    /// unknown-mode error path of `dispatch_alarm_arm_or_disarm`.
+    #[test]
+    fn alarm_arm_unknown_mode_returns_err() {
+        let services = handle_from(ServiceRegistry::new());
+        let (tx, mut rx) = mpsc::channel::<OutboundCommand>(8);
+        let pin_host = Arc::new(MockPinEntryHost::new());
+
+        let mut settings = HashMap::new();
+        settings.insert(
+            WidgetId::from("w"),
+            AlarmDispatchSettings {
+                pin_policy: PinPolicy::None,
+            },
+        );
+
+        let dispatcher = Dispatcher::with_command_tx(services, tx)
+            .with_pin_host_arc(pin_host.clone() as Arc<dyn PinEntryHost>)
+            .with_alarm_settings(settings);
+
+        let action = Action::AlarmArm {
+            entity_id: "alarm_control_panel.home".to_owned(),
+            mode: "BOGUS".to_owned(),
+        };
+        let map = one_widget_map(
+            "w",
+            entry_with(
+                "alarm_control_panel.home",
+                action,
+                Action::None,
+                Action::None,
+            ),
+        );
+        let store = store_with(vec![]);
+
+        let err = dispatcher
+            .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+            .expect_err("unknown mode must surface a typed Err");
+        assert!(
+            matches!(
+                err,
+                DispatchError::NotImplementedYet {
+                    what: "AlarmArm with unknown mode",
+                    ..
+                }
+            ),
+            "expected unknown-mode NotImplementedYet, got {err:?}"
+        );
+        assert!(rx.try_recv().is_err(), "no WS frame on unknown mode");
+        assert!(
+            pin_host.received_format().is_none(),
+            "no PIN prompt on unknown mode"
+        );
+    }
+
+    /// PIN code does NOT appear in any captured tracing span during
+    /// the alarm-disarm flow. Per TASK-105 acceptance #10 (Risk #7).
+    #[test]
+    fn alarm_pin_code_not_in_tracing_spans() {
+        use std::sync::Mutex as TracingMutex;
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct CapturingLayer {
+            events: Arc<TracingMutex<Vec<String>>>,
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturingLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct FieldCollector(Vec<String>);
+                impl tracing::field::Visit for FieldCollector {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push(format!("{}={:?}", field.name(), value));
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.push(format!("{}={}", field.name(), value));
+                    }
+                }
+                let mut collector = FieldCollector(Vec::new());
+                event.record(&mut collector);
+                self.events.lock().unwrap().push(collector.0.join(" "));
+            }
+        }
+
+        let events: Arc<TracingMutex<Vec<String>>> = Arc::new(TracingMutex::new(Vec::new()));
+        let layer = CapturingLayer {
+            events: Arc::clone(&events),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let synthetic_code = "SECRET_PIN_8675309";
+
+        with_default(subscriber, || {
+            let services = handle_from(ServiceRegistry::new());
+            let (tx, _rx) = mpsc::channel::<OutboundCommand>(8);
+            let pin_host = Arc::new(MockPinEntryHost::new());
+
+            let mut settings = HashMap::new();
+            settings.insert(
+                WidgetId::from("w"),
+                AlarmDispatchSettings {
+                    pin_policy: PinPolicy::RequiredOnDisarm {
+                        length: 4,
+                        code_format: CodeFormat::Number,
+                    },
+                },
+            );
+
+            let dispatcher = Dispatcher::with_command_tx(services, tx)
+                .with_pin_host_arc(pin_host.clone() as Arc<dyn PinEntryHost>)
+                .with_alarm_settings(settings);
+
+            let action = Action::AlarmDisarm {
+                entity_id: "alarm_control_panel.home".to_owned(),
+            };
+            let map = one_widget_map(
+                "w",
+                entry_with(
+                    "alarm_control_panel.home",
+                    action,
+                    Action::None,
+                    Action::None,
+                ),
+            );
+            let store = store_with(vec![]);
+
+            let _ = dispatcher
+                .dispatch(&WidgetId::from("w"), Gesture::Tap, &store, &map)
+                .expect("dispatch ok");
+            pin_host.submit(synthetic_code.to_owned());
+        });
+
+        // None of the captured tracing events may include the PIN.
+        let captured = events.lock().unwrap();
+        for line in captured.iter() {
+            assert!(
+                !line.contains(synthetic_code),
+                "PIN code must NOT appear in tracing event: {line:?}"
+            );
+        }
     }
 }
