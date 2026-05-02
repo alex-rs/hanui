@@ -1,0 +1,43 @@
+version: 1
+device_profile: desktop
+default_view: home
+# Visibility-flip golden fixture (TASK-106).
+#
+# Contract (per Phase 6 plan acceptance):
+#   * One always-visible widget (`always_visible`) — its position MUST NOT
+#     change when `gated` flips between predicate-true and predicate-false.
+#   * One predicate-gated widget (`gated`) — visibility predicate
+#     `state_equals:binary_sensor.motion:on`. Predicate-true keeps the
+#     widget in the layout; predicate-false (TASK-110 evaluator + hook)
+#     hides it without reflowing `always_visible`.
+#
+# The expected.json sibling encodes the predicate-true layout. TASK-110
+# will add the predicate-false expected snapshot and the `#[ignore]`
+# golden test that drives both. Until TASK-110 ships, this fixture is
+# loaded by the schema round-trip suite (which validates the YAML form)
+# and not consumed by a layout golden test — there is no `#[ignore]`
+# sentinel to remove.
+views:
+  - id: home
+    title: Home
+    layout: sections
+    sections:
+      - id: main
+        title: Main
+        grid:
+          columns: 4
+          gap: 8
+        widgets:
+          - id: always_visible
+            type: light_tile
+            entity: light.kitchen
+            layout:
+              preferred_columns: 2
+              preferred_rows: 1
+          - id: gated
+            type: sensor_tile
+            entity: binary_sensor.motion
+            visibility: state_equals:binary_sensor.motion:on
+            layout:
+              preferred_columns: 2
+              preferred_rows: 1

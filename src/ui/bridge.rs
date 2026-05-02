@@ -369,6 +369,68 @@ pub struct AlarmTileVM {
 }
 
 // ---------------------------------------------------------------------------
+// HistoryGraphTileVM (TASK-106)
+// ---------------------------------------------------------------------------
+
+/// View-model for a `HistoryGraphTile` widget, mirroring the Slint
+/// `HistoryGraphTileVM` struct in `ui/slint/history_graph_tile.slint`.
+///
+/// Built by [`compute_history_graph_tile_vm`], which threads through
+/// [`crate::ui::history_graph::HistoryGraphVM::from_entity`] to derive the
+/// `is_available` boolean and forward the bridge-supplied `change_count`.
+///
+/// The `icon: image` Slint field is absent here; it is written by the
+/// Slint bridge during property wiring (the same pattern used for
+/// `LightTileVM` / `SensorTileVM` / `EntityTileVM` / `CoverTileVM` /
+/// `FanTileVM` / `LockTileVM` / `AlarmTileVM`).
+///
+/// # Path-commands wire format
+///
+/// `path_commands` is an SVG mini-language string composed by
+/// [`history_path_commands`] from a [`crate::ha::history::HistoryWindow`]
+/// per `locked_decisions.history_render_path`. Coordinates are normalised
+/// to the unit square; the Slint Path's `viewbox-width` / `viewbox-height`
+/// are 1.0 so the polyline scales with the tile. Composition happens at
+/// fetch time (NOT per frame); the bridge throttles pushes to at most
+/// once per 60s via [`crate::ha::history::HistoryThrottle`].
+///
+/// # No `Vec` fields (lesson from TASK-103)
+///
+/// The history point list reaches Slint as a string-encoded SVG polyline,
+/// NOT as a `Vec<Point>` field on this struct. The fetch-side LTTB
+/// downsampler holds the `Vec` once per widget; this VM stays scalar so
+/// the per-state-change rebuild allocates no per-widget vector.
+///
+/// `pending` is the per-tile spinner gate added in TASK-067; see
+/// [`LightTileVM`] for the full contract.
+///
+/// Note (TASK-106 scope): the `MainWindow` Slint component does not yet
+/// declare a `history-tiles` array property — `ui/slint/main_window.slint`
+/// is in this ticket's `must_not_touch` list. `compute_history_graph_tile_vm`
+/// is invoked indirectly via [`build_tiles`] so history entities exercise
+/// the `HistoryGraphVM::from_entity` path on every state change, and the
+/// result flows into the existing fallback `EntityTileVM` render with the
+/// raw HA state string. A subsequent ticket will amend `main_window.slint`
+/// to render a per-kind `HistoryGraphTile` model directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryGraphTileVM {
+    pub name: String,
+    pub state: String,
+    pub change_count: i32,
+    pub is_available: bool,
+    pub icon_id: String,
+    pub preferred_columns: i32,
+    pub preferred_rows: i32,
+    pub placement: TilePlacement,
+    /// Per-tile spinner gate (TASK-067). Default `false`.
+    pub pending: bool,
+    /// SVG mini-language polyline ("M x y L x y L ..."). Composed by
+    /// [`history_path_commands`] from a downsampled
+    /// [`crate::ha::history::HistoryWindow`]. Empty string when no points.
+    pub path_commands: String,
+}
+
+// ---------------------------------------------------------------------------
 // TileVM enum
 // ---------------------------------------------------------------------------
 
@@ -778,15 +840,50 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                                     pending: false,
                                 })
                             }
-                            // Phase 4 schema adds Camera, History variants.
+                            // TASK-106: history entities flow through
+                            // `HistoryGraphVM::from_entity` so the per-frame
+                            // derived `is_available` boolean and the bridge-
+                            // supplied `change_count` are available downstream.
+                            // Until `main_window.slint` grows a `history-tiles`
+                            // array property (subsequent ticket), the history
+                            // tile renders as the generic `EntityTileVM`
+                            // fallback — the canonical HA state string is
+                            // forwarded verbatim. The `HistoryGraphVM` is
+                            // exposed via `compute_history_graph_tile_vm` for
+                            // the per-kind rendering path that follows when
+                            // `main_window.slint` gains the array property.
+                            //
+                            // `change_count == 0` here: no `HistoryWindow` has
+                            // been fetched yet at `build_tiles` time. The
+                            // bridge's history-fetch path (TASK-110+ wiring)
+                            // populates the per-widget window asynchronously
+                            // and pushes via the row-update path; the LTTB
+                            // downsampler and `HistoryThrottle` enforce the
+                            // 60s push budget per
+                            // `locked_decisions.history_render_path`.
+                            WidgetKind::History => {
+                                let _history_vm =
+                                    crate::ui::history_graph::HistoryGraphVM::from_entity(
+                                        &entity, 0,
+                                    );
+                                TileVM::Entity(EntityTileVM {
+                                    name,
+                                    state,
+                                    icon_id,
+                                    preferred_columns,
+                                    preferred_rows,
+                                    placement,
+                                    pending: false,
+                                })
+                            }
+                            // Phase 4 schema adds Camera variant.
                             // Phase 6 adds MediaPlayer, Climate, PowerFlow.
                             // Until dedicated Slint tile components exist
-                            // (TASK-106..TASK-109), these are rendered as EntityTileVM —
-                            // the generic entity tile covers the state display until
-                            // per-kind tiles ship.
+                            // (TASK-107..TASK-109), these are rendered as
+                            // EntityTileVM — the generic entity tile covers
+                            // the state display until per-kind tiles ship.
                             WidgetKind::EntityTile
                             | WidgetKind::Camera
-                            | WidgetKind::History
                             | WidgetKind::MediaPlayer
                             | WidgetKind::Climate
                             | WidgetKind::PowerFlow => TileVM::Entity(EntityTileVM {
@@ -2209,6 +2306,37 @@ pub mod alarm_panel_tile_slint {
 pub use alarm_panel_tile_slint::{AlarmPanelTile, AlarmTilePlacement as SlintAlarmTilePlacement};
 
 // ---------------------------------------------------------------------------
+// HistoryGraphTile Slint module (TASK-106)
+// ---------------------------------------------------------------------------
+//
+// `ui/slint/history_graph_tile.slint` is compiled by `build.rs` (TASK-106)
+// to a separate generated Rust file exposed via the
+// `HANUI_HISTORY_GRAPH_TILE_INCLUDE` env var — the same pattern as
+// `cover_tile.slint` (TASK-102), `fan_tile.slint` (TASK-103),
+// `lock_tile.slint` (TASK-104), and `alarm_panel_tile.slint` (TASK-105).
+// This module picks it up via `include!` so the generated
+// `HistoryGraphTile`, `HistoryGraphTileVM`, and `HistoryGraphTilePlacement`
+// types are available for the `compute_history_graph_tile_vm` projection
+// function below without polluting the production `slint_ui` namespace
+// (which would clash with the same-named Rust struct declared earlier in
+// this file).
+//
+// Future work: once `main_window.slint` grows a `history-tiles` array
+// property, this module's types will be re-exported through the
+// production `slint_ui` namespace instead. The separate compile is the
+// minimal-blast path that satisfies TASK-106's "Slint compile gate"
+// acceptance criterion (history_graph_tile.slint must be in the build
+// graph) without amending any of the protected `must_not_touch` Slint
+// files.
+pub mod history_graph_tile_slint {
+    include!(env!("HANUI_HISTORY_GRAPH_TILE_INCLUDE"));
+}
+
+pub use history_graph_tile_slint::{
+    HistoryGraphTile, HistoryGraphTilePlacement as SlintHistoryGraphTilePlacement,
+};
+
+// ---------------------------------------------------------------------------
 // compute_cover_tile_vm (TASK-102)
 // ---------------------------------------------------------------------------
 
@@ -2451,6 +2579,180 @@ pub fn compute_alarm_tile_vm(
         placement,
         pending: false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// compute_history_graph_tile_vm (TASK-106)
+// ---------------------------------------------------------------------------
+
+/// Project a typed Rust [`HistoryGraphTileVM`] from a live entity snapshot
+/// and an optional [`crate::ha::history::HistoryWindow`], threading through
+/// [`crate::ui::history_graph::HistoryGraphVM::from_entity`] for the
+/// per-frame derived `is_available` boolean.
+///
+/// # Hot-path discipline
+///
+/// Called at entity-change time (NOT per render). The result is a typed
+/// `HistoryGraphTileVM` Rust struct; the further `String -> SharedString`
+/// / `icon_id -> Image` conversions are deferred to a follow-up ticket
+/// once `main_window.slint` declares the `history-tiles` array property.
+///
+/// `window` is `None` when the bridge has not yet completed a fetch for
+/// this widget (or the fetch returned no plottable points). In that case
+/// `change_count = 0` and `path_commands = ""` — the Slint tile renders
+/// "0 samples" and an empty trace per the three-state-render acceptance.
+///
+/// # Path-commands composition
+///
+/// When `window` is `Some(_)`, [`history_path_commands`] composes the SVG
+/// mini-language polyline string from the downsampled points. The
+/// composition allocates one `String` per call and runs at fetch time
+/// (per-window, not per-frame).
+///
+/// # No `Vec` allocation on the per-frame path
+///
+/// Per the TASK-103 audit lesson: this projection writes scalar
+/// `state`/`name`/`icon_id` plus a single owned `path_commands` string.
+/// The history `Vec<(Timestamp, f64)>` itself lives in the bridge's
+/// per-widget [`crate::ha::history::HistoryWindow`] cache and is NOT
+/// re-allocated on every state change.
+///
+/// # Naming
+///
+/// Returns the Rust [`HistoryGraphTileVM`] (defined earlier in this
+/// file). The Slint-shape projection (`SlintHistoryGraphTileVM` from
+/// [`history_graph_tile_slint::HistoryGraphTileVM`]) is not built here
+/// because there is no `history-tiles` `MainWindow` property to write
+/// into yet — that shape conversion lives next to the
+/// `set_history_tiles` call site once it exists.
+#[must_use]
+pub fn compute_history_graph_tile_vm(
+    name: String,
+    icon_id: String,
+    preferred_columns: i32,
+    preferred_rows: i32,
+    placement: TilePlacement,
+    entity: &crate::ha::entity::Entity,
+    window: Option<&crate::ha::history::HistoryWindow>,
+) -> HistoryGraphTileVM {
+    let change_count: i32 = window
+        .map(|w| i32::try_from(w.len()).unwrap_or(i32::MAX))
+        .unwrap_or(0);
+    let history_vm = crate::ui::history_graph::HistoryGraphVM::from_entity(entity, change_count);
+    let path_commands = window.map(history_path_commands).unwrap_or_default();
+
+    HistoryGraphTileVM {
+        name,
+        state: entity.state.as_ref().to_owned(),
+        change_count: history_vm.change_count,
+        is_available: history_vm.is_available,
+        icon_id,
+        preferred_columns,
+        preferred_rows,
+        placement,
+        pending: false,
+        path_commands,
+    }
+}
+
+/// Compose an SVG mini-language polyline string from a downsampled
+/// [`crate::ha::history::HistoryWindow`] per
+/// `locked_decisions.history_render_path`.
+///
+/// The output format is `"M x y L x y L x y ..."` where each coordinate is
+/// in the unit square (0.0..=1.0). The Slint Path's `viewbox-width` /
+/// `viewbox-height` are 1.0, so Slint scales these to pixel space at
+/// render time.
+///
+/// # Normalisation
+///
+/// * Timestamps map to the X axis: the first point lands at `x=0.0`, the
+///   last at `x=1.0`, and intermediate points are linear-interpolated by
+///   their unix-second offset. The LTTB downsampler always preserves the
+///   first and last input points, so for `n > 1` with distinct
+///   timestamps `ts_span > 0` and the contract holds. **Coincident-
+///   timestamp edge case**: when `ts_span == 0.0` (single-point window OR
+///   the rare HA case of multiple records emitted with identical
+///   `last_changed`), every point collapses to `x=0.0`. The Slint Path
+///   renders a degenerate vertical line in that case — visually
+///   indistinguishable from a single dot, which is the correct
+///   "insufficient temporal resolution" fallback.
+/// * Numeric values map to the Y axis with `y=0.0` at the maximum value
+///   and `y=1.0` at the minimum value. The inversion follows screen-space
+///   convention (origin at top) so a rising sensor trace draws upward.
+///   When `min == max` (constant trace), every `y` lands at `0.5` (the
+///   centreline).
+///
+/// # Empty input
+///
+/// An empty window returns an empty string — Slint's Path renders nothing
+/// for the empty-commands case, which is the correct no-data behaviour.
+///
+/// # Allocations
+///
+/// One `String` per call. Capacity is preallocated to `points.len() * 24`
+/// (a generous upper bound on per-coordinate-pair byte cost: each
+/// "L 0.0000 0.0000 " entry is at most ~18 bytes; the overshoot trades a
+/// tiny memory hit for zero realloc churn during the format!() loop).
+#[must_use]
+pub fn history_path_commands(window: &crate::ha::history::HistoryWindow) -> String {
+    let points = &window.points;
+    if points.is_empty() {
+        return String::new();
+    }
+
+    // Compute axis ranges. Use unix-second representation for the X axis
+    // so the timestamp-to-float conversion matches the LTTB downsampler's
+    // own internal ranking key.
+    let first_ts = points[0].0.as_second() as f64;
+    let last_ts = points[points.len() - 1].0.as_second() as f64;
+    let ts_span = (last_ts - first_ts).max(0.0);
+
+    let mut min_val = f64::INFINITY;
+    let mut max_val = f64::NEG_INFINITY;
+    for (_, v) in points {
+        if *v < min_val {
+            min_val = *v;
+        }
+        if *v > max_val {
+            max_val = *v;
+        }
+    }
+    let val_span = (max_val - min_val).abs();
+
+    let normalise_x = |ts_secs: f64| -> f64 {
+        if ts_span == 0.0 {
+            // Single-instant window: collapse to x=0.
+            0.0
+        } else {
+            ((ts_secs - first_ts) / ts_span).clamp(0.0, 1.0)
+        }
+    };
+    let normalise_y = |val: f64| -> f64 {
+        if val_span == 0.0 {
+            // Constant trace: render at the centre.
+            0.5
+        } else {
+            // Invert so the maximum lands at y=0 (top of the unit square).
+            (1.0 - (val - min_val) / val_span).clamp(0.0, 1.0)
+        }
+    };
+
+    let mut out = String::with_capacity(points.len() * 24);
+    use std::fmt::Write as _;
+    for (i, (ts, val)) in points.iter().enumerate() {
+        let x = normalise_x(ts.as_second() as f64);
+        let y = normalise_y(*val);
+        let cmd = if i == 0 { 'M' } else { 'L' };
+        // `write!` on a String never fails; unwrap is the standard idiom.
+        write!(&mut out, "{cmd} {x:.4} {y:.4} ").expect("write to String never fails");
+    }
+    // Trim the trailing space for tidiness; Slint accepts either form
+    // (the SVG mini-language treats whitespace as a separator).
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -7601,5 +7903,398 @@ mod tests {
         assert!(vm.is_triggered, "triggered → is_triggered=true");
         assert!(!vm.is_armed, "triggered is not an armed_* state");
         assert!(!vm.is_pending);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_history_graph_tile_vm + history_path_commands (TASK-106)
+    // -----------------------------------------------------------------------
+
+    /// `build_tiles` dispatches `WidgetKind::History` through the
+    /// `HistoryGraphVM::from_entity` path and produces an `EntityTileVM`
+    /// fallback (no `history-tiles` array property exists yet on
+    /// `main_window.slint`). The state string is forwarded verbatim per
+    /// TASK-106 AC #13.
+    #[test]
+    fn build_tiles_history_widget_uses_history_state() {
+        use crate::ha::store::MemoryStore;
+
+        let store = MemoryStore::load(vec![make_test_entity("sensor.energy_today", "23.4")])
+            .expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("sensor.energy_today", WidgetKind::History);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1, "one widget → one tile");
+        match &tiles[0] {
+            TileVM::Entity(vm) => {
+                assert_eq!(vm.state, "23.4", "history state forwarded verbatim");
+            }
+            other => panic!("expected EntityTileVM (History fallback), got {other:?}"),
+        }
+    }
+
+    /// `build_tiles` for a `WidgetKind::History` widget routes an
+    /// `"unavailable"` entity through the bridge without altering the state
+    /// string — the unavailable visual is driven downstream by
+    /// `HistoryGraphVM::is_available`.
+    #[test]
+    fn build_tiles_history_widget_unavailable_state_passes_through() {
+        use crate::ha::store::MemoryStore;
+
+        let store = MemoryStore::load(vec![make_test_entity("sensor.energy_today", "unavailable")])
+            .expect("MemoryStore::load");
+
+        let dashboard = dashboard_with_kind("sensor.energy_today", WidgetKind::History);
+        let tiles = build_tiles(&store, &dashboard);
+        match &tiles[0] {
+            TileVM::Entity(vm) => assert_eq!(vm.state, "unavailable"),
+            other => panic!("expected EntityTileVM (History fallback), got {other:?}"),
+        }
+    }
+
+    /// `compute_history_graph_tile_vm` with `window=None` produces a VM
+    /// whose `change_count == 0` and `path_commands == ""`. This is the
+    /// pre-fetch state every history tile passes through before its first
+    /// `HistoryWindow` arrives.
+    #[test]
+    fn compute_history_graph_tile_vm_with_no_window_yields_empty_path() {
+        let entity = make_test_entity("sensor.energy_today", "23.4");
+        let vm = compute_history_graph_tile_vm(
+            "Energy".to_owned(),
+            "mdi:chart-line".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+            None,
+        );
+        assert_eq!(vm.name, "Energy");
+        assert_eq!(vm.state, "23.4");
+        assert_eq!(vm.change_count, 0);
+        assert!(vm.is_available, "23.4 → is_available=true");
+        assert!(vm.path_commands.is_empty(), "no window → empty commands");
+        assert!(!vm.pending);
+    }
+
+    /// `compute_history_graph_tile_vm` with a populated window emits a
+    /// non-empty `path_commands` string and forwards `change_count` from
+    /// `HistoryWindow::len`.
+    #[test]
+    fn compute_history_graph_tile_vm_with_populated_window_emits_path() {
+        use crate::ha::history::HistoryWindow;
+
+        let entity = make_test_entity("sensor.energy_today", "23.4");
+        let window = HistoryWindow {
+            points: vec![
+                (jiff::Timestamp::from_second(0).unwrap(), 1.0),
+                (jiff::Timestamp::from_second(60).unwrap(), 2.0),
+                (jiff::Timestamp::from_second(120).unwrap(), 3.0),
+            ],
+        };
+        let vm = compute_history_graph_tile_vm(
+            "Energy".to_owned(),
+            "mdi:chart-line".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+            Some(&window),
+        );
+        assert_eq!(vm.change_count, 3);
+        assert!(vm.is_available);
+        assert!(
+            vm.path_commands.starts_with('M'),
+            "path commands must start with MoveTo: {}",
+            vm.path_commands
+        );
+        assert!(
+            vm.path_commands.contains('L'),
+            "path commands must contain at least one LineTo: {}",
+            vm.path_commands
+        );
+    }
+
+    /// `compute_history_graph_tile_vm` with an `"unavailable"` state
+    /// produces `is_available=false` regardless of whether a window is
+    /// present (the renderer dims the trace via opacity rather than
+    /// hiding it).
+    #[test]
+    fn compute_history_graph_tile_vm_unavailable_state() {
+        let entity = make_test_entity("sensor.energy_today", "unavailable");
+        let vm = compute_history_graph_tile_vm(
+            "Energy".to_owned(),
+            "mdi:chart-line".to_owned(),
+            2,
+            1,
+            TilePlacement::default_for(2, 1),
+            &entity,
+            None,
+        );
+        assert!(!vm.is_available, "unavailable → is_available=false");
+        assert_eq!(vm.state, "unavailable");
+    }
+
+    /// `history_path_commands` returns an empty string for an empty window.
+    #[test]
+    fn history_path_commands_empty_window() {
+        use crate::ha::history::HistoryWindow;
+        let window = HistoryWindow { points: Vec::new() };
+        assert_eq!(history_path_commands(&window), "");
+    }
+
+    /// `history_path_commands` emits one `M` and `(n-1)` `L` commands.
+    #[test]
+    fn history_path_commands_command_count_matches_points() {
+        use crate::ha::history::HistoryWindow;
+        let window = HistoryWindow {
+            points: (0..5)
+                .map(|i| (jiff::Timestamp::from_second(i * 60).unwrap(), i as f64))
+                .collect(),
+        };
+        let cmds = history_path_commands(&window);
+        let m_count = cmds.matches('M').count();
+        let l_count = cmds.matches('L').count();
+        assert_eq!(m_count, 1, "exactly one MoveTo: {cmds}");
+        assert_eq!(l_count, 4, "exactly (n-1)=4 LineTo: {cmds}");
+    }
+
+    /// `history_path_commands` normalises the X axis so the first point
+    /// lands at 0.0 and the last at 1.0.
+    #[test]
+    fn history_path_commands_x_axis_endpoints_normalised() {
+        use crate::ha::history::HistoryWindow;
+        let window = HistoryWindow {
+            points: vec![
+                (jiff::Timestamp::from_second(100).unwrap(), 1.0),
+                (jiff::Timestamp::from_second(200).unwrap(), 2.0),
+            ],
+        };
+        let cmds = history_path_commands(&window);
+        assert!(
+            cmds.starts_with("M 0.0000"),
+            "first point must land at x=0.0: {cmds}"
+        );
+        assert!(
+            cmds.contains("L 1.0000"),
+            "last point must land at x=1.0: {cmds}"
+        );
+    }
+
+    /// `history_path_commands` collapses a constant-value trace to the
+    /// centreline (y=0.5) — the divide-by-zero guard.
+    #[test]
+    fn history_path_commands_constant_value_lands_at_centreline() {
+        use crate::ha::history::HistoryWindow;
+        let window = HistoryWindow {
+            points: vec![
+                (jiff::Timestamp::from_second(0).unwrap(), 5.0),
+                (jiff::Timestamp::from_second(60).unwrap(), 5.0),
+                (jiff::Timestamp::from_second(120).unwrap(), 5.0),
+            ],
+        };
+        let cmds = history_path_commands(&window);
+        // Every coordinate pair should have y=0.5000.
+        let y_05_count = cmds.matches("0.5000").count();
+        assert!(
+            y_05_count >= 3,
+            "constant trace should produce y=0.5 for every point: {cmds}"
+        );
+    }
+
+    /// `history_path_commands` with a single-point window emits a single
+    /// `M` command and collapses x to 0.0 / y to 0.5 (the centreline,
+    /// since a one-point window has zero value-span).
+    #[test]
+    fn history_path_commands_single_point_window() {
+        use crate::ha::history::HistoryWindow;
+        let window = HistoryWindow {
+            points: vec![(jiff::Timestamp::from_second(42).unwrap(), 5.0)],
+        };
+        let cmds = history_path_commands(&window);
+        // One MoveTo, no LineTo.
+        assert_eq!(cmds.matches('M').count(), 1);
+        assert_eq!(cmds.matches('L').count(), 0);
+        // The single point lands at (0, 0.5) per the documented fallback:
+        // ts_span==0 → x=0.0; val_span==0 → y=0.5 (centreline).
+        assert_eq!(
+            cmds, "M 0.0000 0.5000",
+            "single-point window must collapse to (0, 0.5)"
+        );
+    }
+
+    /// `history_path_commands` with a multi-point window whose timestamps
+    /// are all coincident (rare HA case where multiple records share
+    /// `last_changed`) collapses every point to x=0.0 per the documented
+    /// edge-case contract. The Y axis still spans normally.
+    #[test]
+    fn history_path_commands_coincident_timestamps_collapse_x_axis() {
+        use crate::ha::history::HistoryWindow;
+        let window = HistoryWindow {
+            points: vec![
+                (jiff::Timestamp::from_second(100).unwrap(), 1.0),
+                (jiff::Timestamp::from_second(100).unwrap(), 2.0),
+                (jiff::Timestamp::from_second(100).unwrap(), 3.0),
+            ],
+        };
+        let cmds = history_path_commands(&window);
+        // Every coordinate pair must have x=0.0000.
+        let x_zero_count = cmds.matches("0.0000").count();
+        // Three points × at least one "0.0000" each (plus possibly more
+        // for y values that round to 0.0000 when val == max). The
+        // minimum guaranteed count is 3 (one per point's x coordinate).
+        assert!(
+            x_zero_count >= 3,
+            "all coincident-timestamp points must collapse to x=0.0: {cmds}"
+        );
+        // Y axis still spans: min val (1.0) → y=1.0; max val (3.0) → y=0.0.
+        assert!(
+            cmds.contains("1.0000"),
+            "Y axis must still span when ts_span==0: {cmds}"
+        );
+    }
+
+    /// `history_path_commands` Y-axis inverts so the maximum value lands
+    /// at y=0.0 (top of the unit square — screen-space convention).
+    #[test]
+    fn history_path_commands_y_axis_inverts_for_screen_space() {
+        use crate::ha::history::HistoryWindow;
+        let window = HistoryWindow {
+            points: vec![
+                (jiff::Timestamp::from_second(0).unwrap(), 1.0),
+                (jiff::Timestamp::from_second(60).unwrap(), 10.0),
+            ],
+        };
+        let cmds = history_path_commands(&window);
+        // First point (val=1.0, the minimum) should be at y=1.0;
+        // second point (val=10.0, the maximum) should be at y=0.0.
+        assert!(
+            cmds.starts_with("M 0.0000 1.0000"),
+            "minimum value must land at y=1.0 (bottom): {cmds}"
+        );
+        assert!(
+            cmds.contains("L 1.0000 0.0000"),
+            "maximum value must land at y=0.0 (top): {cmds}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // HistoryBody more-info richer impl (TASK-106)
+    // -----------------------------------------------------------------------
+
+    /// `HistoryBody::render_rows` always emits the state row.
+    #[test]
+    fn history_body_emits_state_row() {
+        use crate::ui::more_info::{HistoryBody, MoreInfoBody};
+        let entity = make_test_entity("sensor.energy_today", "23.4");
+        let rows = HistoryBody::new().render_rows(&entity);
+        assert!(
+            rows.iter().any(|r| r.key == "state" && r.value == "23.4"),
+            "HistoryBody must always emit a state row; got {rows:?}"
+        );
+    }
+
+    /// `HistoryBody::render_rows` emits a `unit_of_measurement` row when
+    /// the attribute is present.
+    #[test]
+    fn history_body_emits_unit_of_measurement_row_when_attribute_present() {
+        use crate::ui::more_info::{HistoryBody, MoreInfoBody};
+        let entity = entity_with_attr("23.4", "unit_of_measurement", "\"\\u00b0C\"");
+        let entity = Entity {
+            id: EntityId::from("sensor.energy_today"),
+            ..entity
+        };
+        let rows = HistoryBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "unit_of_measurement" && r.value == "°C"),
+            "HistoryBody must emit a unit_of_measurement row when set; got {rows:?}"
+        );
+    }
+
+    /// `HistoryBody::render_rows` emits a `friendly_name` row when the
+    /// attribute is present.
+    #[test]
+    fn history_body_emits_friendly_name_row_when_attribute_present() {
+        use crate::ui::more_info::{HistoryBody, MoreInfoBody};
+        let entity = entity_with_attr("23.4", "friendly_name", "\"Kitchen Thermometer\"");
+        let entity = Entity {
+            id: EntityId::from("sensor.energy_today"),
+            ..entity
+        };
+        let rows = HistoryBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "friendly_name" && r.value == "Kitchen Thermometer"),
+            "HistoryBody must emit a friendly_name row when set; got {rows:?}"
+        );
+    }
+
+    /// `HistoryBody::render_rows` emits a `device_class` row when the
+    /// attribute is present.
+    #[test]
+    fn history_body_emits_device_class_row_when_attribute_present() {
+        use crate::ui::more_info::{HistoryBody, MoreInfoBody};
+        let entity = entity_with_attr("23.4", "device_class", "\"temperature\"");
+        let entity = Entity {
+            id: EntityId::from("sensor.energy_today"),
+            ..entity
+        };
+        let rows = HistoryBody::new().render_rows(&entity);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "device_class" && r.value == "temperature"),
+            "HistoryBody must emit a device_class row when set; got {rows:?}"
+        );
+    }
+
+    /// `HistoryBody::render_rows` skips optional rows when their attributes
+    /// are absent.
+    #[test]
+    fn history_body_skips_optional_rows_when_absent() {
+        use crate::ui::more_info::{HistoryBody, MoreInfoBody};
+        let entity = make_test_entity("sensor.energy_today", "23.4");
+        let rows = HistoryBody::new().render_rows(&entity);
+        // Mandatory row always present.
+        assert!(rows.iter().any(|r| r.key == "state"));
+        // Optional rows must be absent.
+        assert!(!rows.iter().any(|r| r.key == "unit_of_measurement"));
+        assert!(!rows.iter().any(|r| r.key == "device_class"));
+    }
+
+    // -----------------------------------------------------------------------
+    // visibility_flip.yaml fixture validates (TASK-106 acceptance #10)
+    // -----------------------------------------------------------------------
+
+    /// `tests/layout/visibility_flip.yaml` parses through the full Phase 4
+    /// loader pipeline (parse + validate). The fixture carries one
+    /// always-visible widget and one gated by a `state_equals:` predicate;
+    /// the validator must accept both per the
+    /// `locked_decisions.visibility_predicate_vocabulary`.
+    ///
+    /// This test guards against schema drift: if a future plan amendment
+    /// changes the `state_equals` syntax (e.g. swaps `:` for `=`), this
+    /// test fails BEFORE the visibility-flip golden test (TASK-110) runs.
+    /// The actual layout-flicker assertion lives in TASK-110's
+    /// `tests/integration/layout.rs::golden_visibility_flip_no_flicker`
+    /// which reads both this YAML and the sibling
+    /// `visibility_flip.expected.json` predicate-true snapshot.
+    #[test]
+    fn visibility_flip_fixture_parses_and_validates() {
+        use crate::dashboard::loader::load_dashboard_only;
+        use std::path::Path;
+        let dashboard = load_dashboard_only(Path::new("tests/layout/visibility_flip.yaml"))
+            .expect("visibility_flip.yaml must parse + validate");
+        assert_eq!(dashboard.views.len(), 1, "one view");
+        let widgets = &dashboard.views[0].sections[0].widgets;
+        assert_eq!(widgets.len(), 2, "two widgets in main section");
+        assert_eq!(widgets[0].id, "always_visible");
+        assert_eq!(
+            widgets[0].visibility, "always",
+            "always-visible widget defaults to 'always'"
+        );
+        assert_eq!(widgets[1].id, "gated");
+        assert_eq!(
+            widgets[1].visibility, "state_equals:binary_sensor.motion:on",
+            "gated widget carries the canonical state_equals predicate"
+        );
     }
 }

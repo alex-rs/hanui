@@ -1,0 +1,11 @@
+{
+  "sections": [
+    {
+      "section_id": "main",
+      "positions": [
+        {"widget_id": "always_visible", "col": 0, "row": 0, "span_cols": 2, "span_rows": 1},
+        {"widget_id": "gated",          "col": 2, "row": 0, "span_cols": 2, "span_rows": 1}
+      ]
+    }
+  ]
+}
