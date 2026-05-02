@@ -1,0 +1,25 @@
+version: 1
+device_profile: desktop
+default_view: home
+# Phase 6 acceptance fixture (TASK-112): lock widget at idle state.
+views:
+  - id: home
+    title: Home
+    layout: sections
+    sections:
+      - id: main
+        title: Main
+        grid:
+          columns: 4
+          gap: 8
+        widgets:
+          - id: lock_idle
+            type: lock
+            entity: lock.front_door
+            options:
+              lock:
+                pin_policy: none
+                require_confirmation_on_unlock: false
+            layout:
+              preferred_columns: 1
+              preferred_rows: 1

@@ -1,0 +1,10 @@
+{
+  "sections": [
+    {
+      "section_id": "main",
+      "positions": [
+        {"widget_id": "lock_idle", "col": 0, "row": 0, "span_cols": 1, "span_rows": 1}
+      ]
+    }
+  ]
+}

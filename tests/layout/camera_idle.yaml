@@ -1,0 +1,25 @@
+version: 1
+device_profile: desktop
+default_view: home
+# Phase 6 acceptance fixture (TASK-112): camera widget at idle state.
+views:
+  - id: home
+    title: Home
+    layout: sections
+    sections:
+      - id: main
+        title: Main
+        grid:
+          columns: 4
+          gap: 8
+        widgets:
+          - id: camera_idle
+            type: camera
+            entity: camera.front_door
+            options:
+              camera:
+                interval_seconds: 30
+                url: "https://camera.local/snapshot.jpg"
+            layout:
+              preferred_columns: 2
+              preferred_rows: 2

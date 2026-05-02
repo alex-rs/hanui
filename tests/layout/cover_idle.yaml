@@ -1,0 +1,29 @@
+version: 1
+device_profile: desktop
+default_view: home
+# Phase 6 acceptance fixture (TASK-112): cover widget at idle state.
+# Validates the schema + packer accept a Phase 6 cover widget in a 4-col
+# section. The "idle" suffix is informational — the YAML schema is
+# state-agnostic; the per-frame VM tests in `tests/integration/cover.rs`
+# cover idle/active/unavailable rendering distinctness.
+views:
+  - id: home
+    title: Home
+    layout: sections
+    sections:
+      - id: main
+        title: Main
+        grid:
+          columns: 4
+          gap: 8
+        widgets:
+          - id: cover_idle
+            type: cover
+            entity: cover.garage
+            options:
+              cover:
+                position_min: 0
+                position_max: 100
+            layout:
+              preferred_columns: 2
+              preferred_rows: 1

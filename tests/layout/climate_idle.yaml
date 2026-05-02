@@ -1,0 +1,27 @@
+version: 1
+device_profile: desktop
+default_view: home
+# Phase 6 acceptance fixture (TASK-112): climate widget at idle (off) state.
+views:
+  - id: home
+    title: Home
+    layout: sections
+    sections:
+      - id: main
+        title: Main
+        grid:
+          columns: 4
+          gap: 8
+        widgets:
+          - id: climate_idle
+            type: climate
+            entity: climate.living_room
+            options:
+              climate:
+                min_temp: 15.0
+                max_temp: 30.0
+                step: 0.5
+                hvac_modes: [heat, cool, auto, off]
+            layout:
+              preferred_columns: 2
+              preferred_rows: 1
