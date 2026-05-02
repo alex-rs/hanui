@@ -734,38 +734,137 @@ async fn run_ws_client(
 /// Extracted from `SlintSink::apply_row_updates`'s `invoke_from_event_loop`
 /// closure so the branching logic can be unit-tested with plain `VecModel`
 /// instances, without requiring a running Slint event loop.
-fn write_row_updates(
-    updates: &[ui::bridge::RowUpdate],
-    lights: &ModelRc<ui::bridge::slint_ui::LightTileVM>,
-    sensors: &ModelRc<ui::bridge::slint_ui::SensorTileVM>,
-    entities: &ModelRc<ui::bridge::slint_ui::EntityTileVM>,
-) {
+/// Bundle of references to every Slint per-kind model, one entry per
+/// [`ui::bridge::TileKind`]. Passed to [`write_row_updates`] so the helper
+/// can route each update to the correct model without an N-arg signature.
+///
+/// Pre-`task/phase6-window-wireup` only Light / Sensor / Entity models
+/// existed; the wire-up adds nine more so every Phase 6 widget kind has
+/// its own row stream.
+struct RowUpdateModels<'a> {
+    lights: &'a ModelRc<ui::bridge::slint_ui::LightTileVM>,
+    sensors: &'a ModelRc<ui::bridge::slint_ui::SensorTileVM>,
+    entities: &'a ModelRc<ui::bridge::slint_ui::EntityTileVM>,
+    covers: &'a ModelRc<ui::bridge::slint_ui::CoverTileVM>,
+    fans: &'a ModelRc<ui::bridge::slint_ui::FanTileVM>,
+    locks: &'a ModelRc<ui::bridge::slint_ui::LockTileVM>,
+    alarms: &'a ModelRc<ui::bridge::slint_ui::AlarmTileVM>,
+    histories: &'a ModelRc<ui::bridge::slint_ui::HistoryGraphTileVM>,
+    cameras: &'a ModelRc<ui::bridge::slint_ui::CameraTileVM>,
+    climates: &'a ModelRc<ui::bridge::slint_ui::ClimateTileVM>,
+    media_players: &'a ModelRc<ui::bridge::slint_ui::MediaPlayerTileVM>,
+    power_flows: &'a ModelRc<ui::bridge::slint_ui::PowerFlowTileVM>,
+}
+
+fn write_row_updates(updates: &[ui::bridge::RowUpdate], models: &RowUpdateModels<'_>) {
     use slint::Model;
     for update in updates {
         match update.kind {
             ui::bridge::TileKind::Light => {
-                if let Some(mut row) = lights.row_data(update.row_index) {
+                if let Some(mut row) = models.lights.row_data(update.row_index) {
                     if row.state.as_str() != update.state {
                         row.state = update.state.as_str().into();
-                        lights.set_row_data(update.row_index, row);
+                        models.lights.set_row_data(update.row_index, row);
                     }
                 }
             }
             ui::bridge::TileKind::Sensor => {
-                if let Some(mut row) = sensors.row_data(update.row_index) {
+                if let Some(mut row) = models.sensors.row_data(update.row_index) {
                     if row.state.as_str() != update.state {
                         row.state = update.state.as_str().into();
-                        sensors.set_row_data(update.row_index, row);
+                        models.sensors.set_row_data(update.row_index, row);
                     }
                 }
             }
             ui::bridge::TileKind::Entity => {
-                if let Some(mut row) = entities.row_data(update.row_index) {
+                if let Some(mut row) = models.entities.row_data(update.row_index) {
                     if row.state.as_str() != update.state {
                         row.state = update.state.as_str().into();
-                        entities.set_row_data(update.row_index, row);
+                        models.entities.set_row_data(update.row_index, row);
                     }
                 }
+            }
+            ui::bridge::TileKind::Cover => {
+                if let Some(mut row) = models.covers.row_data(update.row_index) {
+                    if row.state.as_str() != update.state {
+                        row.state = update.state.as_str().into();
+                        models.covers.set_row_data(update.row_index, row);
+                    }
+                }
+            }
+            ui::bridge::TileKind::Fan => {
+                if let Some(mut row) = models.fans.row_data(update.row_index) {
+                    if row.state.as_str() != update.state {
+                        row.state = update.state.as_str().into();
+                        models.fans.set_row_data(update.row_index, row);
+                    }
+                }
+            }
+            ui::bridge::TileKind::Lock => {
+                if let Some(mut row) = models.locks.row_data(update.row_index) {
+                    if row.state.as_str() != update.state {
+                        row.state = update.state.as_str().into();
+                        models.locks.set_row_data(update.row_index, row);
+                    }
+                }
+            }
+            ui::bridge::TileKind::Alarm => {
+                if let Some(mut row) = models.alarms.row_data(update.row_index) {
+                    if row.state.as_str() != update.state {
+                        row.state = update.state.as_str().into();
+                        models.alarms.set_row_data(update.row_index, row);
+                    }
+                }
+            }
+            ui::bridge::TileKind::History => {
+                if let Some(mut row) = models.histories.row_data(update.row_index) {
+                    if row.state.as_str() != update.state {
+                        row.state = update.state.as_str().into();
+                        models.histories.set_row_data(update.row_index, row);
+                    }
+                }
+            }
+            ui::bridge::TileKind::Camera => {
+                if let Some(mut row) = models.cameras.row_data(update.row_index) {
+                    if row.state.as_str() != update.state {
+                        row.state = update.state.as_str().into();
+                        models.cameras.set_row_data(update.row_index, row);
+                    }
+                }
+            }
+            ui::bridge::TileKind::Climate => {
+                if let Some(mut row) = models.climates.row_data(update.row_index) {
+                    if row.state.as_str() != update.state {
+                        row.state = update.state.as_str().into();
+                        models.climates.set_row_data(update.row_index, row);
+                    }
+                }
+            }
+            ui::bridge::TileKind::MediaPlayer => {
+                if let Some(mut row) = models.media_players.row_data(update.row_index) {
+                    if row.state.as_str() != update.state {
+                        row.state = update.state.as_str().into();
+                        models.media_players.set_row_data(update.row_index, row);
+                    }
+                }
+            }
+            ui::bridge::TileKind::PowerFlow => {
+                // PowerFlow's Slint VM has no `state` field — the per-frame
+                // numeric values (grid_w / solar_w / etc.) are the actual
+                // dynamic surface and must flow through a full-rebuild
+                // path. The per-row `state` channel does not apply, so
+                // this arm is a no-op. The state watcher's
+                // Reconnecting/Failed → Live resync rebuilds the full tile
+                // list, picking up fresh PowerFlow values via
+                // `compute_power_flow_tile_vm_from_widget`. We still touch
+                // the `power_flows` model handle so the route is exercised
+                // (defensive / row-bounds check); this is a single Arc
+                // deref + `row_data` lookup, no allocation.
+                let _ = models.power_flows.row_data(update.row_index);
+                tracing::trace!(
+                    row_index = update.row_index,
+                    "skipping per-row state update for PowerFlow tile (no state field; full-rebuild path applies)",
+                );
             }
         }
     }
@@ -833,10 +932,23 @@ impl ui::bridge::BridgeSink for SlintSink {
         let window = self.window.clone();
         if let Err(e) = slint::invoke_from_event_loop(move || {
             if let Some(w) = window.upgrade() {
-                let (lights, sensors, entities) = split_tile_vms(&tiles);
-                w.set_light_tiles(ModelRc::new(VecModel::from(lights)));
-                w.set_sensor_tiles(ModelRc::new(VecModel::from(sensors)));
-                w.set_entity_tiles(ModelRc::new(VecModel::from(entities)));
+                let split = split_tile_vms(&tiles);
+                w.set_light_tiles(ModelRc::new(VecModel::from(split.lights)));
+                w.set_sensor_tiles(ModelRc::new(VecModel::from(split.sensors)));
+                w.set_entity_tiles(ModelRc::new(VecModel::from(split.entities)));
+                // task/phase6-window-wireup: full-rebuild path also writes
+                // every Phase 6 per-kind model so a Reconnecting/Failed →
+                // Live resync repaints the dashboard with fresh tiles for
+                // every kind, not just the Phase 1 trio.
+                w.set_cover_tiles(ModelRc::new(VecModel::from(split.covers)));
+                w.set_fan_tiles(ModelRc::new(VecModel::from(split.fans)));
+                w.set_lock_tiles(ModelRc::new(VecModel::from(split.locks)));
+                w.set_alarm_tiles(ModelRc::new(VecModel::from(split.alarms)));
+                w.set_history_tiles(ModelRc::new(VecModel::from(split.histories)));
+                w.set_camera_tiles(ModelRc::new(VecModel::from(split.cameras)));
+                w.set_climate_tiles(ModelRc::new(VecModel::from(split.climates)));
+                w.set_media_player_tiles(ModelRc::new(VecModel::from(split.media_players)));
+                w.set_power_flow_tiles(ModelRc::new(VecModel::from(split.power_flows)));
             }
         }) {
             tracing::debug!(error = %e, "invoke_from_event_loop failed in write_tiles (event loop shut down?)");
@@ -872,11 +984,38 @@ impl ui::bridge::BridgeSink for SlintSink {
             let Some(w) = window.upgrade() else {
                 return;
             };
+            // task/phase6-window-wireup: route per-row updates to every
+            // Phase 6 model in addition to the Phase 1 trio. Each model
+            // is a thin Arc-bumped handle, so this list of getters is
+            // O(1) per call (no per-row walk).
+            let lights = w.get_light_tiles();
+            let sensors = w.get_sensor_tiles();
+            let entities = w.get_entity_tiles();
+            let covers = w.get_cover_tiles();
+            let fans = w.get_fan_tiles();
+            let locks = w.get_lock_tiles();
+            let alarms = w.get_alarm_tiles();
+            let histories = w.get_history_tiles();
+            let cameras = w.get_camera_tiles();
+            let climates = w.get_climate_tiles();
+            let media_players = w.get_media_player_tiles();
+            let power_flows = w.get_power_flow_tiles();
             write_row_updates(
                 &updates,
-                &w.get_light_tiles(),
-                &w.get_sensor_tiles(),
-                &w.get_entity_tiles(),
+                &RowUpdateModels {
+                    lights: &lights,
+                    sensors: &sensors,
+                    entities: &entities,
+                    covers: &covers,
+                    fans: &fans,
+                    locks: &locks,
+                    alarms: &alarms,
+                    histories: &histories,
+                    cameras: &cameras,
+                    climates: &climates,
+                    media_players: &media_players,
+                    power_flows: &power_flows,
+                },
             );
         }) {
             tracing::debug!(error = %e, "invoke_from_event_loop failed in apply_row_updates (event loop shut down?)");
@@ -1305,6 +1444,7 @@ mod tests {
             state: "unavailable".into(),
             ..Default::default()
         }]));
+        let phase6 = empty_phase6_models();
 
         write_row_updates(
             &[
@@ -1324,9 +1464,20 @@ mod tests {
                     state: "home".into(),
                 },
             ],
-            &lights,
-            &sensors,
-            &entities,
+            &RowUpdateModels {
+                lights: &lights,
+                sensors: &sensors,
+                entities: &entities,
+                covers: &phase6.covers,
+                fans: &phase6.fans,
+                locks: &phase6.locks,
+                alarms: &phase6.alarms,
+                histories: &phase6.histories,
+                cameras: &phase6.cameras,
+                climates: &phase6.climates,
+                media_players: &phase6.media_players,
+                power_flows: &phase6.power_flows,
+            },
         );
 
         assert_eq!(lights.row_data(0).unwrap().state.as_str(), "on");
@@ -1350,6 +1501,7 @@ mod tests {
             ModelRc::new(VecModel::<ui::bridge::slint_ui::SensorTileVM>::from(vec![]));
         let empty_entities =
             ModelRc::new(VecModel::<ui::bridge::slint_ui::EntityTileVM>::from(vec![]));
+        let phase6 = empty_phase6_models();
 
         write_row_updates(
             &[RowUpdate {
@@ -1357,9 +1509,20 @@ mod tests {
                 row_index: 0,
                 state: "on".into(),
             }],
-            &lights,
-            &empty_sensors,
-            &empty_entities,
+            &RowUpdateModels {
+                lights: &lights,
+                sensors: &empty_sensors,
+                entities: &empty_entities,
+                covers: &phase6.covers,
+                fans: &phase6.fans,
+                locks: &phase6.locks,
+                alarms: &phase6.alarms,
+                histories: &phase6.histories,
+                cameras: &phase6.cameras,
+                climates: &phase6.climates,
+                media_players: &phase6.media_players,
+                power_flows: &phase6.power_flows,
+            },
         );
 
         // State is still "on" — no write occurred (same value).
@@ -1375,6 +1538,7 @@ mod tests {
         let lights = ModelRc::new(VecModel::<ui::bridge::slint_ui::LightTileVM>::from(vec![]));
         let sensors = ModelRc::new(VecModel::<ui::bridge::slint_ui::SensorTileVM>::from(vec![]));
         let entities = ModelRc::new(VecModel::<ui::bridge::slint_ui::EntityTileVM>::from(vec![]));
+        let phase6 = empty_phase6_models();
 
         // row_index 99 is out of bounds for empty models — must not panic.
         write_row_updates(
@@ -1383,10 +1547,59 @@ mod tests {
                 row_index: 99,
                 state: "on".into(),
             }],
-            &lights,
-            &sensors,
-            &entities,
+            &RowUpdateModels {
+                lights: &lights,
+                sensors: &sensors,
+                entities: &entities,
+                covers: &phase6.covers,
+                fans: &phase6.fans,
+                locks: &phase6.locks,
+                alarms: &phase6.alarms,
+                histories: &phase6.histories,
+                cameras: &phase6.cameras,
+                climates: &phase6.climates,
+                media_players: &phase6.media_players,
+                power_flows: &phase6.power_flows,
+            },
         );
+    }
+
+    /// Owned bundle of empty Phase 6 model handles for `write_row_updates`
+    /// tests. Holding the `ModelRc`s by value keeps each one alive for the
+    /// duration of the test; `RowUpdateModels` borrows them by reference.
+    struct Phase6EmptyModels {
+        covers: ModelRc<ui::bridge::slint_ui::CoverTileVM>,
+        fans: ModelRc<ui::bridge::slint_ui::FanTileVM>,
+        locks: ModelRc<ui::bridge::slint_ui::LockTileVM>,
+        alarms: ModelRc<ui::bridge::slint_ui::AlarmTileVM>,
+        histories: ModelRc<ui::bridge::slint_ui::HistoryGraphTileVM>,
+        cameras: ModelRc<ui::bridge::slint_ui::CameraTileVM>,
+        climates: ModelRc<ui::bridge::slint_ui::ClimateTileVM>,
+        media_players: ModelRc<ui::bridge::slint_ui::MediaPlayerTileVM>,
+        power_flows: ModelRc<ui::bridge::slint_ui::PowerFlowTileVM>,
+    }
+
+    fn empty_phase6_models() -> Phase6EmptyModels {
+        use slint::{ModelRc, VecModel};
+        Phase6EmptyModels {
+            covers: ModelRc::new(VecModel::<ui::bridge::slint_ui::CoverTileVM>::from(vec![])),
+            fans: ModelRc::new(VecModel::<ui::bridge::slint_ui::FanTileVM>::from(vec![])),
+            locks: ModelRc::new(VecModel::<ui::bridge::slint_ui::LockTileVM>::from(vec![])),
+            alarms: ModelRc::new(VecModel::<ui::bridge::slint_ui::AlarmTileVM>::from(vec![])),
+            histories: ModelRc::new(VecModel::<ui::bridge::slint_ui::HistoryGraphTileVM>::from(
+                vec![],
+            )),
+            cameras: ModelRc::new(VecModel::<ui::bridge::slint_ui::CameraTileVM>::from(vec![])),
+            climates: ModelRc::new(VecModel::<ui::bridge::slint_ui::ClimateTileVM>::from(
+                vec![],
+            )),
+            media_players: ModelRc::new(VecModel::<ui::bridge::slint_ui::MediaPlayerTileVM>::from(
+                vec![],
+            )),
+            power_flows: ModelRc::new(VecModel::<ui::bridge::slint_ui::PowerFlowTileVM>::from(
+                vec![],
+            )),
+        }
     }
 
     /// `build_ws_client_with_store` wires the `WsClient` and the `LiveStore`

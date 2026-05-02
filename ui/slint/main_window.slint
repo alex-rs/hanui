@@ -35,6 +35,15 @@ import { CardBase } from "card_base.slint";
 import { LightTile, LightTileVM, TilePlacement } from "light_tile.slint";
 import { SensorTile, SensorTileVM, SensorTilePlacement } from "sensor_tile.slint";
 import { EntityTile, EntityTileVM, EntityTilePlacement } from "entity_tile.slint";
+import { CoverTile, CoverTileVM, CoverTilePlacement } from "cover_tile.slint";
+import { FanTile, FanTileVM, FanTilePlacement } from "fan_tile.slint";
+import { LockTile, LockTileVM, LockTilePlacement } from "lock_tile.slint";
+import { AlarmPanelTile, AlarmTileVM, AlarmTilePlacement } from "alarm_panel_tile.slint";
+import { HistoryGraphTile, HistoryGraphTileVM, HistoryGraphTilePlacement } from "history_graph_tile.slint";
+import { CameraSnapshotTile, CameraTileVM, CameraTilePlacement } from "camera_snapshot_tile.slint";
+import { ClimateTile, ClimateTileVM, ClimateTilePlacement } from "climate_tile.slint";
+import { MediaPlayerTile, MediaPlayerTileVM, MediaPlayerTilePlacement } from "media_player_tile.slint";
+import { PowerFlowTile, PowerFlowTileVM, PowerFlowTilePlacement } from "power_flow_tile.slint";
 import { GestureConfigGlobal } from "gesture_config.slint";
 import { ViewRouterGlobal } from "view_router.slint";
 import { MoreInfoModal, ModalRowVM } from "more_info.slint";
@@ -64,6 +73,21 @@ export component MainWindow inherits Window {
     in property <[LightTileVM]> light-tiles;
     in property <[SensorTileVM]> sensor-tiles;
     in property <[EntityTileVM]> entity-tiles;
+    // ── Phase 6 per-kind tile arrays (task/phase6-window-wireup) ────────
+    // Each Phase 6 widget kind now renders through its dedicated tile
+    // component instead of falling back to EntityTile. The Rust bridge's
+    // `wire_window` writes one model per array; rendering happens in
+    // document order within the VerticalLayout below. See
+    // `src/ui/bridge.rs::split_tile_vms` for the Rust-side mapping.
+    in property <[CoverTileVM]> cover-tiles;
+    in property <[FanTileVM]> fan-tiles;
+    in property <[LockTileVM]> lock-tiles;
+    in property <[AlarmTileVM]> alarm-tiles;
+    in property <[HistoryGraphTileVM]> history-tiles;
+    in property <[CameraTileVM]> camera-tiles;
+    in property <[ClimateTileVM]> climate-tiles;
+    in property <[MediaPlayerTileVM]> media-player-tiles;
+    in property <[PowerFlowTileVM]> power-flow-tiles;
     in property <bool> status-banner-visible: false;
 
     // ── More-info modal (TASK-066) ──────────────────────────────────────
@@ -106,6 +130,39 @@ export component MainWindow inherits Window {
             view-model: tile;
         }
         for tile[i] in root.entity-tiles : EntityTile {
+            view-model: tile;
+        }
+        // Phase 6 per-kind tile renderers. Each iterates its dedicated
+        // model array; the tile components themselves wrap CardBase and
+        // honour AnimationBudget per their own per-tile docs (cover_tile.slint,
+        // fan_tile.slint, lock_tile.slint, alarm_panel_tile.slint,
+        // history_graph_tile.slint, camera_snapshot_tile.slint,
+        // climate_tile.slint, media_player_tile.slint, power_flow_tile.slint).
+        for tile[i] in root.cover-tiles : CoverTile {
+            view-model: tile;
+        }
+        for tile[i] in root.fan-tiles : FanTile {
+            view-model: tile;
+        }
+        for tile[i] in root.lock-tiles : LockTile {
+            view-model: tile;
+        }
+        for tile[i] in root.alarm-tiles : AlarmPanelTile {
+            view-model: tile;
+        }
+        for tile[i] in root.history-tiles : HistoryGraphTile {
+            view-model: tile;
+        }
+        for tile[i] in root.camera-tiles : CameraSnapshotTile {
+            view-model: tile;
+        }
+        for tile[i] in root.climate-tiles : ClimateTile {
+            view-model: tile;
+        }
+        for tile[i] in root.media-player-tiles : MediaPlayerTile {
+            view-model: tile;
+        }
+        for tile[i] in root.power-flow-tiles : PowerFlowTile {
             view-model: tile;
         }
     }
