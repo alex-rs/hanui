@@ -1752,4 +1752,17 @@ views:
             "same bucket length but different content must not be equal"
         );
     }
+
+    // Covers line 704: the `return false` branch in `impl PartialEq for Dashboard`
+    // when a plain field (not dep_index) differs between two instances.
+    #[test]
+    fn dashboard_partial_eq_plain_field_diff_returns_false() {
+        let a = minimal_dashboard();
+        let mut b = minimal_dashboard();
+        b.version = 2;
+        assert_ne!(
+            a, b,
+            "dashboards differing only in `version` must not be equal"
+        );
+    }
 }
