@@ -220,12 +220,29 @@ fn single_entity_dashboard(entity_id: &str) -> Dashboard {
 }
 
 /// Extract the `state` string from the single tile in `tiles`.
+///
+/// Post `task/phase6-window-wireup`: every Phase 6 widget kind has its own
+/// `TileVM` variant. PowerFlow has no `state` field on its VM (the per-frame
+/// data surface is numeric watts) — it is intentionally not handled here
+/// because no test in this file produces a PowerFlow tile.
 fn single_tile_state(tiles: &[TileVM]) -> String {
     assert_eq!(tiles.len(), 1, "expected exactly one tile");
     match &tiles[0] {
         TileVM::Entity(vm) => vm.state.clone(),
         TileVM::Light(vm) => vm.state.clone(),
         TileVM::Sensor(vm) => vm.state.clone(),
+        TileVM::Cover(vm) => vm.state.clone(),
+        TileVM::Fan(vm) => vm.state.clone(),
+        TileVM::Lock(vm) => vm.state.clone(),
+        TileVM::Alarm(vm) => vm.state.clone(),
+        TileVM::History(vm) => vm.state.clone(),
+        TileVM::Camera(vm) => vm.state.clone(),
+        TileVM::Climate(vm) => vm.state.clone(),
+        TileVM::MediaPlayer(vm) => vm.state.clone(),
+        TileVM::PowerFlow(_) => panic!(
+            "PowerFlow tile produced in `single_tile_state`; PowerFlow has no `state` field — \
+             this test must not exercise the PowerFlow path",
+        ),
     }
 }
 

@@ -56,7 +56,7 @@
 //! Slint callback or animation timer (per the slint-engineer charter
 //! hot-path discipline).
 
-use crate::dashboard::schema::{Dashboard, Placement, WidgetKind};
+use crate::dashboard::schema::{Dashboard, Placement, WidgetKind, WidgetOptions};
 use crate::ha::entity::{EntityId, EntityKind};
 use crate::ha::store::EntityStore;
 
@@ -685,11 +685,29 @@ pub struct PowerFlowTileVM {
 ///
 /// `build_tiles` returns one `TileVM` per widget in the dashboard config,
 /// in document order (views → sections → widgets).
+///
+/// Phase 6 expansion (`task/phase6-window-wireup`): every `WidgetKind`
+/// from `dashboard::schema::WidgetKind` now has a dedicated variant; no
+/// kind falls through to `Entity` anymore. `main_window.slint` declares a
+/// matching `<kind>-tiles` array property for each so the bridge writes
+/// per-kind models that drive each Phase 6 tile component (`CoverTile`,
+/// `FanTile`, `LockTile`, `AlarmPanelTile`, `HistoryGraphTile`,
+/// `CameraSnapshotTile`, `ClimateTile`, `MediaPlayerTile`,
+/// `PowerFlowTile`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum TileVM {
     Light(LightTileVM),
     Sensor(SensorTileVM),
     Entity(EntityTileVM),
+    Cover(CoverTileVM),
+    Fan(FanTileVM),
+    Lock(LockTileVM),
+    Alarm(AlarmTileVM),
+    History(HistoryGraphTileVM),
+    Camera(CameraTileVM),
+    Climate(ClimateTileVM),
+    MediaPlayer(MediaPlayerTileVM),
+    PowerFlow(PowerFlowTileVM),
 }
 
 // ---------------------------------------------------------------------------
@@ -698,12 +716,15 @@ pub enum TileVM {
 
 /// Per-kind discriminator used by the [`RowIndex`] / [`RowUpdate`] surface.
 ///
-/// Mirrors the three [`TileVM`] variants so the flush loop can route each
-/// changed entity to the correct Slint per-kind model (`light_tiles`,
-/// `sensor_tiles`, `entity_tiles`) without re-pattern-matching the full
-/// [`TileVM`].  The [`RowIndex`] stores `(kind, row_index)` pairs because the
-/// Slint side splits tiles by kind in [`split_tile_vms`]; a row index is only
-/// meaningful relative to its per-kind model.
+/// Mirrors the [`TileVM`] variants so the flush loop can route each
+/// changed entity to the correct Slint per-kind model
+/// (`light_tiles`, `sensor_tiles`, `entity_tiles`, plus the Phase 6
+/// per-kind models — `cover_tiles`, `fan_tiles`, `lock_tiles`,
+/// `alarm_tiles`, `history_tiles`, `camera_tiles`, `climate_tiles`,
+/// `media_player_tiles`, `power_flow_tiles`) without re-pattern-matching
+/// the full [`TileVM`].  The [`RowIndex`] stores `(kind, row_index)` pairs
+/// because the Slint side splits tiles by kind in [`split_tile_vms`]; a
+/// row index is only meaningful relative to its per-kind model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TileKind {
     /// `LightTileVM` rows in `MainWindow::light_tiles`.
@@ -712,6 +733,24 @@ pub enum TileKind {
     Sensor,
     /// `EntityTileVM` rows in `MainWindow::entity_tiles`.
     Entity,
+    /// `CoverTileVM` rows in `MainWindow::cover_tiles`.
+    Cover,
+    /// `FanTileVM` rows in `MainWindow::fan_tiles`.
+    Fan,
+    /// `LockTileVM` rows in `MainWindow::lock_tiles`.
+    Lock,
+    /// `AlarmTileVM` rows in `MainWindow::alarm_tiles`.
+    Alarm,
+    /// `HistoryGraphTileVM` rows in `MainWindow::history_tiles`.
+    History,
+    /// `CameraTileVM` rows in `MainWindow::camera_tiles`.
+    Camera,
+    /// `ClimateTileVM` rows in `MainWindow::climate_tiles`.
+    Climate,
+    /// `MediaPlayerTileVM` rows in `MainWindow::media_player_tiles`.
+    MediaPlayer,
+    /// `PowerFlowTileVM` rows in `MainWindow::power_flow_tiles`.
+    PowerFlow,
 }
 
 /// One row's worth of dynamic-field changes flowing from the flush loop to
@@ -791,29 +830,26 @@ impl RowIndex {
 /// Map a [`WidgetKind`] to the [`TileKind`] (i.e. the per-kind Slint model
 /// it lives in) that [`build_tiles`] produces for it.
 ///
-/// Mirrors the `match widget.widget_type` arms in [`build_tiles`] —
-/// `LightTile -> Light`, `SensorTile -> Sensor`, every other variant falls
-/// into the generic `Entity` slot until per-kind tiles ship.  The mapping is
-/// a pure function of the widget config (no store state required), which is
-/// what lets [`build_row_index`] run without touching the live store.
+/// Mirrors the `match widget.widget_type` arms in [`build_tiles`] one-to-one
+/// post `task/phase6-window-wireup`. Every `WidgetKind` now maps to its
+/// dedicated [`TileKind`] / Slint per-kind model — no kind falls through to
+/// `Entity` anymore. The mapping is a pure function of the widget config
+/// (no store state required), which is what lets [`build_row_index`] run
+/// without touching the live store.
 fn tile_kind_for_widget(widget_type: &WidgetKind) -> TileKind {
     match widget_type {
         WidgetKind::LightTile => TileKind::Light,
         WidgetKind::SensorTile => TileKind::Sensor,
-        // Phase 4 schema adds Camera/History/Fan/Lock/Alarm; Phase 6 adds
-        // Cover/MediaPlayer/Climate/PowerFlow. Until per-kind Slint tiles
-        // exist (TASK-102..TASK-109), they all render via the generic
-        // entity tile — see the matching `build_tiles` arm.
-        WidgetKind::EntityTile
-        | WidgetKind::Camera
-        | WidgetKind::History
-        | WidgetKind::Fan
-        | WidgetKind::Lock
-        | WidgetKind::Alarm
-        | WidgetKind::Cover
-        | WidgetKind::MediaPlayer
-        | WidgetKind::Climate
-        | WidgetKind::PowerFlow => TileKind::Entity,
+        WidgetKind::EntityTile => TileKind::Entity,
+        WidgetKind::Cover => TileKind::Cover,
+        WidgetKind::Fan => TileKind::Fan,
+        WidgetKind::Lock => TileKind::Lock,
+        WidgetKind::Alarm => TileKind::Alarm,
+        WidgetKind::History => TileKind::History,
+        WidgetKind::Camera => TileKind::Camera,
+        WidgetKind::Climate => TileKind::Climate,
+        WidgetKind::MediaPlayer => TileKind::MediaPlayer,
+        WidgetKind::PowerFlow => TileKind::PowerFlow,
     }
 }
 
@@ -830,10 +866,20 @@ fn tile_kind_for_widget(widget_type: &WidgetKind) -> TileKind {
 pub fn build_row_index(dashboard: &Dashboard) -> RowIndex {
     let mut by_entity: HashMap<EntityId, Vec<(TileKind, usize)>> = HashMap::new();
     // Per-kind row counters track the row index within each per-kind model
-    // that `split_tile_vms` produces.
+    // that `split_tile_vms` produces. Phase 6 adds nine more counters so
+    // every `WidgetKind` gets its own row stream.
     let mut light_idx: usize = 0;
     let mut sensor_idx: usize = 0;
     let mut entity_idx: usize = 0;
+    let mut cover_idx: usize = 0;
+    let mut fan_idx: usize = 0;
+    let mut lock_idx: usize = 0;
+    let mut alarm_idx: usize = 0;
+    let mut history_idx: usize = 0;
+    let mut camera_idx: usize = 0;
+    let mut climate_idx: usize = 0;
+    let mut media_player_idx: usize = 0;
+    let mut power_flow_idx: usize = 0;
     for view in &dashboard.views {
         for section in &view.sections {
             for widget in &section.widgets {
@@ -854,10 +900,59 @@ pub fn build_row_index(dashboard: &Dashboard) -> RowIndex {
                         entity_idx += 1;
                         i
                     }
+                    TileKind::Cover => {
+                        let i = cover_idx;
+                        cover_idx += 1;
+                        i
+                    }
+                    TileKind::Fan => {
+                        let i = fan_idx;
+                        fan_idx += 1;
+                        i
+                    }
+                    TileKind::Lock => {
+                        let i = lock_idx;
+                        lock_idx += 1;
+                        i
+                    }
+                    TileKind::Alarm => {
+                        let i = alarm_idx;
+                        alarm_idx += 1;
+                        i
+                    }
+                    TileKind::History => {
+                        let i = history_idx;
+                        history_idx += 1;
+                        i
+                    }
+                    TileKind::Camera => {
+                        let i = camera_idx;
+                        camera_idx += 1;
+                        i
+                    }
+                    TileKind::Climate => {
+                        let i = climate_idx;
+                        climate_idx += 1;
+                        i
+                    }
+                    TileKind::MediaPlayer => {
+                        let i = media_player_idx;
+                        media_player_idx += 1;
+                        i
+                    }
+                    TileKind::PowerFlow => {
+                        let i = power_flow_idx;
+                        power_flow_idx += 1;
+                        i
+                    }
                 };
                 let id_str = widget.entity.as_deref().unwrap_or("");
                 if id_str.is_empty() {
                     // No entity binding: row is allocated but not routable.
+                    // PowerFlow widgets have `entity: None` (their primary
+                    // grid_entity lives in `WidgetOptions::PowerFlow`); they
+                    // intentionally fall here so the per-entity broadcast
+                    // path is not wired for the wrapper widget itself.
                     continue;
                 }
                 by_entity
@@ -969,267 +1064,121 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                                 placement,
                                 pending: false,
                             }),
-                            // TASK-102: cover entities flow through
-                            // `CoverVM::from_entity` so the per-frame derived
-                            // state (is_open / is_moving / position) is
-                            // available to the bridge. Until `main_window.slint`
-                            // grows a `cover-tiles` array property (subsequent
-                            // ticket), the cover tile renders as the generic
-                            // `EntityTileVM` fallback — but the `state` string
-                            // is enriched with the position percentage so the
-                            // user sees "open 75%" / "closed" / "opening" /
-                            // "closing" without losing information. The
-                            // `CoverVM` itself is exposed via
-                            // `compute_cover_tile_vm` for the per-kind
-                            // rendering path that follows in TASK-108.
-                            WidgetKind::Cover => {
-                                let cover_vm = crate::ui::cover::CoverVM::from_entity(&entity);
-                                let has_position =
-                                    entity.attributes.get("current_position").is_some();
-                                let state = if has_position {
-                                    format!("{} {}%", entity.state.as_ref(), cover_vm.position)
-                                } else {
-                                    (*entity.state).to_string()
-                                };
-                                TileVM::Entity(EntityTileVM {
-                                    name,
-                                    state,
-                                    icon_id,
-                                    preferred_columns,
-                                    preferred_rows,
-                                    placement,
-                                    pending: false,
-                                })
-                            }
-                            // TASK-103: fan entities flow through
-                            // `FanVM::from_entity` so the per-frame derived
-                            // state (is_on / speed_pct / current_speed) is
-                            // available to the bridge. Until `main_window.slint`
-                            // grows a `fan-tiles` array property (subsequent
-                            // ticket), the fan tile renders as the generic
-                            // `EntityTileVM` fallback — but the `state` string
-                            // is enriched with the speed percentage or preset
-                            // mode so the user sees "on 75%" / "on Low" / "off"
-                            // without losing information. The `FanVM` itself is
-                            // exposed via `compute_fan_tile_vm` for the
-                            // per-kind rendering path that follows when
-                            // `main_window.slint` gains the array property.
-                            WidgetKind::Fan => {
-                                let fan_vm = crate::ui::fan::FanVM::from_entity(&entity);
-                                let raw_state = entity.state.as_ref();
-                                // Prefer percentage when present (numeric is
-                                // unambiguous); fall back to preset mode
-                                // string when only that is reported.
-                                let state = if let Some(pct) = fan_vm.speed_pct {
-                                    format!("{raw_state} {pct}%")
-                                } else if let Some(speed) = fan_vm.current_speed.as_deref() {
-                                    format!("{raw_state} {speed}")
-                                } else {
-                                    raw_state.to_owned()
-                                };
-                                TileVM::Entity(EntityTileVM {
-                                    name,
-                                    state,
-                                    icon_id,
-                                    preferred_columns,
-                                    preferred_rows,
-                                    placement,
-                                    pending: false,
-                                })
-                            }
-                            // TASK-104: lock entities flow through
-                            // `LockVM::from_entity` so the per-frame derived
-                            // `is_locked` boolean is available to the bridge.
-                            // Until `main_window.slint` grows a `lock-tiles`
-                            // array property (subsequent ticket), the lock
-                            // tile renders as the generic `EntityTileVM`
-                            // fallback — but the `state` string is forwarded
-                            // verbatim so the user sees "locked" / "unlocked"
-                            // / "jammed" / "unavailable" directly. The
-                            // `LockVM` itself is exposed via
-                            // `compute_lock_tile_vm` for the per-kind
-                            // rendering path that follows when
-                            // `main_window.slint` gains the array property.
-                            WidgetKind::Lock => {
-                                let _lock_vm = crate::ui::lock::LockVM::from_entity(&entity);
-                                TileVM::Entity(EntityTileVM {
-                                    name,
-                                    state,
-                                    icon_id,
-                                    preferred_columns,
-                                    preferred_rows,
-                                    placement,
-                                    pending: false,
-                                })
-                            }
-                            // TASK-105: alarm entities flow through
-                            // `AlarmVM::from_entity` so the per-frame derived
-                            // state (is_armed / is_triggered / is_pending) is
-                            // available to the bridge. Until `main_window.slint`
-                            // grows an `alarm-tiles` array property (subsequent
-                            // ticket), the alarm tile renders as the generic
-                            // `EntityTileVM` fallback — the canonical HA state
-                            // string is forwarded verbatim (`"disarmed"`,
-                            // `"armed_home"`, `"triggered"`, etc.). The
-                            // `AlarmVM` itself is exposed via
-                            // `compute_alarm_tile_vm` for the per-kind
-                            // rendering path that follows when
-                            // `main_window.slint` gains the array property.
-                            WidgetKind::Alarm => {
-                                let _alarm_vm = crate::ui::alarm::AlarmVM::from_entity(&entity);
-                                TileVM::Entity(EntityTileVM {
-                                    name,
-                                    state,
-                                    icon_id,
-                                    preferred_columns,
-                                    preferred_rows,
-                                    placement,
-                                    pending: false,
-                                })
-                            }
-                            // TASK-106: history entities flow through
-                            // `HistoryGraphVM::from_entity` so the per-frame
-                            // derived `is_available` boolean and the bridge-
-                            // supplied `change_count` are available downstream.
-                            // Until `main_window.slint` grows a `history-tiles`
-                            // array property (subsequent ticket), the history
-                            // tile renders as the generic `EntityTileVM`
-                            // fallback — the canonical HA state string is
-                            // forwarded verbatim. The `HistoryGraphVM` is
-                            // exposed via `compute_history_graph_tile_vm` for
-                            // the per-kind rendering path that follows when
-                            // `main_window.slint` gains the array property.
-                            //
-                            // `change_count == 0` here: no `HistoryWindow` has
-                            // been fetched yet at `build_tiles` time. The
-                            // bridge's history-fetch path (TASK-110+ wiring)
-                            // populates the per-widget window asynchronously
-                            // and pushes via the row-update path; the LTTB
-                            // downsampler and `HistoryThrottle` enforce the
-                            // 60s push budget per
+                            // task/phase6-window-wireup: each Phase 6 widget
+                            // kind now produces its own typed `TileVM` variant.
+                            // The Slint side renders a dedicated component per
+                            // kind (CoverTile / FanTile / LockTile /
+                            // AlarmPanelTile / HistoryGraphTile /
+                            // CameraSnapshotTile / ClimateTile / MediaPlayerTile
+                            // / PowerFlowTile); the bridge no longer falls back
+                            // to `EntityTileVM`. Each `compute_*_tile_vm` helper
+                            // already exists from TASK-094 / TASK-102..109 — we
+                            // just route through it here.
+                            WidgetKind::Cover => TileVM::Cover(compute_cover_tile_vm(
+                                name,
+                                icon_id,
+                                preferred_columns,
+                                preferred_rows,
+                                placement,
+                                &entity,
+                            )),
+                            WidgetKind::Fan => TileVM::Fan(compute_fan_tile_vm(
+                                name,
+                                icon_id,
+                                preferred_columns,
+                                preferred_rows,
+                                placement,
+                                &entity,
+                            )),
+                            WidgetKind::Lock => TileVM::Lock(compute_lock_tile_vm(
+                                name,
+                                icon_id,
+                                preferred_columns,
+                                preferred_rows,
+                                placement,
+                                &entity,
+                            )),
+                            WidgetKind::Alarm => TileVM::Alarm(compute_alarm_tile_vm(
+                                name,
+                                icon_id,
+                                preferred_columns,
+                                preferred_rows,
+                                placement,
+                                &entity,
+                            )),
+                            // History tiles arrive with `change_count == 0` /
+                            // `path_commands == ""` at build time; the
+                            // bridge's history-fetch path (TASK-110+) pushes
+                            // a richer `HistoryGraphTileVM` via row-update
+                            // once the LTTB downsampler has a window per
                             // `locked_decisions.history_render_path`.
-                            WidgetKind::History => {
-                                let _history_vm =
-                                    crate::ui::history_graph::HistoryGraphVM::from_entity(
-                                        &entity, 0,
-                                    );
-                                TileVM::Entity(EntityTileVM {
-                                    name,
-                                    state,
-                                    icon_id,
-                                    preferred_columns,
-                                    preferred_rows,
-                                    placement,
-                                    pending: false,
-                                })
-                            }
-                            // TASK-107: camera entities flow through
-                            // `CameraVM::from_entity` so the per-frame
-                            // derived `is_recording` / `is_streaming` /
-                            // `is_available` booleans are available
-                            // downstream. Until `main_window.slint` grows
-                            // a `camera-tiles` array property (subsequent
-                            // ticket), the camera tile renders as the
-                            // generic `EntityTileVM` fallback — the
-                            // canonical HA state string is forwarded
-                            // verbatim. The `CameraVM` is exposed via
-                            // `compute_camera_tile_vm` for the per-kind
-                            // rendering path that follows when
-                            // `main_window.slint` gains the array property.
-                            WidgetKind::Camera => {
-                                let _camera_vm = crate::ui::camera::CameraVM::from_entity(&entity);
-                                TileVM::Entity(EntityTileVM {
-                                    name,
-                                    state,
-                                    icon_id,
-                                    preferred_columns,
-                                    preferred_rows,
-                                    placement,
-                                    pending: false,
-                                })
-                            }
-                            // TASK-108: climate entities flow through
-                            // `ClimateVM::from_entity` so the per-frame
-                            // derived `is_active` boolean and the optional
-                            // `current_temperature` / `target_temperature`
-                            // reads are exercised on every state change.
-                            // Until `main_window.slint` grows a
-                            // `climate-tiles` array property (subsequent
-                            // ticket), the climate tile renders as the
-                            // generic `EntityTileVM` fallback — the
-                            // canonical HVAC-mode string (`"heat"`,
-                            // `"cool"`, `"auto"`, `"off"`, `"fan_only"`,
-                            // ...) is forwarded verbatim. The `ClimateVM`
-                            // is exposed via `compute_climate_tile_vm`
-                            // for the per-kind rendering path that
-                            // follows when `main_window.slint` gains the
-                            // array property.
-                            WidgetKind::Climate => {
-                                let _climate_vm =
-                                    crate::ui::climate::ClimateVM::from_entity(&entity);
-                                TileVM::Entity(EntityTileVM {
-                                    name,
-                                    state,
-                                    icon_id,
-                                    preferred_columns,
-                                    preferred_rows,
-                                    placement,
-                                    pending: false,
-                                })
-                            }
-                            // TASK-109: media-player entities flow through
-                            // `MediaPlayerVM::from_entity` so the per-frame
-                            // derived `is_playing` boolean and the optional
-                            // `media_title` / `artist` / `volume_level` reads
-                            // are exercised on every state change. Until
-                            // `main_window.slint` grows a `media-player-tiles`
-                            // array property (subsequent ticket), the
-                            // media-player tile renders as the generic
-                            // `EntityTileVM` fallback — the canonical HA
-                            // state string is forwarded verbatim. The
-                            // `MediaPlayerVM` is exposed via
-                            // `compute_media_player_tile_vm` for the
-                            // per-kind rendering path that follows when
-                            // `main_window.slint` gains the array property.
+                            WidgetKind::History => TileVM::History(compute_history_graph_tile_vm(
+                                name,
+                                icon_id,
+                                preferred_columns,
+                                preferred_rows,
+                                placement,
+                                &entity,
+                                None,
+                            )),
+                            WidgetKind::Camera => TileVM::Camera(compute_camera_tile_vm(
+                                name,
+                                icon_id,
+                                preferred_columns,
+                                preferred_rows,
+                                placement,
+                                &entity,
+                            )),
+                            WidgetKind::Climate => TileVM::Climate(compute_climate_tile_vm(
+                                name,
+                                icon_id,
+                                preferred_columns,
+                                preferred_rows,
+                                placement,
+                                &entity,
+                            )),
                             WidgetKind::MediaPlayer => {
-                                let _media_player_vm =
-                                    crate::ui::media_player::MediaPlayerVM::from_entity(&entity);
-                                TileVM::Entity(EntityTileVM {
+                                TileVM::MediaPlayer(compute_media_player_tile_vm(
                                     name,
-                                    state,
                                     icon_id,
                                     preferred_columns,
                                     preferred_rows,
                                     placement,
-                                    pending: false,
-                                })
+                                    &entity,
+                                ))
                             }
-                            // TASK-094: power-flow widgets thread through
-                            // `PowerFlowVM::read_power_watts` so the per-frame
-                            // numeric parse (handles the `unavailable` /
-                            // `unknown` sentinels and the integer-vs-float
-                            // shape variants) is exercised on every state
-                            // change. Until `main_window.slint` grows a
-                            // `power-flow-tiles` array property (subsequent
-                            // ticket), the power-flow widget renders as the
-                            // generic `EntityTileVM` fallback — the canonical
-                            // HA state string is forwarded verbatim. The
-                            // typed view-model is exposed via
-                            // `compute_power_flow_tile_vm` for the per-kind
-                            // rendering path that follows when
-                            // `main_window.slint` gains the array property.
+                            // Power-flow widgets bind multiple HA entities
+                            // through `WidgetOptions::PowerFlow`. The widget's
+                            // top-level `entity` field is unset; instead the
+                            // grid_entity / solar_entity / battery_entity /
+                            // battery_soc_entity / home_entity ids in
+                            // `widget.options` drive five separate store reads.
+                            //
+                            // This branch is only reachable when the wrapper
+                            // widget itself has a non-empty `entity` field —
+                            // an unusual config (since the schema treats
+                            // PowerFlow as multi-entity). For the canonical
+                            // shape (`entity: None`) `store.get` returns
+                            // `None` and the missing-entity arm below
+                            // dispatches to `compute_power_flow_tile_vm` with
+                            // store-resolved auxiliaries. Here we still build
+                            // a `PowerFlowTileVM` so the row layout matches
+                            // the `RowIndex` for any future config that DOES
+                            // bind a primary entity. Auxiliary readings are
+                            // resolved via the live store reference.
                             WidgetKind::PowerFlow => {
-                                let _grid_w =
-                                    crate::ui::power_flow::PowerFlowVM::read_power_watts(&entity);
-                                TileVM::Entity(EntityTileVM {
-                                    name,
-                                    state,
-                                    icon_id,
-                                    preferred_columns,
-                                    preferred_rows,
-                                    placement,
-                                    pending: false,
-                                })
+                                TileVM::PowerFlow(compute_power_flow_tile_vm_from_widget(
+                                    PowerFlowBuildArgs {
+                                        name,
+                                        icon_id,
+                                        preferred_columns,
+                                        preferred_rows,
+                                        placement,
+                                        wrapper_entity: Some(&entity),
+                                        options: widget.options.as_ref(),
+                                    },
+                                    store,
+                                ))
                             }
                             WidgetKind::EntityTile => TileVM::Entity(EntityTileVM {
                                 name,
@@ -1271,6 +1220,18 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                             .clone()
                             .unwrap_or_else(|| "mdi:help-circle".to_string());
 
+                        // task/phase6-window-wireup: emit a placeholder VM
+                        // of the matching `TileKind` so the row layout stays
+                        // stable across availability transitions (TASK-119
+                        // F2 row-stability invariant). Each per-kind VM is
+                        // constructed with `state = "unavailable"` and the
+                        // available booleans cleared so the Slint side
+                        // renders the unavailable visual variant for that
+                        // kind. PowerFlow is special: its canonical YAML
+                        // shape has `entity: None`, so this arm is the
+                        // ONLY path that produces a `TileVM::PowerFlow` for
+                        // the standard config — auxiliaries are still
+                        // resolved against the live store.
                         match widget.widget_type {
                             WidgetKind::LightTile => TileVM::Light(LightTileVM {
                                 name,
@@ -1290,16 +1251,7 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                                 placement,
                                 pending: false,
                             }),
-                            WidgetKind::EntityTile
-                            | WidgetKind::Camera
-                            | WidgetKind::History
-                            | WidgetKind::Fan
-                            | WidgetKind::Lock
-                            | WidgetKind::Alarm
-                            | WidgetKind::Cover
-                            | WidgetKind::MediaPlayer
-                            | WidgetKind::Climate
-                            | WidgetKind::PowerFlow => TileVM::Entity(EntityTileVM {
+                            WidgetKind::EntityTile => TileVM::Entity(EntityTileVM {
                                 name,
                                 state,
                                 icon_id,
@@ -1308,6 +1260,120 @@ pub fn build_tiles(store: &dyn EntityStore, dashboard: &Dashboard) -> Vec<TileVM
                                 placement,
                                 pending: false,
                             }),
+                            WidgetKind::Cover => TileVM::Cover(CoverTileVM {
+                                name,
+                                state,
+                                position: 0,
+                                tilt: 0,
+                                has_position: false,
+                                has_tilt: false,
+                                is_open: false,
+                                is_moving: false,
+                                icon_id,
+                                preferred_columns,
+                                preferred_rows,
+                                placement,
+                                pending: false,
+                            }),
+                            WidgetKind::Fan => TileVM::Fan(FanTileVM {
+                                name,
+                                state,
+                                speed_pct: 0,
+                                has_speed_pct: false,
+                                is_on: false,
+                                current_speed: String::new(),
+                                has_current_speed: false,
+                                icon_id,
+                                preferred_columns,
+                                preferred_rows,
+                                placement,
+                                pending: false,
+                            }),
+                            WidgetKind::Lock => TileVM::Lock(LockTileVM {
+                                name,
+                                state,
+                                is_locked: false,
+                                icon_id,
+                                preferred_columns,
+                                preferred_rows,
+                                placement,
+                                pending: false,
+                            }),
+                            WidgetKind::Alarm => TileVM::Alarm(AlarmTileVM {
+                                name,
+                                state,
+                                is_armed: false,
+                                is_triggered: false,
+                                is_pending: false,
+                                icon_id,
+                                preferred_columns,
+                                preferred_rows,
+                                placement,
+                                pending: false,
+                            }),
+                            WidgetKind::History => TileVM::History(HistoryGraphTileVM {
+                                name,
+                                state,
+                                change_count: 0,
+                                is_available: false,
+                                icon_id,
+                                preferred_columns,
+                                preferred_rows,
+                                placement,
+                                pending: false,
+                                path_commands: String::new(),
+                            }),
+                            WidgetKind::Camera => TileVM::Camera(CameraTileVM {
+                                name,
+                                state,
+                                is_recording: false,
+                                is_streaming: false,
+                                is_available: false,
+                                icon_id,
+                                preferred_columns,
+                                preferred_rows,
+                                placement,
+                                pending: false,
+                            }),
+                            WidgetKind::Climate => TileVM::Climate(ClimateTileVM {
+                                name,
+                                state,
+                                is_active: false,
+                                current_temperature: None,
+                                target_temperature: None,
+                                icon_id,
+                                preferred_columns,
+                                preferred_rows,
+                                placement,
+                                pending: false,
+                            }),
+                            WidgetKind::MediaPlayer => TileVM::MediaPlayer(MediaPlayerTileVM {
+                                name,
+                                state,
+                                is_playing: false,
+                                media_title: None,
+                                artist: None,
+                                volume_level: None,
+                                icon_id,
+                                preferred_columns,
+                                preferred_rows,
+                                placement,
+                                pending: false,
+                            }),
+                            WidgetKind::PowerFlow => {
+                                TileVM::PowerFlow(compute_power_flow_tile_vm_from_widget(
+                                    PowerFlowBuildArgs {
+                                        name,
+                                        icon_id,
+                                        preferred_columns,
+                                        preferred_rows,
+                                        placement,
+                                        wrapper_entity: None,
+                                        options: widget.options.as_ref(),
+                                    },
+                                    store,
+                                ))
+                            }
                         }
                     }
                 };
@@ -1396,7 +1462,127 @@ impl std::error::Error for WireError {}
 // VM split + conversion
 // ---------------------------------------------------------------------------
 
-/// Split a flat `&[TileVM]` slice into three per-variant `Vec`s of the
+/// Per-kind Slint-typed VM vectors produced by [`split_tile_vms`], ready to
+/// be wrapped in `ModelRc`s by [`wire_window`].
+///
+/// Pre-`task/phase6-window-wireup` `split_tile_vms` returned a 3-tuple. The
+/// Phase 6 wire-up grew that to twelve per-kind vectors (one per
+/// [`TileKind`]); using a struct keeps the return ergonomic and keeps the
+/// caller's destructuring readable.
+pub struct SplitTileVms {
+    pub lights: Vec<slint_ui::LightTileVM>,
+    pub sensors: Vec<slint_ui::SensorTileVM>,
+    pub entities: Vec<slint_ui::EntityTileVM>,
+    pub covers: Vec<slint_ui::CoverTileVM>,
+    pub fans: Vec<slint_ui::FanTileVM>,
+    pub locks: Vec<slint_ui::LockTileVM>,
+    pub alarms: Vec<slint_ui::AlarmTileVM>,
+    pub histories: Vec<slint_ui::HistoryGraphTileVM>,
+    pub cameras: Vec<slint_ui::CameraTileVM>,
+    pub climates: Vec<slint_ui::ClimateTileVM>,
+    pub media_players: Vec<slint_ui::MediaPlayerTileVM>,
+    pub power_flows: Vec<slint_ui::PowerFlowTileVM>,
+}
+
+/// Format a power-watts value with one decimal place and a `W` suffix.
+///
+/// Matches the formatter used by the more-info modal
+/// (`crate::ui::power_flow::format_watts`); duplicated here because that
+/// helper is private. Negative values render with a leading minus (the
+/// export / discharge convention).
+fn power_format_watts(w: f32) -> String {
+    format!("{w:.1} W")
+}
+
+/// Magnitude threshold (watts) below which a power-flow lane is treated as
+/// idle. Matches the `min_flow_w` constant referenced by the Slint
+/// `PowerFlowTile` lane visuals; pulled out here so the bridge derives
+/// `*_idle` booleans server-side rather than asking Slint to compare floats
+/// per frame.
+const POWER_FLOW_MIN_FLOW_W: f32 = 1.0;
+
+/// Build a Slint-typed `PowerFlowTileVM` from a Rust-typed [`PowerFlowTileVM`].
+///
+/// The Slint VM carries every field the lane visuals read on every frame —
+/// pre-formatted labels, derived `*_idle` and direction flags, and an
+/// `is_available` boolean — so the Slint side never branches on `Option`s.
+/// Composition runs once per state change (NOT per frame); `format!`
+/// allocations are bounded by lane count (≤ 4).
+fn slint_power_flow_tile_vm(vm: &PowerFlowTileVM) -> slint_ui::PowerFlowTileVM {
+    let grid_w = vm.grid_w.unwrap_or(0.0);
+    let grid_idle = vm
+        .grid_w
+        .map(|w| w.abs() < POWER_FLOW_MIN_FLOW_W)
+        .unwrap_or(true);
+    let grid_importing = vm.grid_w.map(|w| w > 0.0).unwrap_or(false);
+
+    let has_solar = vm.solar_w.is_some();
+    let solar_w = vm.solar_w.unwrap_or(0.0);
+    let solar_idle = vm
+        .solar_w
+        .map(|w| w.abs() < POWER_FLOW_MIN_FLOW_W)
+        .unwrap_or(true);
+
+    let has_battery = vm.battery_w.is_some();
+    let battery_w = vm.battery_w.unwrap_or(0.0);
+    let battery_idle = vm
+        .battery_w
+        .map(|w| w.abs() < POWER_FLOW_MIN_FLOW_W)
+        .unwrap_or(true);
+    let battery_charging = vm.battery_w.map(|w| w > 0.0).unwrap_or(false);
+
+    let has_battery_pct = vm.battery_pct.is_some();
+    let battery_pct = vm.battery_pct.unwrap_or(0.0);
+
+    let has_home = vm.home_w.is_some();
+    let home_w = vm.home_w.unwrap_or(0.0);
+    let home_idle = vm
+        .home_w
+        .map(|w| w.abs() < POWER_FLOW_MIN_FLOW_W)
+        .unwrap_or(true);
+
+    // The grid entity is the primary entity; "available" means we got a
+    // numeric reading. When `vm.grid_w` is `None`, the upstream entity is
+    // unavailable / unknown and the tile renders the unavailable variant.
+    let is_available = vm.grid_w.is_some();
+
+    slint_ui::PowerFlowTileVM {
+        name: SharedString::from(vm.name.as_str()),
+        grid_w,
+        grid_label: SharedString::from(power_format_watts(grid_w).as_str()),
+        grid_importing,
+        grid_idle,
+        has_solar,
+        solar_w,
+        solar_label: SharedString::from(power_format_watts(solar_w).as_str()),
+        solar_idle,
+        has_battery,
+        battery_w,
+        battery_label: SharedString::from(power_format_watts(battery_w).as_str()),
+        battery_charging,
+        battery_idle,
+        has_battery_pct,
+        battery_pct,
+        has_home,
+        home_w,
+        home_label: SharedString::from(power_format_watts(home_w).as_str()),
+        home_idle,
+        is_available,
+        r#icon_id: SharedString::from(vm.icon_id.as_str()),
+        icon: icons::resolve(&vm.icon_id),
+        preferred_columns: vm.preferred_columns,
+        preferred_rows: vm.preferred_rows,
+        placement: slint_ui::PowerFlowTilePlacement {
+            col: vm.placement.col,
+            row: vm.placement.row,
+            span_cols: vm.placement.span_cols,
+            span_rows: vm.placement.span_rows,
+        },
+        pending: vm.pending,
+    }
+}
+
+/// Split a flat `&[TileVM]` slice into per-variant `Vec`s of the
 /// Slint-generated VM structs, ready to be wrapped in `ModelRc`s and written
 /// to `MainWindow` properties.
 ///
@@ -1414,20 +1600,25 @@ impl std::error::Error for WireError {}
 /// Panics if [`crate::assets::icons::init`] has not been called first, because
 /// [`icons::resolve`] panics on an unset `OnceLock`. Production callers wire
 /// `icons::init()` at startup (TASK-016 / `main.rs`); tests call it explicitly.
-pub fn split_tile_vms(
-    tiles: &[TileVM],
-) -> (
-    Vec<slint_ui::LightTileVM>,
-    Vec<slint_ui::SensorTileVM>,
-    Vec<slint_ui::EntityTileVM>,
-) {
-    let mut lights = Vec::new();
-    let mut sensors = Vec::new();
-    let mut entities = Vec::new();
+pub fn split_tile_vms(tiles: &[TileVM]) -> SplitTileVms {
+    let mut out = SplitTileVms {
+        lights: Vec::new(),
+        sensors: Vec::new(),
+        entities: Vec::new(),
+        covers: Vec::new(),
+        fans: Vec::new(),
+        locks: Vec::new(),
+        alarms: Vec::new(),
+        histories: Vec::new(),
+        cameras: Vec::new(),
+        climates: Vec::new(),
+        media_players: Vec::new(),
+        power_flows: Vec::new(),
+    };
 
     for tile in tiles {
         match tile {
-            TileVM::Light(vm) => lights.push(slint_ui::LightTileVM {
+            TileVM::Light(vm) => out.lights.push(slint_ui::LightTileVM {
                 name: SharedString::from(vm.name.as_str()),
                 state: SharedString::from(vm.state.as_str()),
                 r#icon_id: SharedString::from(vm.icon_id.as_str()),
@@ -1446,7 +1637,7 @@ pub fn split_tile_vms(
                 // a refresh.
                 pending: vm.pending,
             }),
-            TileVM::Sensor(vm) => sensors.push(slint_ui::SensorTileVM {
+            TileVM::Sensor(vm) => out.sensors.push(slint_ui::SensorTileVM {
                 name: SharedString::from(vm.name.as_str()),
                 state: SharedString::from(vm.state.as_str()),
                 r#icon_id: SharedString::from(vm.icon_id.as_str()),
@@ -1461,7 +1652,7 @@ pub fn split_tile_vms(
                 },
                 pending: vm.pending,
             }),
-            TileVM::Entity(vm) => entities.push(slint_ui::EntityTileVM {
+            TileVM::Entity(vm) => out.entities.push(slint_ui::EntityTileVM {
                 name: SharedString::from(vm.name.as_str()),
                 state: SharedString::from(vm.state.as_str()),
                 r#icon_id: SharedString::from(vm.icon_id.as_str()),
@@ -1476,10 +1667,164 @@ pub fn split_tile_vms(
                 },
                 pending: vm.pending,
             }),
+            TileVM::Cover(vm) => out.covers.push(slint_ui::CoverTileVM {
+                name: SharedString::from(vm.name.as_str()),
+                state: SharedString::from(vm.state.as_str()),
+                position: vm.position,
+                tilt: vm.tilt,
+                r#has_position: vm.has_position,
+                r#has_tilt: vm.has_tilt,
+                r#is_open: vm.is_open,
+                r#is_moving: vm.is_moving,
+                r#icon_id: SharedString::from(vm.icon_id.as_str()),
+                icon: icons::resolve(&vm.icon_id),
+                preferred_columns: vm.preferred_columns,
+                preferred_rows: vm.preferred_rows,
+                placement: slint_ui::CoverTilePlacement {
+                    col: vm.placement.col,
+                    row: vm.placement.row,
+                    span_cols: vm.placement.span_cols,
+                    span_rows: vm.placement.span_rows,
+                },
+                pending: vm.pending,
+            }),
+            TileVM::Fan(vm) => out.fans.push(slint_ui::FanTileVM {
+                name: SharedString::from(vm.name.as_str()),
+                state: SharedString::from(vm.state.as_str()),
+                r#speed_pct: vm.speed_pct,
+                r#has_speed_pct: vm.has_speed_pct,
+                r#is_on: vm.is_on,
+                r#current_speed: SharedString::from(vm.current_speed.as_str()),
+                r#has_current_speed: vm.has_current_speed,
+                r#icon_id: SharedString::from(vm.icon_id.as_str()),
+                icon: icons::resolve(&vm.icon_id),
+                preferred_columns: vm.preferred_columns,
+                preferred_rows: vm.preferred_rows,
+                placement: slint_ui::FanTilePlacement {
+                    col: vm.placement.col,
+                    row: vm.placement.row,
+                    span_cols: vm.placement.span_cols,
+                    span_rows: vm.placement.span_rows,
+                },
+                pending: vm.pending,
+            }),
+            TileVM::Lock(vm) => out.locks.push(slint_ui::LockTileVM {
+                name: SharedString::from(vm.name.as_str()),
+                state: SharedString::from(vm.state.as_str()),
+                r#is_locked: vm.is_locked,
+                r#icon_id: SharedString::from(vm.icon_id.as_str()),
+                icon: icons::resolve(&vm.icon_id),
+                preferred_columns: vm.preferred_columns,
+                preferred_rows: vm.preferred_rows,
+                placement: slint_ui::LockTilePlacement {
+                    col: vm.placement.col,
+                    row: vm.placement.row,
+                    span_cols: vm.placement.span_cols,
+                    span_rows: vm.placement.span_rows,
+                },
+                pending: vm.pending,
+            }),
+            TileVM::Alarm(vm) => out.alarms.push(slint_ui::AlarmTileVM {
+                name: SharedString::from(vm.name.as_str()),
+                state: SharedString::from(vm.state.as_str()),
+                r#is_armed: vm.is_armed,
+                r#is_triggered: vm.is_triggered,
+                r#is_pending: vm.is_pending,
+                r#icon_id: SharedString::from(vm.icon_id.as_str()),
+                icon: icons::resolve(&vm.icon_id),
+                preferred_columns: vm.preferred_columns,
+                preferred_rows: vm.preferred_rows,
+                placement: slint_ui::AlarmTilePlacement {
+                    col: vm.placement.col,
+                    row: vm.placement.row,
+                    span_cols: vm.placement.span_cols,
+                    span_rows: vm.placement.span_rows,
+                },
+                pending: vm.pending,
+            }),
+            TileVM::History(vm) => out.histories.push(slint_ui::HistoryGraphTileVM {
+                name: SharedString::from(vm.name.as_str()),
+                state: SharedString::from(vm.state.as_str()),
+                r#change_count: vm.change_count,
+                r#is_available: vm.is_available,
+                r#icon_id: SharedString::from(vm.icon_id.as_str()),
+                icon: icons::resolve(&vm.icon_id),
+                preferred_columns: vm.preferred_columns,
+                preferred_rows: vm.preferred_rows,
+                placement: slint_ui::HistoryGraphTilePlacement {
+                    col: vm.placement.col,
+                    row: vm.placement.row,
+                    span_cols: vm.placement.span_cols,
+                    span_rows: vm.placement.span_rows,
+                },
+                pending: vm.pending,
+                r#path_commands: SharedString::from(vm.path_commands.as_str()),
+            }),
+            TileVM::Camera(vm) => out.cameras.push(slint_ui::CameraTileVM {
+                name: SharedString::from(vm.name.as_str()),
+                state: SharedString::from(vm.state.as_str()),
+                r#is_recording: vm.is_recording,
+                r#is_streaming: vm.is_streaming,
+                r#is_available: vm.is_available,
+                r#icon_id: SharedString::from(vm.icon_id.as_str()),
+                icon: icons::resolve(&vm.icon_id),
+                preferred_columns: vm.preferred_columns,
+                preferred_rows: vm.preferred_rows,
+                placement: slint_ui::CameraTilePlacement {
+                    col: vm.placement.col,
+                    row: vm.placement.row,
+                    span_cols: vm.placement.span_cols,
+                    span_rows: vm.placement.span_rows,
+                },
+                pending: vm.pending,
+            }),
+            TileVM::Climate(vm) => out.climates.push(slint_ui::ClimateTileVM {
+                name: SharedString::from(vm.name.as_str()),
+                state: SharedString::from(vm.state.as_str()),
+                r#is_active: vm.is_active,
+                r#current_temperature: vm.current_temperature.unwrap_or(0.0),
+                r#has_current_temperature: vm.current_temperature.is_some(),
+                r#target_temperature: vm.target_temperature.unwrap_or(0.0),
+                r#has_target_temperature: vm.target_temperature.is_some(),
+                r#icon_id: SharedString::from(vm.icon_id.as_str()),
+                icon: icons::resolve(&vm.icon_id),
+                preferred_columns: vm.preferred_columns,
+                preferred_rows: vm.preferred_rows,
+                placement: slint_ui::ClimateTilePlacement {
+                    col: vm.placement.col,
+                    row: vm.placement.row,
+                    span_cols: vm.placement.span_cols,
+                    span_rows: vm.placement.span_rows,
+                },
+                pending: vm.pending,
+            }),
+            TileVM::MediaPlayer(vm) => out.media_players.push(slint_ui::MediaPlayerTileVM {
+                name: SharedString::from(vm.name.as_str()),
+                state: SharedString::from(vm.state.as_str()),
+                r#is_playing: vm.is_playing,
+                r#media_title: SharedString::from(vm.media_title.as_deref().unwrap_or("")),
+                r#has_media_title: vm.media_title.is_some(),
+                artist: SharedString::from(vm.artist.as_deref().unwrap_or("")),
+                r#has_artist: vm.artist.is_some(),
+                r#volume_level: vm.volume_level.unwrap_or(0.0),
+                r#has_volume_level: vm.volume_level.is_some(),
+                r#icon_id: SharedString::from(vm.icon_id.as_str()),
+                icon: icons::resolve(&vm.icon_id),
+                preferred_columns: vm.preferred_columns,
+                preferred_rows: vm.preferred_rows,
+                placement: slint_ui::MediaPlayerTilePlacement {
+                    col: vm.placement.col,
+                    row: vm.placement.row,
+                    span_cols: vm.placement.span_cols,
+                    span_rows: vm.placement.span_rows,
+                },
+                pending: vm.pending,
+            }),
+            TileVM::PowerFlow(vm) => out.power_flows.push(slint_power_flow_tile_vm(vm)),
         }
     }
 
-    (lights, sensors, entities)
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1526,17 +1871,26 @@ pub fn wire_window(
     tiles: &[TileVM],
     profile: &'static DeviceProfile,
 ) -> Result<(), WireError> {
-    let (lights, sensors, entities) = split_tile_vms(tiles);
+    let split = split_tile_vms(tiles);
 
     // Wrap each Vec in a VecModel and pass via ModelRc to the Slint property.
     // Slint clones the ModelRc internally (Arc bump); no per-element copy.
-    let light_model: ModelRc<slint_ui::LightTileVM> = ModelRc::new(VecModel::from(lights));
-    let sensor_model: ModelRc<slint_ui::SensorTileVM> = ModelRc::new(VecModel::from(sensors));
-    let entity_model: ModelRc<slint_ui::EntityTileVM> = ModelRc::new(VecModel::from(entities));
-
-    window.set_light_tiles(light_model);
-    window.set_sensor_tiles(sensor_model);
-    window.set_entity_tiles(entity_model);
+    window.set_light_tiles(ModelRc::new(VecModel::from(split.lights)));
+    window.set_sensor_tiles(ModelRc::new(VecModel::from(split.sensors)));
+    window.set_entity_tiles(ModelRc::new(VecModel::from(split.entities)));
+    // Phase 6 per-kind property writes — same `ModelRc<VecModel<...>>`
+    // pattern as the three Phase 1 kinds. Each model is installed exactly
+    // once per refresh cycle; per-frame reads inside Slint see only Arc
+    // bumps for the model handle and shared pixel buffers for icons.
+    window.set_cover_tiles(ModelRc::new(VecModel::from(split.covers)));
+    window.set_fan_tiles(ModelRc::new(VecModel::from(split.fans)));
+    window.set_lock_tiles(ModelRc::new(VecModel::from(split.locks)));
+    window.set_alarm_tiles(ModelRc::new(VecModel::from(split.alarms)));
+    window.set_history_tiles(ModelRc::new(VecModel::from(split.histories)));
+    window.set_camera_tiles(ModelRc::new(VecModel::from(split.cameras)));
+    window.set_climate_tiles(ModelRc::new(VecModel::from(split.climates)));
+    window.set_media_player_tiles(ModelRc::new(VecModel::from(split.media_players)));
+    window.set_power_flow_tiles(ModelRc::new(VecModel::from(split.power_flows)));
 
     // AnimationBudget globals — wired once at startup from the active
     // DeviceProfile (TASK-120b F4).
@@ -3500,6 +3854,143 @@ pub fn compute_power_flow_tile_vm(
     }
 }
 
+/// Static (config-derived) parameters for a power-flow tile build, bundled
+/// to keep [`compute_power_flow_tile_vm_from_widget`]'s signature within
+/// the clippy `too_many_arguments` cap (7).
+pub struct PowerFlowBuildArgs<'a> {
+    pub name: String,
+    pub icon_id: String,
+    pub preferred_columns: i32,
+    pub preferred_rows: i32,
+    pub placement: TilePlacement,
+    pub wrapper_entity: Option<&'a crate::ha::entity::Entity>,
+    pub options: Option<&'a WidgetOptions>,
+}
+
+/// Build a [`PowerFlowTileVM`] from a widget config + live store.
+///
+/// Power-flow widgets bind multiple HA entities through
+/// [`WidgetOptions::PowerFlow`]; the canonical YAML shape sets `entity: None`
+/// on the wrapper widget itself and lists the `grid_entity` /
+/// `solar_entity` / `battery_entity` / `battery_soc_entity` /
+/// `home_entity` ids inside `widget.options`. This helper resolves all
+/// five from the supplied store and forwards them through
+/// [`compute_power_flow_tile_vm`].
+///
+/// `args.wrapper_entity` is the entity matching `widget.entity` (when set) —
+/// it is ignored if a `WidgetOptions::PowerFlow` payload is present (the
+/// payload's `grid_entity` is the canonical primary). When neither is
+/// usable the returned VM has `grid_w = None`, which the Slint side
+/// renders as the unavailable variant (`is-available == false`).
+///
+/// `task/phase6-window-wireup` introduces this helper so `build_tiles` can
+/// produce a `TileVM::PowerFlow` variant in both the entity-present and
+/// entity-missing arms without duplicating the auxiliary-resolution logic.
+#[must_use]
+fn compute_power_flow_tile_vm_from_widget(
+    args: PowerFlowBuildArgs<'_>,
+    store: &dyn EntityStore,
+) -> PowerFlowTileVM {
+    let PowerFlowBuildArgs {
+        name,
+        icon_id,
+        preferred_columns,
+        preferred_rows,
+        placement,
+        wrapper_entity,
+        options,
+    } = args;
+    // Resolve the grid entity preferentially from `WidgetOptions::PowerFlow.grid_entity`;
+    // fall back to the wrapper widget's own entity binding for callers that
+    // chose the alternate (single-entity) wiring shape.
+    let pf_options = options.and_then(|o| match o {
+        WidgetOptions::PowerFlow {
+            grid_entity,
+            solar_entity,
+            battery_entity,
+            battery_soc_entity,
+            home_entity,
+        } => Some((
+            grid_entity.as_str(),
+            solar_entity.as_deref(),
+            battery_entity.as_deref(),
+            battery_soc_entity.as_deref(),
+            home_entity.as_deref(),
+        )),
+        _ => None,
+    });
+
+    let read_w = |id: &str| -> Option<f32> {
+        let e = store.get(&EntityId::from(id))?;
+        crate::ui::power_flow::PowerFlowVM::read_power_watts(&e)
+    };
+    let read_pct = |id: &str| -> Option<f32> {
+        let e = store.get(&EntityId::from(id))?;
+        crate::ui::power_flow::PowerFlowVM::read_battery_pct(&e)
+    };
+
+    if let Some((grid_id, solar_id, battery_id, soc_id, home_id)) = pf_options {
+        let grid_entity_lookup = store.get(&EntityId::from(grid_id));
+        let auxiliary = PowerFlowAuxiliaryReadings {
+            solar_w: solar_id.and_then(read_w),
+            battery_w: battery_id.and_then(read_w),
+            battery_pct: soc_id.and_then(read_pct),
+            home_w: home_id.and_then(read_w),
+        };
+        match grid_entity_lookup {
+            Some(grid) => compute_power_flow_tile_vm(
+                name,
+                icon_id,
+                preferred_columns,
+                preferred_rows,
+                placement,
+                &grid,
+                auxiliary,
+            ),
+            None => PowerFlowTileVM {
+                name,
+                grid_w: None,
+                solar_w: auxiliary.solar_w,
+                battery_w: auxiliary.battery_w,
+                battery_pct: auxiliary.battery_pct,
+                home_w: auxiliary.home_w,
+                icon_id,
+                preferred_columns,
+                preferred_rows,
+                placement,
+                pending: false,
+            },
+        }
+    } else if let Some(grid) = wrapper_entity {
+        compute_power_flow_tile_vm(
+            name,
+            icon_id,
+            preferred_columns,
+            preferred_rows,
+            placement,
+            grid,
+            PowerFlowAuxiliaryReadings::default(),
+        )
+    } else {
+        // Neither options nor wrapper entity supplied: defensive fallback.
+        // Slint's `is-available` will be `false` (grid_w == None), driving
+        // the unavailable visual variant.
+        PowerFlowTileVM {
+            name,
+            grid_w: None,
+            solar_w: None,
+            battery_w: None,
+            battery_pct: None,
+            home_w: None,
+            icon_id,
+            preferred_columns,
+            preferred_rows,
+            placement,
+            pending: false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PinEntryHost bridge implementation (TASK-100)
 // ---------------------------------------------------------------------------
@@ -4348,11 +4839,11 @@ mod tests {
             make_light_tile("Bedroom", "off", "mdi:lightbulb"),
         ];
 
-        let (lights, sensors, entities) = split_tile_vms(&tiles);
+        let split = split_tile_vms(&tiles);
 
-        assert_eq!(lights.len(), 2, "two LightTileVMs expected");
-        assert_eq!(sensors.len(), 1, "one SensorTileVM expected");
-        assert_eq!(entities.len(), 1, "one EntityTileVM expected");
+        assert_eq!(split.lights.len(), 2, "two LightTileVMs expected");
+        assert_eq!(split.sensors.len(), 1, "one SensorTileVM expected");
+        assert_eq!(split.entities.len(), 1, "one EntityTileVM expected");
     }
 
     #[test]
@@ -4360,7 +4851,8 @@ mod tests {
         ensure_icons_init();
 
         let tiles = vec![make_light_tile("Kitchen", "on", "mdi:lightbulb")];
-        let (lights, _, _) = split_tile_vms(&tiles);
+        let split = split_tile_vms(&tiles);
+        let lights = &split.lights;
 
         assert_eq!(lights[0].name.as_str(), "Kitchen");
         assert_eq!(lights[0].state.as_str(), "on");
@@ -4382,7 +4874,9 @@ mod tests {
             make_sensor_tile("Hallway", "21.3", "mdi:thermometer"),
         ];
 
-        let (lights, sensors, _) = split_tile_vms(&tiles);
+        let split = split_tile_vms(&tiles);
+        let lights = &split.lights;
+        let sensors = &split.sensors;
 
         let lb_pixels = lights[0]
             .icon
@@ -4405,7 +4899,8 @@ mod tests {
         ensure_icons_init();
 
         let tiles = vec![make_light_tile("Mystery", "on", "mdi:nonexistent")];
-        let (lights, _, _) = split_tile_vms(&tiles);
+        let split = split_tile_vms(&tiles);
+        let lights = &split.lights;
 
         // The fallback path is exercised: the icon must equal the help-circle
         // pixel data even though the id is unrecognised.
@@ -4434,12 +4929,14 @@ mod tests {
         ensure_icons_init();
 
         let tiles_before = vec![make_light_tile("Kitchen", "on", "mdi:lightbulb")];
-        let (lights_before, _, _) = split_tile_vms(&tiles_before);
+        let split_before = split_tile_vms(&tiles_before);
+        let lights_before = &split_before.lights;
         assert_eq!(lights_before[0].state.as_str(), "on");
 
         // Mutate the synthesized fixture: simulate the entity flipping to off.
         let tiles_after = vec![make_light_tile("Kitchen", "off", "mdi:lightbulb")];
-        let (lights_after, _, _) = split_tile_vms(&tiles_after);
+        let split_after = split_tile_vms(&tiles_after);
+        let lights_after = &split_after.lights;
         assert_eq!(lights_after[0].state.as_str(), "off");
 
         // Same name, same icon, but state must have flipped — exactly the
@@ -4460,13 +4957,611 @@ mod tests {
             make_sensor_tile("S2", "20", "mdi:thermometer"),
         ];
 
-        let (lights, sensors, _) = split_tile_vms(&tiles);
+        let split = split_tile_vms(&tiles);
+        let lights = &split.lights;
+        let sensors = &split.sensors;
 
         // Per-variant order must match document order within that variant.
         assert_eq!(lights[0].name.as_str(), "L1");
         assert_eq!(lights[1].name.as_str(), "L2");
         assert_eq!(sensors[0].name.as_str(), "S1");
         assert_eq!(sensors[1].name.as_str(), "S2");
+    }
+
+    // -----------------------------------------------------------------------
+    // split_tile_vms — Phase 6 per-kind dispatch arms
+    //
+    // Each Phase 6 variant carries kind-specific scalar fields that the
+    // Slint per-kind tile component reads directly. The arms below build a
+    // small slice containing one tile of each kind and assert both the
+    // partitioning (per-variant Vec lengths) and that each kind's
+    // distinguishing field round-trips into the Slint-typed output struct
+    // verbatim. A regression that drops or reorders an arm fails here.
+    // -----------------------------------------------------------------------
+
+    /// `split_tile_vms` emits one entry per Phase 6 kind into the matching
+    /// per-kind Vec when the input slice carries one tile of each kind.
+    /// Each kind's distinguishing field (`is_open`, `is_on`, `is_locked`,
+    /// `is_armed`, `is_available`, `is_recording`, `is_active`,
+    /// `is_playing`) round-trips into the Slint-typed output unchanged.
+    #[test]
+    fn split_tile_vms_phase6_kinds_route_to_per_kind_vecs() {
+        ensure_icons_init();
+
+        let placement = TilePlacement::default_for(2, 2);
+        let tiles = vec![
+            TileVM::Cover(CoverTileVM {
+                name: "Patio".into(),
+                state: "open".into(),
+                position: 42,
+                tilt: 0,
+                has_position: true,
+                has_tilt: false,
+                is_open: true,
+                is_moving: false,
+                icon_id: "mdi:window-shutter-open".into(),
+                preferred_columns: 2,
+                preferred_rows: 2,
+                placement: placement.clone(),
+                pending: false,
+            }),
+            TileVM::Fan(FanTileVM {
+                name: "Bedroom Fan".into(),
+                state: "on".into(),
+                speed_pct: 75,
+                has_speed_pct: true,
+                is_on: true,
+                current_speed: "high".into(),
+                has_current_speed: true,
+                icon_id: "mdi:fan".into(),
+                preferred_columns: 2,
+                preferred_rows: 2,
+                placement: placement.clone(),
+                pending: false,
+            }),
+            TileVM::Lock(LockTileVM {
+                name: "Front Door".into(),
+                state: "locked".into(),
+                is_locked: true,
+                icon_id: "mdi:lock".into(),
+                preferred_columns: 2,
+                preferred_rows: 2,
+                placement: placement.clone(),
+                pending: false,
+            }),
+            TileVM::Alarm(AlarmTileVM {
+                name: "Home Alarm".into(),
+                state: "armed_away".into(),
+                is_armed: true,
+                is_triggered: false,
+                is_pending: false,
+                icon_id: "mdi:shield-home".into(),
+                preferred_columns: 2,
+                preferred_rows: 2,
+                placement: placement.clone(),
+                pending: false,
+            }),
+            TileVM::History(HistoryGraphTileVM {
+                name: "Energy Today".into(),
+                state: "12.4".into(),
+                change_count: 7,
+                is_available: true,
+                icon_id: "mdi:chart-line".into(),
+                preferred_columns: 2,
+                preferred_rows: 2,
+                placement: placement.clone(),
+                pending: false,
+                path_commands: "M 0 0 L 1 1".into(),
+            }),
+            TileVM::Camera(CameraTileVM {
+                name: "Front Door".into(),
+                state: "recording".into(),
+                is_recording: true,
+                is_streaming: false,
+                is_available: true,
+                icon_id: "mdi:cctv".into(),
+                preferred_columns: 2,
+                preferred_rows: 2,
+                placement: placement.clone(),
+                pending: false,
+            }),
+            TileVM::Climate(ClimateTileVM {
+                name: "Living Room".into(),
+                state: "heat".into(),
+                is_active: true,
+                current_temperature: Some(21.5),
+                target_temperature: Some(22.0),
+                icon_id: "mdi:thermostat".into(),
+                preferred_columns: 2,
+                preferred_rows: 2,
+                placement: placement.clone(),
+                pending: false,
+            }),
+            TileVM::MediaPlayer(MediaPlayerTileVM {
+                name: "Kitchen Speaker".into(),
+                state: "playing".into(),
+                is_playing: true,
+                media_title: Some("Track Name".into()),
+                artist: Some("Artist Name".into()),
+                volume_level: Some(0.55),
+                icon_id: "mdi:speaker".into(),
+                preferred_columns: 2,
+                preferred_rows: 2,
+                placement: placement.clone(),
+                pending: false,
+            }),
+            TileVM::PowerFlow(PowerFlowTileVM {
+                name: "Power".into(),
+                grid_w: Some(1500.0),
+                solar_w: Some(2000.0),
+                battery_w: Some(-300.0),
+                battery_pct: Some(75.0),
+                home_w: Some(800.0),
+                icon_id: "mdi:lightning-bolt-circle".into(),
+                preferred_columns: 2,
+                preferred_rows: 2,
+                placement,
+                pending: false,
+            }),
+        ];
+
+        let split = split_tile_vms(&tiles);
+
+        // Each per-kind Vec gets exactly one entry — partitioning is
+        // disjoint and complete (no kind drops, no kind double-routes).
+        assert_eq!(split.covers.len(), 1, "one CoverTileVM expected");
+        assert_eq!(split.fans.len(), 1, "one FanTileVM expected");
+        assert_eq!(split.locks.len(), 1, "one LockTileVM expected");
+        assert_eq!(split.alarms.len(), 1, "one AlarmTileVM expected");
+        assert_eq!(split.histories.len(), 1, "one HistoryGraphTileVM expected");
+        assert_eq!(split.cameras.len(), 1, "one CameraTileVM expected");
+        assert_eq!(split.climates.len(), 1, "one ClimateTileVM expected");
+        assert_eq!(
+            split.media_players.len(),
+            1,
+            "one MediaPlayerTileVM expected"
+        );
+        assert_eq!(split.power_flows.len(), 1, "one PowerFlowTileVM expected");
+
+        // Phase 1 buckets stay empty when no Phase 1 tile is present.
+        assert!(
+            split.lights.is_empty() && split.sensors.is_empty() && split.entities.is_empty(),
+            "Phase 1 buckets must be empty when input slice carries only Phase 6 kinds"
+        );
+
+        // Distinguishing per-kind fields round-trip into the Slint-typed
+        // output structs verbatim. These assertions exercise the field
+        // copies that occur inside each `split_tile_vms` arm.
+        let cover = &split.covers[0];
+        assert_eq!(cover.name.as_str(), "Patio");
+        assert_eq!(cover.state.as_str(), "open");
+        assert_eq!(cover.position, 42);
+        assert!(cover.r#has_position);
+        assert!(cover.r#is_open);
+        assert!(!cover.r#is_moving);
+        assert_eq!(cover.r#icon_id.as_str(), "mdi:window-shutter-open");
+
+        let fan = &split.fans[0];
+        assert_eq!(fan.name.as_str(), "Bedroom Fan");
+        assert_eq!(fan.state.as_str(), "on");
+        assert_eq!(fan.r#speed_pct, 75);
+        assert!(fan.r#has_speed_pct);
+        assert!(fan.r#is_on);
+        assert_eq!(fan.r#current_speed.as_str(), "high");
+        assert!(fan.r#has_current_speed);
+
+        let lock = &split.locks[0];
+        assert_eq!(lock.name.as_str(), "Front Door");
+        assert_eq!(lock.state.as_str(), "locked");
+        assert!(lock.r#is_locked);
+
+        let alarm = &split.alarms[0];
+        assert_eq!(alarm.name.as_str(), "Home Alarm");
+        assert_eq!(alarm.state.as_str(), "armed_away");
+        assert!(alarm.r#is_armed);
+        assert!(!alarm.r#is_triggered);
+        assert!(!alarm.r#is_pending);
+
+        let history = &split.histories[0];
+        assert_eq!(history.name.as_str(), "Energy Today");
+        assert_eq!(history.state.as_str(), "12.4");
+        assert_eq!(history.r#change_count, 7);
+        assert!(history.r#is_available);
+        assert_eq!(history.r#path_commands.as_str(), "M 0 0 L 1 1");
+
+        let camera = &split.cameras[0];
+        assert_eq!(camera.name.as_str(), "Front Door");
+        assert_eq!(camera.state.as_str(), "recording");
+        assert!(camera.r#is_recording);
+        assert!(!camera.r#is_streaming);
+        assert!(camera.r#is_available);
+
+        let climate = &split.climates[0];
+        assert_eq!(climate.name.as_str(), "Living Room");
+        assert_eq!(climate.state.as_str(), "heat");
+        assert!(climate.r#is_active);
+        // Option<f32> → (value, has_*) projection
+        assert!(climate.r#has_current_temperature);
+        assert_eq!(climate.r#current_temperature, 21.5);
+        assert!(climate.r#has_target_temperature);
+        assert_eq!(climate.r#target_temperature, 22.0);
+
+        let mp = &split.media_players[0];
+        assert_eq!(mp.name.as_str(), "Kitchen Speaker");
+        assert_eq!(mp.state.as_str(), "playing");
+        assert!(mp.r#is_playing);
+        assert!(mp.r#has_media_title);
+        assert_eq!(mp.r#media_title.as_str(), "Track Name");
+        assert!(mp.r#has_artist);
+        assert_eq!(mp.artist.as_str(), "Artist Name");
+        assert!(mp.r#has_volume_level);
+        assert!((mp.r#volume_level - 0.55).abs() < 1e-6);
+
+        // PowerFlow drives its own Slint conversion via
+        // `slint_power_flow_tile_vm`; with a populated `grid_w` the lane
+        // labels and direction flags carry the formatted scalar.
+        let pf = &split.power_flows[0];
+        assert_eq!(pf.name.as_str(), "Power");
+        assert!(pf.is_available, "grid_w=Some → is_available=true");
+        assert!(pf.grid_importing, "grid_w > 0 → importing");
+        assert!(!pf.grid_idle, "1500 W is well above the idle threshold");
+        assert!(pf.has_solar);
+        assert!(!pf.solar_idle);
+        assert!(pf.has_battery);
+        assert!(!pf.battery_charging, "battery_w < 0 → discharging");
+        assert!(!pf.battery_idle);
+        assert!(pf.has_battery_pct);
+        assert!((pf.battery_pct - 75.0).abs() < 1e-6);
+        assert!(pf.has_home);
+        assert!(!pf.home_idle);
+    }
+
+    /// `split_tile_vms` projects an Option<f32> field that is `None` to
+    /// `(0.0, false)`. This exercises the unwrap_or-default branch in
+    /// the Climate / MediaPlayer / PowerFlow arms (which is the
+    /// `is_some()=false` side of the conversion).
+    #[test]
+    fn split_tile_vms_option_f32_none_projects_to_default_with_has_flag_false() {
+        ensure_icons_init();
+
+        let placement = TilePlacement::default_for(2, 2);
+        let tiles = vec![
+            TileVM::Climate(ClimateTileVM {
+                name: "Climate".into(),
+                state: "off".into(),
+                is_active: false,
+                current_temperature: None,
+                target_temperature: None,
+                icon_id: "mdi:thermostat".into(),
+                preferred_columns: 2,
+                preferred_rows: 2,
+                placement: placement.clone(),
+                pending: false,
+            }),
+            TileVM::MediaPlayer(MediaPlayerTileVM {
+                name: "MP".into(),
+                state: "idle".into(),
+                is_playing: false,
+                media_title: None,
+                artist: None,
+                volume_level: None,
+                icon_id: "mdi:speaker".into(),
+                preferred_columns: 2,
+                preferred_rows: 2,
+                placement: placement.clone(),
+                pending: false,
+            }),
+            TileVM::PowerFlow(PowerFlowTileVM {
+                name: "PF".into(),
+                grid_w: None,
+                solar_w: None,
+                battery_w: None,
+                battery_pct: None,
+                home_w: None,
+                icon_id: "mdi:lightning-bolt-circle".into(),
+                preferred_columns: 2,
+                preferred_rows: 2,
+                placement,
+                pending: false,
+            }),
+        ];
+
+        let split = split_tile_vms(&tiles);
+
+        let climate = &split.climates[0];
+        assert!(!climate.r#has_current_temperature);
+        assert_eq!(climate.r#current_temperature, 0.0);
+        assert!(!climate.r#has_target_temperature);
+        assert_eq!(climate.r#target_temperature, 0.0);
+
+        let mp = &split.media_players[0];
+        assert!(!mp.r#has_media_title);
+        assert_eq!(mp.r#media_title.as_str(), "");
+        assert!(!mp.r#has_artist);
+        assert_eq!(mp.artist.as_str(), "");
+        assert!(!mp.r#has_volume_level);
+        assert_eq!(mp.r#volume_level, 0.0);
+
+        let pf = &split.power_flows[0];
+        assert!(!pf.is_available, "grid_w=None → is_available=false");
+        assert!(pf.grid_idle, "grid_w=None → idle=true (defensive default)");
+        assert!(!pf.grid_importing);
+        assert!(!pf.has_solar);
+        assert!(pf.solar_idle);
+        assert!(!pf.has_battery);
+        assert!(pf.battery_idle);
+        assert!(!pf.battery_charging);
+        assert!(!pf.has_battery_pct);
+        assert_eq!(pf.battery_pct, 0.0);
+        assert!(!pf.has_home);
+        assert!(pf.home_idle);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_tiles — Phase 6 unavailable-fallback arms
+    //
+    // When a widget references an entity that is NOT present in the store,
+    // `build_tiles` emits a placeholder VM of the matching `TileKind` with
+    // `state="unavailable"` so the row layout stays stable across
+    // availability transitions (TASK-119 F2 row-stability invariant). The
+    // tests below exercise the Phase 6 unavailable arms (Cover / Fan /
+    // Lock / Alarm / History / Camera / Climate / MediaPlayer) — the
+    // Light / Sensor / Entity arms are exercised by
+    // `missing_entity_produces_entity_tile_vm_with_unavailable` above.
+    //
+    // PowerFlow has its own dedicated arm tested in
+    // `compute_power_flow_tile_vm_from_widget_options_path_with_missing_grid_emits_unavailable_vm`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_tiles_cover_widget_with_missing_entity_emits_unavailable_cover_vm() {
+        use crate::ha::store::MemoryStore;
+        let store = MemoryStore::load(vec![]).expect("MemoryStore::load");
+        let dashboard = dashboard_with_kind("cover.does_not_exist", WidgetKind::Cover);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1, "row layout stays stable: one tile emitted");
+        match &tiles[0] {
+            TileVM::Cover(vm) => {
+                assert_eq!(vm.state, "unavailable");
+                assert!(!vm.is_open, "unavailable cover must not be open");
+                assert!(!vm.is_moving);
+                assert!(!vm.has_position);
+                assert!(!vm.has_tilt);
+                assert_eq!(vm.icon_id, "mdi:help-circle");
+            }
+            other => panic!("expected CoverTileVM placeholder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_tiles_fan_widget_with_missing_entity_emits_unavailable_fan_vm() {
+        use crate::ha::store::MemoryStore;
+        let store = MemoryStore::load(vec![]).expect("MemoryStore::load");
+        let dashboard = dashboard_with_kind("fan.does_not_exist", WidgetKind::Fan);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1);
+        match &tiles[0] {
+            TileVM::Fan(vm) => {
+                assert_eq!(vm.state, "unavailable");
+                assert!(!vm.is_on);
+                assert!(!vm.has_speed_pct);
+                assert!(!vm.has_current_speed);
+                assert_eq!(vm.current_speed, "");
+            }
+            other => panic!("expected FanTileVM placeholder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_tiles_lock_widget_with_missing_entity_emits_unavailable_lock_vm() {
+        use crate::ha::store::MemoryStore;
+        let store = MemoryStore::load(vec![]).expect("MemoryStore::load");
+        let dashboard = dashboard_with_kind("lock.does_not_exist", WidgetKind::Lock);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1);
+        match &tiles[0] {
+            TileVM::Lock(vm) => {
+                assert_eq!(vm.state, "unavailable");
+                assert!(!vm.is_locked, "unavailable lock must not be locked");
+            }
+            other => panic!("expected LockTileVM placeholder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_tiles_alarm_widget_with_missing_entity_emits_unavailable_alarm_vm() {
+        use crate::ha::store::MemoryStore;
+        let store = MemoryStore::load(vec![]).expect("MemoryStore::load");
+        let dashboard =
+            dashboard_with_kind("alarm_control_panel.does_not_exist", WidgetKind::Alarm);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1);
+        match &tiles[0] {
+            TileVM::Alarm(vm) => {
+                assert_eq!(vm.state, "unavailable");
+                assert!(!vm.is_armed);
+                assert!(!vm.is_triggered);
+                assert!(!vm.is_pending);
+            }
+            other => panic!("expected AlarmTileVM placeholder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_tiles_history_widget_with_missing_entity_emits_unavailable_history_vm() {
+        use crate::ha::store::MemoryStore;
+        let store = MemoryStore::load(vec![]).expect("MemoryStore::load");
+        let dashboard = dashboard_with_kind("sensor.does_not_exist", WidgetKind::History);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1);
+        match &tiles[0] {
+            TileVM::History(vm) => {
+                assert_eq!(vm.state, "unavailable");
+                assert!(!vm.is_available);
+                assert_eq!(vm.change_count, 0);
+                assert_eq!(vm.path_commands, "");
+            }
+            other => panic!("expected HistoryGraphTileVM placeholder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_tiles_camera_widget_with_missing_entity_emits_unavailable_camera_vm() {
+        use crate::ha::store::MemoryStore;
+        let store = MemoryStore::load(vec![]).expect("MemoryStore::load");
+        let dashboard = dashboard_with_kind("camera.does_not_exist", WidgetKind::Camera);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1);
+        match &tiles[0] {
+            TileVM::Camera(vm) => {
+                assert_eq!(vm.state, "unavailable");
+                assert!(!vm.is_recording);
+                assert!(!vm.is_streaming);
+                assert!(!vm.is_available);
+            }
+            other => panic!("expected CameraTileVM placeholder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_tiles_climate_widget_with_missing_entity_emits_unavailable_climate_vm() {
+        use crate::ha::store::MemoryStore;
+        let store = MemoryStore::load(vec![]).expect("MemoryStore::load");
+        let dashboard = dashboard_with_kind("climate.does_not_exist", WidgetKind::Climate);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1);
+        match &tiles[0] {
+            TileVM::Climate(vm) => {
+                assert_eq!(vm.state, "unavailable");
+                assert!(!vm.is_active);
+                assert_eq!(vm.current_temperature, None);
+                assert_eq!(vm.target_temperature, None);
+            }
+            other => panic!("expected ClimateTileVM placeholder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_tiles_media_player_widget_with_missing_entity_emits_unavailable_media_player_vm() {
+        use crate::ha::store::MemoryStore;
+        let store = MemoryStore::load(vec![]).expect("MemoryStore::load");
+        let dashboard = dashboard_with_kind("media_player.does_not_exist", WidgetKind::MediaPlayer);
+        let tiles = build_tiles(&store, &dashboard);
+        assert_eq!(tiles.len(), 1);
+        match &tiles[0] {
+            TileVM::MediaPlayer(vm) => {
+                assert_eq!(vm.state, "unavailable");
+                assert!(!vm.is_playing);
+                assert_eq!(vm.media_title, None);
+                assert_eq!(vm.artist, None);
+                assert_eq!(vm.volume_level, None);
+            }
+            other => panic!("expected MediaPlayerTileVM placeholder, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_power_flow_tile_vm_from_widget — options-path branches
+    //
+    // The wrapper-entity branch is exercised by
+    // `build_tiles_power_flow_widget_uses_state` etc. The two uncovered
+    // branches handled here are:
+    //
+    // 1. `WidgetOptions::PowerFlow` present + grid entity NOT in store —
+    //    the auxiliary fields still resolve, but `grid_w` is None and the
+    //    Slint side renders the unavailable variant.
+    // 2. Defensive fallback: neither options nor wrapper_entity supplied —
+    //    every scalar is None.
+    // -----------------------------------------------------------------------
+
+    /// Options-driven path: the grid entity is NOT in the store, but the
+    /// auxiliary entities ARE. The bridge must surface the auxiliary
+    /// readings even when the primary grid entity is missing — this keeps
+    /// solar / battery / home labels populated so the operator sees the
+    /// last-known partial state.
+    #[test]
+    fn compute_power_flow_tile_vm_from_widget_options_path_with_missing_grid_resolves_auxiliaries()
+    {
+        use crate::dashboard::schema::WidgetOptions;
+        use crate::ha::store::MemoryStore;
+
+        // Grid entity is intentionally missing; aux entities are present.
+        let store = MemoryStore::load(vec![
+            make_test_entity("sensor.solar_power", "2000.0"),
+            make_test_entity("sensor.battery_power", "-300.0"),
+            make_test_entity("sensor.battery_soc", "75.0"),
+            make_test_entity("sensor.home_power", "800.0"),
+        ])
+        .expect("MemoryStore::load");
+
+        let options = WidgetOptions::PowerFlow {
+            grid_entity: "sensor.does_not_exist_grid".to_string(),
+            solar_entity: Some("sensor.solar_power".to_string()),
+            battery_entity: Some("sensor.battery_power".to_string()),
+            battery_soc_entity: Some("sensor.battery_soc".to_string()),
+            home_entity: Some("sensor.home_power".to_string()),
+        };
+
+        let vm = compute_power_flow_tile_vm_from_widget(
+            PowerFlowBuildArgs {
+                name: "Power".to_string(),
+                icon_id: "mdi:lightning-bolt-circle".to_string(),
+                preferred_columns: 2,
+                preferred_rows: 2,
+                placement: TilePlacement::default_for(2, 2),
+                wrapper_entity: None,
+                options: Some(&options),
+            },
+            &store,
+        );
+
+        // Grid is missing → grid_w is None (drives Slint unavailable variant).
+        assert!(
+            vm.grid_w.is_none(),
+            "missing grid entity must surface as grid_w=None"
+        );
+        // But auxiliaries still resolve — the operator sees partial state.
+        assert_eq!(vm.solar_w, Some(2000.0));
+        assert_eq!(vm.battery_w, Some(-300.0));
+        assert_eq!(vm.battery_pct, Some(75.0));
+        assert_eq!(vm.home_w, Some(800.0));
+        // The placeholder still carries the configured name and icon so
+        // the unavailable visual variant labels are stable.
+        assert_eq!(vm.name, "Power");
+        assert_eq!(vm.icon_id, "mdi:lightning-bolt-circle");
+        assert!(!vm.pending);
+    }
+
+    /// Defensive fallback: a power-flow widget with NO options AND no
+    /// wrapper entity (degenerate config). The bridge must still emit a
+    /// `PowerFlowTileVM` so the row layout stays stable; every scalar is
+    /// None so the Slint side renders the unavailable visual variant.
+    #[test]
+    fn compute_power_flow_tile_vm_from_widget_defensive_fallback_emits_all_none() {
+        use crate::ha::store::MemoryStore;
+        let store = MemoryStore::load(vec![]).expect("MemoryStore::load");
+
+        let vm = compute_power_flow_tile_vm_from_widget(
+            PowerFlowBuildArgs {
+                name: "Defensive Power".to_string(),
+                icon_id: "mdi:lightning-bolt-circle".to_string(),
+                preferred_columns: 2,
+                preferred_rows: 2,
+                placement: TilePlacement::default_for(2, 2),
+                wrapper_entity: None,
+                options: None, // <-- no options
+            },
+            &store,
+        );
+
+        assert_eq!(vm.name, "Defensive Power");
+        assert!(vm.grid_w.is_none());
+        assert!(vm.solar_w.is_none());
+        assert!(vm.battery_w.is_none());
+        assert!(vm.battery_pct.is_none());
+        assert!(vm.home_w.is_none());
+        assert!(!vm.pending);
+        assert_eq!(vm.icon_id, "mdi:lightning-bolt-circle");
     }
 
     #[test]
@@ -5500,31 +6595,30 @@ mod tests {
 
     #[test]
     fn tile_kind_for_widget_maps_every_widget_kind_variant() {
+        // task/phase6-window-wireup: every `WidgetKind` now maps to its
+        // dedicated `TileKind`. Pre-wire-up the Phase 6 kinds all collapsed
+        // into `TileKind::Entity`; the row-update fan-out and the per-kind
+        // Slint models depend on this 1:1 mapping.
         use crate::dashboard::schema::WidgetKind;
-        assert_eq!(
-            tile_kind_for_widget(&WidgetKind::LightTile),
-            TileKind::Light
-        );
-        assert_eq!(
-            tile_kind_for_widget(&WidgetKind::SensorTile),
-            TileKind::Sensor
-        );
-        for k in [
-            WidgetKind::EntityTile,
-            WidgetKind::Camera,
-            WidgetKind::History,
-            WidgetKind::Fan,
-            WidgetKind::Lock,
-            WidgetKind::Alarm,
-            WidgetKind::Cover,
-            WidgetKind::MediaPlayer,
-            WidgetKind::Climate,
-            WidgetKind::PowerFlow,
-        ] {
+        let cases: &[(WidgetKind, TileKind)] = &[
+            (WidgetKind::LightTile, TileKind::Light),
+            (WidgetKind::SensorTile, TileKind::Sensor),
+            (WidgetKind::EntityTile, TileKind::Entity),
+            (WidgetKind::Cover, TileKind::Cover),
+            (WidgetKind::Fan, TileKind::Fan),
+            (WidgetKind::Lock, TileKind::Lock),
+            (WidgetKind::Alarm, TileKind::Alarm),
+            (WidgetKind::History, TileKind::History),
+            (WidgetKind::Camera, TileKind::Camera),
+            (WidgetKind::Climate, TileKind::Climate),
+            (WidgetKind::MediaPlayer, TileKind::MediaPlayer),
+            (WidgetKind::PowerFlow, TileKind::PowerFlow),
+        ];
+        for (widget_kind, expected) in cases {
             assert_eq!(
-                tile_kind_for_widget(&k),
-                TileKind::Entity,
-                "{k:?} must map to TileKind::Entity"
+                tile_kind_for_widget(widget_kind),
+                *expected,
+                "{widget_kind:?} must map to {expected:?}"
             );
         }
     }
@@ -5716,6 +6810,214 @@ mod tests {
         // `light.kitchen` is in the index; `switch.unknown` is not.
         assert!(!index.rows_for(&EntityId::from("light.kitchen")).is_empty());
         assert!(index.rows_for(&EntityId::from("switch.unknown")).is_empty());
+    }
+
+    /// `build_row_index` walks every `WidgetKind` in document order and
+    /// assigns each a row in its per-kind model. Each Phase 6 kind has a
+    /// distinct row counter; the test below pins that the per-kind streams
+    /// are independent (each kind starts at row 0) and that the lookup by
+    /// entity returns the matching `(kind, row)` pair. PowerFlow widgets
+    /// have `entity: None`, so they consume a row in the per-kind stream
+    /// but are not routable from the per-entity broadcast — the test
+    /// exercises that path explicitly so the `entity == ""` branch is
+    /// covered.
+    #[test]
+    fn build_row_index_assigns_independent_row_streams_per_phase6_kind() {
+        use crate::dashboard::schema::{
+            Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
+        };
+        let mk = |id: &str, kind: WidgetKind, entity: Option<&str>| Widget {
+            id: id.to_string(),
+            widget_type: kind,
+            entity: entity.map(str::to_string),
+            entities: vec![],
+            name: None,
+            icon: None,
+            tap_action: None,
+            hold_action: None,
+            double_tap_action: None,
+            layout: WidgetLayout {
+                preferred_columns: 1,
+                preferred_rows: 1,
+            },
+            options: None,
+            placement: None,
+            visibility: "always".to_string(),
+        };
+
+        let dashboard = Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
+            version: 1,
+            device_profile: ProfileKey::Rpi4,
+            home_assistant: None,
+            theme: None,
+            default_view: "home".to_string(),
+            views: vec![View {
+                id: "home".to_string(),
+                title: "Home".to_string(),
+                layout: Layout::Sections,
+                sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
+                    id: "s1".to_string(),
+                    title: "T".to_string(),
+                    widgets: vec![
+                        mk("w-cover", WidgetKind::Cover, Some("cover.patio")),
+                        mk("w-fan", WidgetKind::Fan, Some("fan.bedroom")),
+                        mk("w-lock", WidgetKind::Lock, Some("lock.front_door")),
+                        mk(
+                            "w-alarm",
+                            WidgetKind::Alarm,
+                            Some("alarm_control_panel.home"),
+                        ),
+                        mk("w-history", WidgetKind::History, Some("sensor.energy")),
+                        mk("w-camera", WidgetKind::Camera, Some("camera.front_door")),
+                        mk(
+                            "w-climate",
+                            WidgetKind::Climate,
+                            Some("climate.living_room"),
+                        ),
+                        mk(
+                            "w-mp",
+                            WidgetKind::MediaPlayer,
+                            Some("media_player.kitchen"),
+                        ),
+                        // PowerFlow widgets canonically have entity: None
+                        // (their grid entity lives in WidgetOptions::PowerFlow).
+                        // The row counter still advances; the entity index
+                        // does NOT record a routing entry.
+                        mk("w-pf", WidgetKind::PowerFlow, None),
+                    ],
+                }],
+            }],
+        };
+        let index = build_row_index(&dashboard);
+
+        // 8 entity-bound widgets routable; the PowerFlow widget consumed
+        // a row but is not routable from the per-entity broadcast.
+        assert_eq!(
+            index.entity_count(),
+            8,
+            "8 entity-bound Phase 6 widgets must be routable"
+        );
+        assert_eq!(
+            index.total_rows(),
+            8,
+            "total_rows counts only entity-bound entries"
+        );
+
+        // Each per-kind stream starts at row 0 — the streams are
+        // independent (per-kind row counter, not a single global counter).
+        assert_eq!(
+            index.rows_for(&EntityId::from("cover.patio")),
+            &[(TileKind::Cover, 0)]
+        );
+        assert_eq!(
+            index.rows_for(&EntityId::from("fan.bedroom")),
+            &[(TileKind::Fan, 0)]
+        );
+        assert_eq!(
+            index.rows_for(&EntityId::from("lock.front_door")),
+            &[(TileKind::Lock, 0)]
+        );
+        assert_eq!(
+            index.rows_for(&EntityId::from("alarm_control_panel.home")),
+            &[(TileKind::Alarm, 0)]
+        );
+        assert_eq!(
+            index.rows_for(&EntityId::from("sensor.energy")),
+            &[(TileKind::History, 0)]
+        );
+        assert_eq!(
+            index.rows_for(&EntityId::from("camera.front_door")),
+            &[(TileKind::Camera, 0)]
+        );
+        assert_eq!(
+            index.rows_for(&EntityId::from("climate.living_room")),
+            &[(TileKind::Climate, 0)]
+        );
+        assert_eq!(
+            index.rows_for(&EntityId::from("media_player.kitchen")),
+            &[(TileKind::MediaPlayer, 0)]
+        );
+    }
+
+    /// Two widgets of the same Phase 6 kind: the per-kind row counter
+    /// advances independently (first widget → row 0, second → row 1).
+    /// This pins the increment side of each Phase 6 arm in
+    /// `build_row_index`'s per-kind match.
+    #[test]
+    fn build_row_index_increments_per_kind_counter_independently() {
+        use crate::dashboard::schema::{
+            Dashboard, Layout, ProfileKey, Section, View, Widget, WidgetKind, WidgetLayout,
+        };
+        let mk = |id: &str, kind: WidgetKind, entity: &str| Widget {
+            id: id.to_string(),
+            widget_type: kind,
+            entity: Some(entity.to_string()),
+            entities: vec![],
+            name: None,
+            icon: None,
+            tap_action: None,
+            hold_action: None,
+            double_tap_action: None,
+            layout: WidgetLayout {
+                preferred_columns: 1,
+                preferred_rows: 1,
+            },
+            options: None,
+            placement: None,
+            visibility: "always".to_string(),
+        };
+
+        // Two Cover widgets + two Fan widgets, interleaved so a global
+        // row counter (regression mode) would assign different rows.
+        let dashboard = Dashboard {
+            call_service_allowlist: std::sync::Arc::new(std::collections::BTreeSet::new()),
+            dep_index: std::sync::Arc::default(),
+            version: 1,
+            device_profile: ProfileKey::Rpi4,
+            home_assistant: None,
+            theme: None,
+            default_view: "home".to_string(),
+            views: vec![View {
+                id: "home".to_string(),
+                title: "Home".to_string(),
+                layout: Layout::Sections,
+                sections: vec![Section {
+                    grid: crate::dashboard::schema::SectionGrid::default(),
+                    id: "s1".to_string(),
+                    title: "T".to_string(),
+                    widgets: vec![
+                        mk("w1", WidgetKind::Cover, "cover.a"),
+                        mk("w2", WidgetKind::Fan, "fan.a"),
+                        mk("w3", WidgetKind::Cover, "cover.b"),
+                        mk("w4", WidgetKind::Fan, "fan.b"),
+                    ],
+                }],
+            }],
+        };
+        let index = build_row_index(&dashboard);
+
+        // Cover stream: row 0 then row 1. A regression that used a single
+        // global counter would assign Cover rows {0, 2} instead.
+        assert_eq!(
+            index.rows_for(&EntityId::from("cover.a")),
+            &[(TileKind::Cover, 0)]
+        );
+        assert_eq!(
+            index.rows_for(&EntityId::from("cover.b")),
+            &[(TileKind::Cover, 1)]
+        );
+        // Fan stream is independent — also starts at 0.
+        assert_eq!(
+            index.rows_for(&EntityId::from("fan.a")),
+            &[(TileKind::Fan, 0)]
+        );
+        assert_eq!(
+            index.rows_for(&EntityId::from("fan.b")),
+            &[(TileKind::Fan, 1)]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8042,10 +9344,12 @@ mod tests {
     }
 
     /// `build_tiles` for a `WidgetKind::Cover` widget with a
-    /// `current_position` attribute produces an `EntityTileVM` whose
-    /// `state` string is enriched with the position percentage. This
-    /// confirms the bridge dispatches the cover state-change through
-    /// `CoverVM::from_entity` per TASK-102 AC #7.
+    /// `current_position` attribute produces a `TileVM::Cover` whose
+    /// `position` field carries the percentage and `has_position` is true.
+    /// Post `task/phase6-window-wireup`, the state string is the raw HA
+    /// canonical state (`"open"`) — the position is surfaced through the
+    /// dedicated `position` field that the Slint `CoverTile` renders as
+    /// a separate `"NN%"` label.
     #[test]
     fn build_tiles_cover_widget_includes_position_in_state_when_attribute_present() {
         use crate::ha::store::MemoryStore;
@@ -8061,18 +9365,19 @@ mod tests {
         let tiles = build_tiles(&store, &dashboard);
         assert_eq!(tiles.len(), 1);
         match &tiles[0] {
-            TileVM::Entity(vm) => {
-                assert_eq!(
-                    vm.state, "open 42%",
-                    "cover state must be enriched with position percentage"
-                );
+            TileVM::Cover(vm) => {
+                assert_eq!(vm.state, "open", "cover state is the raw HA state");
+                assert_eq!(vm.position, 42, "position must reflect current_position");
+                assert!(vm.has_position, "has_position must be true");
+                assert!(vm.is_open, "is_open must be true for open state");
             }
-            other => panic!("expected EntityTileVM (Cover fallback), got {other:?}"),
+            other => panic!("expected CoverTileVM, got {other:?}"),
         }
     }
 
     /// `build_tiles` for a cover entity WITHOUT a `current_position`
-    /// attribute keeps the raw HA state string (no spurious percentage).
+    /// attribute keeps the raw HA state string and reports `has_position
+    /// == false` so the Slint tile suppresses the percentage label.
     #[test]
     fn build_tiles_cover_widget_without_position_keeps_raw_state() {
         use crate::ha::store::MemoryStore;
@@ -8084,13 +9389,15 @@ mod tests {
         let tiles = build_tiles(&store, &dashboard);
         assert_eq!(tiles.len(), 1);
         match &tiles[0] {
-            TileVM::Entity(vm) => {
-                assert_eq!(
-                    vm.state, "closed",
-                    "no current_position → no percentage suffix"
+            TileVM::Cover(vm) => {
+                assert_eq!(vm.state, "closed");
+                assert!(
+                    !vm.has_position,
+                    "no current_position → has_position must be false"
                 );
+                assert!(!vm.is_open);
             }
-            other => panic!("expected EntityTileVM, got {other:?}"),
+            other => panic!("expected CoverTileVM, got {other:?}"),
         }
     }
 
@@ -8267,18 +9574,21 @@ mod tests {
         let tiles = build_tiles(&store, &dashboard);
         assert_eq!(tiles.len(), 1);
         match &tiles[0] {
-            TileVM::Entity(vm) => {
-                assert_eq!(
-                    vm.state, "on 42%",
-                    "fan state must be enriched with percentage"
-                );
+            TileVM::Fan(vm) => {
+                // Post task/phase6-window-wireup: state is the raw HA
+                // canonical state; percentage lives on `speed_pct` so the
+                // Slint tile renders a separate label.
+                assert_eq!(vm.state, "on", "state is the raw HA state");
+                assert_eq!(vm.speed_pct, 42, "speed_pct must reflect percentage");
+                assert!(vm.has_speed_pct, "has_speed_pct must be true");
+                assert!(vm.is_on, "is_on must be true");
             }
-            other => panic!("expected EntityTileVM (Fan fallback), got {other:?}"),
+            other => panic!("expected FanTileVM, got {other:?}"),
         }
     }
 
     /// `build_tiles` for a fan entity with only a `preset_mode` attribute
-    /// renders the preset name in the enriched state.
+    /// renders the preset name through the dedicated `current_speed` field.
     #[test]
     fn build_tiles_fan_widget_includes_preset_mode_in_state_when_percentage_absent() {
         use crate::ha::store::MemoryStore;
@@ -8294,15 +9604,18 @@ mod tests {
         let tiles = build_tiles(&store, &dashboard);
         assert_eq!(tiles.len(), 1);
         match &tiles[0] {
-            TileVM::Entity(vm) => {
-                assert_eq!(vm.state, "on Low", "fan state must include preset mode");
+            TileVM::Fan(vm) => {
+                assert_eq!(vm.state, "on", "state is the raw HA state");
+                assert!(vm.has_current_speed);
+                assert_eq!(vm.current_speed, "Low");
+                assert!(!vm.has_speed_pct);
             }
-            other => panic!("expected EntityTileVM (Fan fallback), got {other:?}"),
+            other => panic!("expected FanTileVM, got {other:?}"),
         }
     }
 
     /// `build_tiles` for a fan entity WITHOUT speed attributes keeps the
-    /// raw HA state string (no spurious suffix).
+    /// raw HA state string and reports both speed booleans as false.
     #[test]
     fn build_tiles_fan_widget_without_speed_keeps_raw_state() {
         use crate::ha::store::MemoryStore;
@@ -8314,10 +9627,13 @@ mod tests {
         let tiles = build_tiles(&store, &dashboard);
         assert_eq!(tiles.len(), 1);
         match &tiles[0] {
-            TileVM::Entity(vm) => {
-                assert_eq!(vm.state, "off", "no speed attribute → no suffix");
+            TileVM::Fan(vm) => {
+                assert_eq!(vm.state, "off");
+                assert!(!vm.has_speed_pct);
+                assert!(!vm.has_current_speed);
+                assert!(!vm.is_on);
             }
-            other => panic!("expected EntityTileVM, got {other:?}"),
+            other => panic!("expected FanTileVM, got {other:?}"),
         }
     }
 
@@ -8490,13 +9806,14 @@ mod tests {
         let tiles = build_tiles(&store, &dashboard);
         assert_eq!(tiles.len(), 1);
         match &tiles[0] {
-            TileVM::Entity(vm) => {
+            TileVM::Lock(vm) => {
                 assert_eq!(
                     vm.state, "locked",
                     "lock state forwarded verbatim (no enrichment)"
                 );
+                assert!(vm.is_locked, "is_locked must be true for `locked` state");
             }
-            other => panic!("expected EntityTileVM (Lock fallback), got {other:?}"),
+            other => panic!("expected LockTileVM, got {other:?}"),
         }
     }
 
@@ -8513,10 +9830,10 @@ mod tests {
         let tiles = build_tiles(&store, &dashboard);
         assert_eq!(tiles.len(), 1);
         match &tiles[0] {
-            TileVM::Entity(vm) => {
+            TileVM::Lock(vm) => {
                 assert_eq!(vm.state, "jammed");
             }
-            other => panic!("expected EntityTileVM (Lock fallback), got {other:?}"),
+            other => panic!("expected LockTileVM, got {other:?}"),
         }
     }
 
@@ -8609,10 +9926,12 @@ mod tests {
         let tiles = build_tiles(&store, &dashboard);
         assert_eq!(tiles.len(), 1, "one widget → one tile");
         match &tiles[0] {
-            TileVM::Entity(vm) => {
+            TileVM::Alarm(vm) => {
                 assert_eq!(vm.state, "armed_away", "alarm state flows through to tile");
+                assert!(vm.is_armed);
+                assert!(!vm.is_triggered);
             }
-            other => panic!("expected EntityTileVM for alarm, got {other:?}"),
+            other => panic!("expected AlarmTileVM, got {other:?}"),
         }
     }
 
@@ -8688,10 +10007,13 @@ mod tests {
         let tiles = build_tiles(&store, &dashboard);
         assert_eq!(tiles.len(), 1, "one widget → one tile");
         match &tiles[0] {
-            TileVM::Entity(vm) => {
+            TileVM::History(vm) => {
                 assert_eq!(vm.state, "23.4", "history state forwarded verbatim");
+                assert!(vm.is_available);
+                assert_eq!(vm.change_count, 0, "no window fetched yet at build_tiles");
+                assert!(vm.path_commands.is_empty());
             }
-            other => panic!("expected EntityTileVM (History fallback), got {other:?}"),
+            other => panic!("expected HistoryGraphTileVM, got {other:?}"),
         }
     }
 
@@ -8709,8 +10031,11 @@ mod tests {
         let dashboard = dashboard_with_kind("sensor.energy_today", WidgetKind::History);
         let tiles = build_tiles(&store, &dashboard);
         match &tiles[0] {
-            TileVM::Entity(vm) => assert_eq!(vm.state, "unavailable"),
-            other => panic!("expected EntityTileVM (History fallback), got {other:?}"),
+            TileVM::History(vm) => {
+                assert_eq!(vm.state, "unavailable");
+                assert!(!vm.is_available);
+            }
+            other => panic!("expected HistoryGraphTileVM, got {other:?}"),
         }
     }
 
@@ -8958,10 +10283,11 @@ mod tests {
         let tiles = build_tiles(&store, &dashboard);
         assert_eq!(tiles.len(), 1, "one widget → one tile");
         match &tiles[0] {
-            TileVM::Entity(vm) => {
+            TileVM::Camera(vm) => {
                 assert_eq!(vm.state, "idle", "camera state forwarded verbatim");
+                assert!(vm.is_available);
             }
-            other => panic!("expected EntityTileVM (Camera fallback), got {other:?}"),
+            other => panic!("expected CameraTileVM, got {other:?}"),
         }
     }
 
@@ -8978,8 +10304,11 @@ mod tests {
         let dashboard = dashboard_with_kind("camera.front_door", WidgetKind::Camera);
         let tiles = build_tiles(&store, &dashboard);
         match &tiles[0] {
-            TileVM::Entity(vm) => assert_eq!(vm.state, "recording"),
-            other => panic!("expected EntityTileVM (Camera fallback), got {other:?}"),
+            TileVM::Camera(vm) => {
+                assert_eq!(vm.state, "recording");
+                assert!(vm.is_recording);
+            }
+            other => panic!("expected CameraTileVM, got {other:?}"),
         }
     }
 
@@ -8997,8 +10326,11 @@ mod tests {
         let dashboard = dashboard_with_kind("camera.front_door", WidgetKind::Camera);
         let tiles = build_tiles(&store, &dashboard);
         match &tiles[0] {
-            TileVM::Entity(vm) => assert_eq!(vm.state, "unavailable"),
-            other => panic!("expected EntityTileVM (Camera fallback), got {other:?}"),
+            TileVM::Camera(vm) => {
+                assert_eq!(vm.state, "unavailable");
+                assert!(!vm.is_available);
+            }
+            other => panic!("expected CameraTileVM, got {other:?}"),
         }
     }
 
@@ -9117,10 +10449,11 @@ mod tests {
         let tiles = build_tiles(&store, &dashboard);
         assert_eq!(tiles.len(), 1, "one widget → one tile");
         match &tiles[0] {
-            TileVM::Entity(vm) => {
+            TileVM::Climate(vm) => {
                 assert_eq!(vm.state, "heat", "climate state forwarded verbatim");
+                assert!(vm.is_active);
             }
-            other => panic!("expected EntityTileVM (Climate fallback), got {other:?}"),
+            other => panic!("expected ClimateTileVM, got {other:?}"),
         }
     }
 
@@ -9137,8 +10470,8 @@ mod tests {
         let dashboard = dashboard_with_kind("climate.living_room", WidgetKind::Climate);
         let tiles = build_tiles(&store, &dashboard);
         match &tiles[0] {
-            TileVM::Entity(vm) => assert_eq!(vm.state, "cool"),
-            other => panic!("expected EntityTileVM (Climate fallback), got {other:?}"),
+            TileVM::Climate(vm) => assert_eq!(vm.state, "cool"),
+            other => panic!("expected ClimateTileVM, got {other:?}"),
         }
     }
 
@@ -9155,8 +10488,11 @@ mod tests {
         let dashboard = dashboard_with_kind("climate.living_room", WidgetKind::Climate);
         let tiles = build_tiles(&store, &dashboard);
         match &tiles[0] {
-            TileVM::Entity(vm) => assert_eq!(vm.state, "off"),
-            other => panic!("expected EntityTileVM (Climate fallback), got {other:?}"),
+            TileVM::Climate(vm) => {
+                assert_eq!(vm.state, "off");
+                assert!(!vm.is_active);
+            }
+            other => panic!("expected ClimateTileVM, got {other:?}"),
         }
     }
 
@@ -9174,8 +10510,11 @@ mod tests {
         let dashboard = dashboard_with_kind("climate.living_room", WidgetKind::Climate);
         let tiles = build_tiles(&store, &dashboard);
         match &tiles[0] {
-            TileVM::Entity(vm) => assert_eq!(vm.state, "unavailable"),
-            other => panic!("expected EntityTileVM (Climate fallback), got {other:?}"),
+            TileVM::Climate(vm) => {
+                assert_eq!(vm.state, "unavailable");
+                assert!(!vm.is_active);
+            }
+            other => panic!("expected ClimateTileVM, got {other:?}"),
         }
     }
 
@@ -9306,10 +10645,11 @@ mod tests {
         let tiles = build_tiles(&store, &dashboard);
         assert_eq!(tiles.len(), 1, "one widget → one tile");
         match &tiles[0] {
-            TileVM::Entity(vm) => {
+            TileVM::MediaPlayer(vm) => {
                 assert_eq!(vm.state, "playing", "media-player state forwarded verbatim");
+                assert!(vm.is_playing);
             }
-            other => panic!("expected EntityTileVM (MediaPlayer fallback), got {other:?}"),
+            other => panic!("expected MediaPlayerTileVM, got {other:?}"),
         }
     }
 
@@ -9327,8 +10667,11 @@ mod tests {
         let dashboard = dashboard_with_kind("media_player.tv", WidgetKind::MediaPlayer);
         let tiles = build_tiles(&store, &dashboard);
         match &tiles[0] {
-            TileVM::Entity(vm) => assert_eq!(vm.state, "paused"),
-            other => panic!("expected EntityTileVM (MediaPlayer fallback), got {other:?}"),
+            TileVM::MediaPlayer(vm) => {
+                assert_eq!(vm.state, "paused");
+                assert!(!vm.is_playing);
+            }
+            other => panic!("expected MediaPlayerTileVM, got {other:?}"),
         }
     }
 
@@ -9346,8 +10689,11 @@ mod tests {
         let dashboard = dashboard_with_kind("media_player.tv", WidgetKind::MediaPlayer);
         let tiles = build_tiles(&store, &dashboard);
         match &tiles[0] {
-            TileVM::Entity(vm) => assert_eq!(vm.state, "unavailable"),
-            other => panic!("expected EntityTileVM (MediaPlayer fallback), got {other:?}"),
+            TileVM::MediaPlayer(vm) => {
+                assert_eq!(vm.state, "unavailable");
+                assert!(!vm.is_playing);
+            }
+            other => panic!("expected MediaPlayerTileVM, got {other:?}"),
         }
     }
 
@@ -9495,17 +10841,22 @@ mod tests {
         let tiles = build_tiles(&store, &dashboard);
         assert_eq!(tiles.len(), 1, "one widget → one tile");
         match &tiles[0] {
-            TileVM::Entity(vm) => {
-                assert_eq!(vm.state, "1500", "power-flow state forwarded verbatim");
+            // Post task/phase6-window-wireup: PowerFlow has no `state`
+            // string field on its VM. The dashboard helper sets
+            // `widget.entity = Some(...)` and `widget.options = None`, so
+            // the bridge falls through `compute_power_flow_tile_vm_from_widget`'s
+            // wrapper-entity branch and forwards the parsed grid wattage.
+            TileVM::PowerFlow(vm) => {
+                assert_eq!(vm.grid_w, Some(1500.0), "grid_w must parse the state");
             }
-            other => panic!("expected EntityTileVM (PowerFlow fallback), got {other:?}"),
+            other => panic!("expected PowerFlowTileVM, got {other:?}"),
         }
     }
 
     /// `build_tiles` for a `WidgetKind::PowerFlow` widget routes a
-    /// negative-export grid reading through the bridge without altering
-    /// the state string — the directional indicator is driven downstream
-    /// by `PowerFlowVM::read_power_watts`.
+    /// negative-export grid reading through the bridge — `grid_w` carries
+    /// the signed numeric value; the directional indicator is driven by
+    /// the Slint side via `grid_importing`.
     #[test]
     fn build_tiles_power_flow_widget_export_state_passes_through() {
         use crate::ha::store::MemoryStore;
@@ -9516,15 +10867,15 @@ mod tests {
         let dashboard = dashboard_with_kind("sensor.grid_power", WidgetKind::PowerFlow);
         let tiles = build_tiles(&store, &dashboard);
         match &tiles[0] {
-            TileVM::Entity(vm) => assert_eq!(vm.state, "-200.5"),
-            other => panic!("expected EntityTileVM (PowerFlow fallback), got {other:?}"),
+            TileVM::PowerFlow(vm) => assert_eq!(vm.grid_w, Some(-200.5)),
+            other => panic!("expected PowerFlowTileVM, got {other:?}"),
         }
     }
 
     /// `build_tiles` for a `WidgetKind::PowerFlow` widget routes an
     /// `unavailable` entity through the bridge without altering the state
     /// string — `PowerFlowVM::read_power_watts` returns `None` for the
-    /// sentinel and the unavailable visual is driven downstream.
+    /// sentinel and the Slint side renders the unavailable variant.
     #[test]
     fn build_tiles_power_flow_widget_unavailable_state_passes_through() {
         use crate::ha::store::MemoryStore;
@@ -9535,8 +10886,10 @@ mod tests {
         let dashboard = dashboard_with_kind("sensor.grid_power", WidgetKind::PowerFlow);
         let tiles = build_tiles(&store, &dashboard);
         match &tiles[0] {
-            TileVM::Entity(vm) => assert_eq!(vm.state, "unavailable"),
-            other => panic!("expected EntityTileVM (PowerFlow fallback), got {other:?}"),
+            TileVM::PowerFlow(vm) => {
+                assert!(vm.grid_w.is_none(), "unavailable → grid_w=None");
+            }
+            other => panic!("expected PowerFlowTileVM, got {other:?}"),
         }
     }
 
