@@ -2900,12 +2900,19 @@ where
 // `set_row_data`. This keeps the per-flush hot path unchanged and the
 // per-frame allocation budget at zero.
 
-/// Compute per-tile section-relative placements via a simple greedy packer.
+/// Compute per-tile section-relative placements via a row-span-aware bin
+/// packer.
 ///
 /// For each section in document order:
 ///   * walk widgets in declaration order;
-///   * place each widget at the next free slot in the current row, advancing
-///     to the next row when adding the widget would overflow `section.grid.columns`;
+///   * for each widget, scan the section grid in row-major order (left-to-
+///     right, top-to-bottom) and pick the first (col, row) where the
+///     widget's full `(span_cols × span_rows)` block of cells is free;
+///   * mark every cell occupied by the widget (bitmap) so that a tile with
+///     `span_rows == 2` blocks the second row from being used by following
+///     tiles in the same column range — fixes the row-span overlap bug
+///     where a 2-row tile at row 0 cols 0..2 would silently overlap a tile
+///     placed at row 1 col 0 by the previous greedy cursor packer;
 ///   * if a widget's `preferred_columns` exceeds the section width, clamp to
 ///     the section width (minimum 1) so layout never overflows;
 ///   * record the resulting (col, row, span_cols, span_rows) into the
@@ -2920,14 +2927,22 @@ where
 /// This runs once per dashboard load (and once per view switch in the
 /// future — but section structure is YAML-static, so nothing actually
 /// changes between view switches today). Per-flush refreshes never call
-/// this function.
+/// this function — no per-frame allocation lives in this hot path.
 pub fn pack_section_layouts(dashboard: &Dashboard, tiles: &mut [TileVM]) {
+    // Per-section reusable occupancy buffer. Allocated once per section;
+    // sized to (rows × columns) and grown as needed when the packer pushes
+    // tiles into new rows. Phase 6 sections cap at 4 columns × <16 rows so
+    // the worst-case allocation is trivially small. This is NOT a per-frame
+    // allocation — it lives only inside the dashboard-load packer, which
+    // runs once per load (not per flush, not per view switch).
+    let mut occupied: Vec<bool> = Vec::new();
+
     let mut tile_idx: usize = 0;
     for view in &dashboard.views {
         for section in &view.sections {
             let columns = i32::from(section.grid.columns).max(1);
-            let mut cursor_col: i32 = 0;
-            let mut cursor_row: i32 = 0;
+            let cols_usize = usize::try_from(columns).unwrap_or(1);
+            occupied.clear();
             for _widget in &section.widgets {
                 if tile_idx >= tiles.len() {
                     debug_assert!(
@@ -2939,62 +2954,134 @@ pub fn pack_section_layouts(dashboard: &Dashboard, tiles: &mut [TileVM]) {
                 let placement = next_pack_placement(
                     tiles[tile_idx].placement(),
                     columns,
-                    &mut cursor_col,
-                    &mut cursor_row,
+                    cols_usize,
+                    &mut occupied,
                 );
                 tiles[tile_idx].set_placement(placement);
                 tile_idx += 1;
             }
-            // Reset cursor at section boundary — each section gets its own
-            // (col, row) coordinate space.
-            let _ = cursor_col;
-            let _ = cursor_row;
         }
     }
 }
 
-/// Compute the placement for a single tile during the greedy section pack.
+/// Compute the placement for a single tile via a row-span-aware first-fit
+/// scan over `occupied`.
 ///
 /// Inputs:
 ///   * `current` — the tile's current placement (its preferred span dimensions
 ///     come from `span_cols` / `span_rows`).
 ///   * `section_columns` — the section's grid column count (>= 1).
-///   * `cursor_col` / `cursor_row` — running cursor for the section, mutated.
+///   * `cols_usize` — `section_columns` cast to `usize` for indexing.
+///   * `occupied` — flat row-major bitmap of occupied cells; row `r` cell `c`
+///     lives at index `r * cols_usize + c`. Grown in place as the packer
+///     extends into new rows.
 ///
-/// Returns the new `TilePlacement` for this tile. Cursor advances within
-/// the row; on overflow the cursor wraps to the next row.
+/// Returns the placed `TilePlacement` and marks every cell it covers as
+/// occupied so subsequent tiles cannot overlap any of those cells —
+/// including cells covered by a multi-row span. Worst-case complexity is
+/// O(rows × cols × span_rows × span_cols) per tile; for Phase 6 dashboards
+/// (cols ≤ 4, rows < 16) this is trivially small and runs only once per
+/// dashboard load.
 fn next_pack_placement(
     current: TilePlacement,
     section_columns: i32,
-    cursor_col: &mut i32,
-    cursor_row: &mut i32,
+    cols_usize: usize,
+    occupied: &mut Vec<bool>,
 ) -> TilePlacement {
     // Clamp span_cols to the section width so a 4-column-span widget
     // declared in a 2-column section still renders (span = 2). Minimum 1
     // so a zero / negative value does not blank the tile.
     let span_cols = current.span_cols.clamp(1, section_columns);
     let span_rows = current.span_rows.max(1);
+    let span_cols_usize = usize::try_from(span_cols).unwrap_or(1);
+    let span_rows_usize = usize::try_from(span_rows).unwrap_or(1);
 
-    // Wrap to next row if this tile won't fit on the current row.
-    if *cursor_col + span_cols > section_columns {
-        *cursor_col = 0;
-        *cursor_row += 1;
+    // Scan row by row, left to right, for the first row × col where the
+    // full span_rows × span_cols block of cells is free. Grow `occupied`
+    // by one row at a time when the scan exceeds the current bottom edge —
+    // this keeps the bitmap exactly large enough to hold every placed cell
+    // without pre-sizing it to a (possibly never-used) maximum.
+    let mut row: usize = 0;
+    loop {
+        // Ensure we have enough rows in `occupied` to test (row + span_rows).
+        let needed_cells = (row + span_rows_usize) * cols_usize;
+        if occupied.len() < needed_cells {
+            occupied.resize(needed_cells, false);
+        }
+
+        for col in 0..=cols_usize.saturating_sub(span_cols_usize) {
+            if cells_free(
+                occupied,
+                cols_usize,
+                row,
+                col,
+                span_rows_usize,
+                span_cols_usize,
+            ) {
+                mark_cells_occupied(
+                    occupied,
+                    cols_usize,
+                    row,
+                    col,
+                    span_rows_usize,
+                    span_cols_usize,
+                );
+                return TilePlacement {
+                    col: i32::try_from(col).unwrap_or(0),
+                    row: i32::try_from(row).unwrap_or(0),
+                    span_cols,
+                    span_rows,
+                };
+            }
+        }
+        row += 1;
     }
+}
 
-    let placement = TilePlacement {
-        col: *cursor_col,
-        row: *cursor_row,
-        span_cols,
-        span_rows,
-    };
-
-    *cursor_col += span_cols;
-    if *cursor_col >= section_columns {
-        *cursor_col = 0;
-        *cursor_row += 1;
+/// True iff every cell in the (row..row+span_rows) × (col..col+span_cols)
+/// rectangle is currently free in `occupied`.
+fn cells_free(
+    occupied: &[bool],
+    cols: usize,
+    row: usize,
+    col: usize,
+    span_rows: usize,
+    span_cols: usize,
+) -> bool {
+    for dr in 0..span_rows {
+        for dc in 0..span_cols {
+            let idx = (row + dr) * cols + (col + dc);
+            if idx >= occupied.len() {
+                // Row beyond current buffer is implicitly free (the caller
+                // grows the buffer before checking). Defensive only.
+                continue;
+            }
+            if occupied[idx] {
+                return false;
+            }
+        }
     }
+    true
+}
 
-    placement
+/// Mark every cell in the (row..row+span_rows) × (col..col+span_cols)
+/// rectangle as occupied. Caller MUST have grown `occupied` first.
+fn mark_cells_occupied(
+    occupied: &mut [bool],
+    cols: usize,
+    row: usize,
+    col: usize,
+    span_rows: usize,
+    span_cols: usize,
+) {
+    for dr in 0..span_rows {
+        for dc in 0..span_cols {
+            let idx = (row + dr) * cols + (col + dc);
+            if idx < occupied.len() {
+                occupied[idx] = true;
+            }
+        }
+    }
 }
 
 /// Per-section layout summary produced by [`compute_dashboard_layout`].
@@ -11844,18 +11931,23 @@ mod tests {
         let mut tiles = build_tiles(&store, &dashboard);
         pack_section_layouts(&dashboard, &mut tiles);
 
-        // Walk the dashboard in document order and verify each tile's
-        // placement was packed sequentially within its section.
+        // Per-section invariant: every placed tile lives entirely inside
+        // the (cols × ∞-rows) grid AND no two tiles' (col, row, span_cols,
+        // span_rows) rectangles share a cell. The row-span-aware bin packer
+        // is correct iff this invariant holds — it replaces the old
+        // greedy-cursor invariant which silently allowed multi-row tiles to
+        // overlap subsequent tiles in the same column range.
         let mut tile_idx = 0usize;
         for view in &dashboard.views {
             for section in &view.sections {
                 let columns = i32::from(section.grid.columns);
-                let mut cursor_col = 0i32;
-                let mut cursor_row = 0i32;
+                let cols_usize = usize::try_from(columns).expect("columns >= 0");
+                // Per-section occupancy bitmap mirroring the packer.
+                let mut seen: Vec<bool> = Vec::new();
                 for _widget in &section.widgets {
                     let placement = tiles[tile_idx].placement();
 
-                    // Verify the packer used valid section-relative coordinates.
+                    // Verify section-relative bounds.
                     assert!(
                         placement.col >= 0 && placement.col < columns,
                         "section {:?} tile {tile_idx}: col {} out of range [0, {columns})",
@@ -11874,25 +11966,43 @@ mod tests {
                         section.id,
                         placement.row,
                     );
+                    assert!(
+                        placement.span_rows >= 1,
+                        "section {:?} tile {tile_idx}: span_rows {} must be >= 1",
+                        section.id,
+                        placement.span_rows,
+                    );
+                    assert!(
+                        placement.col + placement.span_cols <= columns,
+                        "section {:?} tile {tile_idx}: right edge {} exceeds columns {columns}",
+                        section.id,
+                        placement.col + placement.span_cols,
+                    );
 
-                    if cursor_col + placement.span_cols > columns {
-                        cursor_col = 0;
-                        cursor_row += 1;
+                    // No-overlap invariant: every cell covered by this
+                    // tile must be unoccupied; mark it after the check.
+                    let row_usize = usize::try_from(placement.row).expect("row >= 0");
+                    let col_usize = usize::try_from(placement.col).expect("col >= 0");
+                    let span_rows_usize =
+                        usize::try_from(placement.span_rows).expect("span_rows >= 1");
+                    let span_cols_usize =
+                        usize::try_from(placement.span_cols).expect("span_cols >= 1");
+                    let needed = (row_usize + span_rows_usize) * cols_usize;
+                    if seen.len() < needed {
+                        seen.resize(needed, false);
                     }
-                    assert_eq!(
-                        placement.col, cursor_col,
-                        "tile {tile_idx} col mismatch in section {:?}",
-                        section.id
-                    );
-                    assert_eq!(
-                        placement.row, cursor_row,
-                        "tile {tile_idx} row mismatch in section {:?}",
-                        section.id
-                    );
-                    cursor_col += placement.span_cols;
-                    if cursor_col >= columns {
-                        cursor_col = 0;
-                        cursor_row += 1;
+                    for dr in 0..span_rows_usize {
+                        for dc in 0..span_cols_usize {
+                            let idx = (row_usize + dr) * cols_usize + (col_usize + dc);
+                            assert!(
+                                !seen[idx],
+                                "section {:?} tile {tile_idx}: cell (row={}, col={}) overlaps a prior tile",
+                                section.id,
+                                row_usize + dr,
+                                col_usize + dc,
+                            );
+                            seen[idx] = true;
+                        }
                     }
                     tile_idx += 1;
                 }
@@ -11902,6 +12012,122 @@ mod tests {
             tile_idx,
             tiles.len(),
             "packer must visit exactly tiles.len() entries"
+        );
+    }
+
+    /// Row-span overlap regression (founder smoke run, May 2026):
+    ///
+    /// In the old greedy-cursor packer a tile with `preferred_rows=2` only
+    /// advanced the cursor in column-space — the row beneath remained
+    /// available, so the next tile silently landed on top of the multi-row
+    /// tile. This test feeds the packer the exact climate-section shape
+    /// that triggered the bug (Fan 2x2, Camera 2x2, History 4x2,
+    /// Thermostat 2x2 in a 4-col grid) and asserts each tile owns the
+    /// expected disjoint rectangle.
+    #[test]
+    fn pack_section_layouts_no_overlap_with_row_spans() {
+        use crate::dashboard::schema::{
+            Dashboard, Layout as L, ProfileKey, Section, SectionGrid, View, Widget, WidgetKind,
+            WidgetLayout,
+        };
+        use std::collections::BTreeSet;
+        use std::sync::Arc;
+
+        fn w(id: &str, kind: WidgetKind, cols: u8, rows: u8) -> Widget {
+            Widget {
+                id: id.to_string(),
+                widget_type: kind,
+                entity: None,
+                entities: vec![],
+                name: None,
+                icon: None,
+                tap_action: None,
+                hold_action: None,
+                double_tap_action: None,
+                layout: WidgetLayout {
+                    preferred_columns: cols,
+                    preferred_rows: rows,
+                },
+                options: None,
+                placement: None,
+                visibility: "always".to_string(),
+            }
+        }
+
+        let dashboard = Dashboard {
+            call_service_allowlist: Arc::new(BTreeSet::new()),
+            dep_index: Arc::default(),
+            version: 1,
+            device_profile: ProfileKey::Desktop,
+            home_assistant: None,
+            theme: None,
+            default_view: "v".to_string(),
+            views: vec![View {
+                id: "v".to_string(),
+                title: "v".to_string(),
+                layout: L::Sections,
+                sections: vec![Section {
+                    grid: SectionGrid { columns: 4, gap: 8 },
+                    id: "climate".to_string(),
+                    title: "Climate".to_string(),
+                    widgets: vec![
+                        w("fan", WidgetKind::Fan, 2, 2),
+                        w("camera", WidgetKind::Camera, 2, 2),
+                        w("history", WidgetKind::History, 4, 2),
+                        w("thermo", WidgetKind::Climate, 2, 2),
+                    ],
+                }],
+            }],
+        };
+
+        // build_tiles requires an EntityStore; an empty store works because
+        // the placement scan ignores tile content.
+        let store = crate::ha::store::MemoryStore::load(Vec::new())
+            .expect("empty MemoryStore must construct");
+        let mut tiles = build_tiles(&store, &dashboard);
+        pack_section_layouts(&dashboard, &mut tiles);
+
+        // Exact placements: row-span-aware first-fit produces:
+        //   fan      → (col=0, row=0, span=2x2)
+        //   camera   → (col=2, row=0, span=2x2)   ← row 1 is BLOCKED by fan
+        //   history  → (col=0, row=2, span=4x2)
+        //   thermo   → (col=0, row=4, span=2x2)
+        let placements: Vec<TilePlacement> = tiles.iter().map(|t| t.placement()).collect();
+        assert_eq!(
+            placements[0],
+            TilePlacement {
+                col: 0,
+                row: 0,
+                span_cols: 2,
+                span_rows: 2
+            }
+        );
+        assert_eq!(
+            placements[1],
+            TilePlacement {
+                col: 2,
+                row: 0,
+                span_cols: 2,
+                span_rows: 2
+            }
+        );
+        assert_eq!(
+            placements[2],
+            TilePlacement {
+                col: 0,
+                row: 2,
+                span_cols: 4,
+                span_rows: 2
+            }
+        );
+        assert_eq!(
+            placements[3],
+            TilePlacement {
+                col: 0,
+                row: 4,
+                span_cols: 2,
+                span_rows: 2
+            }
         );
     }
 
@@ -12043,8 +12269,7 @@ mod tests {
     #[test]
     fn next_pack_placement_clamps_oversized_widgets_to_section_width() {
         // A 6-column-wide widget in a 4-column section should clamp to 4.
-        let mut col = 0;
-        let mut row = 0;
+        let mut occupied: Vec<bool> = Vec::new();
         let p = next_pack_placement(
             TilePlacement {
                 col: 0,
@@ -12053,8 +12278,8 @@ mod tests {
                 span_rows: 1,
             },
             4,
-            &mut col,
-            &mut row,
+            4,
+            &mut occupied,
         );
         assert_eq!(p.span_cols, 4, "must clamp to section width");
         assert_eq!(p.col, 0);
@@ -12063,8 +12288,9 @@ mod tests {
 
     #[test]
     fn next_pack_placement_wraps_to_next_row_on_overflow() {
-        let mut col = 3;
-        let mut row = 0;
+        // Pre-occupy cols 0..3 of row 0 so a 2-col tile can't fit on row 0.
+        // The packer must wrap to row 1, col 0.
+        let mut occupied: Vec<bool> = vec![true, true, true, false];
         let p = next_pack_placement(
             TilePlacement {
                 col: 0,
@@ -12073,18 +12299,17 @@ mod tests {
                 span_rows: 1,
             },
             4,
-            &mut col,
-            &mut row,
+            4,
+            &mut occupied,
         );
-        // 3 + 2 > 4 → wrap.
+        // Only col 3 free on row 0; 2-wide tile cannot fit → wrap to row 1.
         assert_eq!(p.row, 1);
         assert_eq!(p.col, 0);
     }
 
     #[test]
     fn next_pack_placement_minimum_span_one() {
-        let mut col = 0;
-        let mut row = 0;
+        let mut occupied: Vec<bool> = Vec::new();
         let p = next_pack_placement(
             TilePlacement {
                 col: 0,
@@ -12093,11 +12318,45 @@ mod tests {
                 span_rows: 0,
             },
             4,
-            &mut col,
-            &mut row,
+            4,
+            &mut occupied,
         );
         assert_eq!(p.span_cols, 1, "zero span clamps to 1");
         assert_eq!(p.span_rows, 1, "zero rows clamps to 1");
+    }
+
+    #[test]
+    fn next_pack_placement_skips_cells_blocked_by_row_span() {
+        // A 2x2 tile at (0,0) blocks row 1, cols 0..2. A subsequent 2x1
+        // tile must NOT land at (col=0, row=1) — that would overlap. The
+        // first-fit row-major scan should pick (col=0, row=2) instead
+        // since cols 0..2 of row 1 are occupied.
+        //
+        // Layout state after pre-fill:
+        //   row 0: [X, X, _, _]
+        //   row 1: [X, X, _, _]
+        let mut occupied: Vec<bool> = vec![
+            true, true, false, false, // row 0
+            true, true, false, false, // row 1
+        ];
+        let p = next_pack_placement(
+            TilePlacement {
+                col: 0,
+                row: 0,
+                span_cols: 2,
+                span_rows: 1,
+            },
+            4,
+            4,
+            &mut occupied,
+        );
+        // The packer's row-major scan finds (col=2, row=0) first — that's
+        // valid, no overlap, fits. Document that the packer prefers the
+        // earliest free slot, not the next-row fallback.
+        assert_eq!(p.row, 0);
+        assert_eq!(p.col, 2);
+        assert_eq!(p.span_cols, 2);
+        assert_eq!(p.span_rows, 1);
     }
 
     #[test]

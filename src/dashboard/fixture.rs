@@ -412,10 +412,18 @@ fn energy_section() -> Section {
 
 /// Build a hand-constructed [`Dashboard`] suitable for the `--fixture` path.
 ///
-/// Produces one View `home` with multiple Sections so all widgets render in
-/// the single-view Slint MainWindow without needing the view-router. Covers
-/// every Phase 6 [`WidgetKind`] variant — see the module-level docs for the
-/// full list.
+/// Produces four Views — `home`, `security`, `media`, `energy` — that mirror
+/// the structure of `examples/dashboard.yaml` so the no-HA smoke run
+/// exercises the ViewSwitcher tab strip in addition to all Phase 6 widget
+/// kinds. Covers every Phase 6 [`WidgetKind`] variant; see the module-level
+/// docs for the full list.
+///
+/// History: prior to the May 2026 founder smoke run this fixture collapsed
+/// every section into a single `home` view. The single-view shape silently
+/// hid the ViewSwitcher (which auto-suppresses for `views.length < 2`),
+/// making it impossible to preview view-switching without a live HA
+/// backend. The multi-view layout below restores parity with
+/// `examples/dashboard.yaml` so visual smoke covers the tab-strip path.
 ///
 /// This function is called only from `src/lib.rs`'s `run_with_memory_store`
 /// path (i.e. `--fixture <file>`) and from unit tests. The production
@@ -429,19 +437,36 @@ pub fn fixture_dashboard() -> Dashboard {
         home_assistant: None,
         theme: None,
         default_view: "home".to_string(),
-        views: vec![View {
-            id: "home".to_string(),
-            title: "Home".to_string(),
-            layout: Layout::Sections,
-            sections: vec![
-                overview_section(),
-                climate_section(),
-                access_section(),
-                alarm_section(),
-                media_section(),
-                energy_section(),
-            ],
-        }],
+        views: vec![
+            // Home view — Phase 1 overview tiles + climate widgets.
+            View {
+                id: "home".to_string(),
+                title: "Home".to_string(),
+                layout: Layout::Sections,
+                sections: vec![overview_section(), climate_section()],
+            },
+            // Security view — locks, cover, alarm.
+            View {
+                id: "security".to_string(),
+                title: "Security".to_string(),
+                layout: Layout::Sections,
+                sections: vec![access_section(), alarm_section()],
+            },
+            // Media view — TV / media-player tile.
+            View {
+                id: "media".to_string(),
+                title: "Media".to_string(),
+                layout: Layout::Sections,
+                sections: vec![media_section()],
+            },
+            // Energy view — power-flow tile.
+            View {
+                id: "energy".to_string(),
+                title: "Energy".to_string(),
+                layout: Layout::Sections,
+                sections: vec![energy_section()],
+            },
+        ],
     }
 }
 
@@ -472,27 +497,66 @@ mod tests {
     }
 
     #[test]
-    fn fixture_dashboard_contains_one_view() {
-        // The fixture intentionally collapses every Phase 6 widget into the
-        // single `home` view so the Slint MainWindow renders all of them on
-        // one screen without invoking the view-router.
+    fn fixture_dashboard_contains_four_views() {
+        // Mirrors `examples/dashboard.yaml`: home / security / media /
+        // energy. Multi-view shape exercises the ViewSwitcher tab strip
+        // in the `--fixture` smoke run, which auto-suppresses on
+        // single-view dashboards.
         let d = fixture_dashboard();
-        assert_eq!(d.views.len(), 1);
-        let view = &d.views[0];
-        assert_eq!(view.id, "home");
-        assert_eq!(view.layout, Layout::Sections);
+        assert_eq!(d.views.len(), 4);
+        let ids: Vec<&str> = d.views.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(ids, vec!["home", "security", "media", "energy"]);
+        let titles: Vec<&str> = d.views.iter().map(|v| v.title.as_str()).collect();
+        assert_eq!(titles, vec!["Home", "Security", "Media", "Energy"]);
+        for view in &d.views {
+            assert_eq!(
+                view.layout,
+                Layout::Sections,
+                "every fixture view must use Layout::Sections"
+            );
+        }
     }
 
     #[test]
     fn fixture_dashboard_has_multiple_sections() {
         // Phase 6 widget showcase requires multiple sections grouped by
-        // function (overview, climate, access, alarm, media, energy).
+        // function (overview, climate, access, alarm, media, energy)
+        // distributed across four views.
         let d = fixture_dashboard();
+        let total_sections: usize = d.views.iter().map(|v| v.sections.len()).sum();
         assert_eq!(
-            d.views[0].sections.len(),
-            6,
-            "fixture must have 6 sections to group all Phase 6 widget kinds"
+            total_sections, 6,
+            "fixture must have 6 sections total to group all Phase 6 widget kinds"
         );
+    }
+
+    #[test]
+    fn fixture_dashboard_default_view_resolves_to_a_real_view() {
+        // The default-view id must point at a real view; otherwise the
+        // ViewSwitcher cannot select an active tab at startup.
+        let d = fixture_dashboard();
+        assert!(
+            d.views.iter().any(|v| v.id == d.default_view),
+            "default_view {:?} must match an existing view id",
+            d.default_view
+        );
+    }
+
+    #[test]
+    fn fixture_dashboard_view_section_ids_match_yaml_grouping() {
+        // Sanity-check the founder-visible grouping: home owns overview +
+        // climate; security owns access + alarm; media owns media; energy
+        // owns power_overview. Mirrors `examples/dashboard.yaml`.
+        let d = fixture_dashboard();
+        let by_view: Vec<Vec<&str>> = d
+            .views
+            .iter()
+            .map(|v| v.sections.iter().map(|s| s.id.as_str()).collect())
+            .collect();
+        assert_eq!(by_view[0], vec!["overview", "climate"]);
+        assert_eq!(by_view[1], vec!["access", "alarm"]);
+        assert_eq!(by_view[2], vec!["media"]);
+        assert_eq!(by_view[3], vec!["power_overview"]);
     }
 
     #[test]

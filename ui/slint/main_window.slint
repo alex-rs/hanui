@@ -49,6 +49,7 @@ import { GestureConfigGlobal } from "gesture_config.slint";
 import { ViewRouterGlobal } from "view_router.slint";
 import { MoreInfoModal, ModalRowVM } from "more_info.slint";
 import { Toast } from "toast.slint";
+import { ScrollView } from "std-widgets.slint";
 
 export { AnimationBudget } from "card_base.slint";
 export { GestureConfigGlobal } from "gesture_config.slint";
@@ -184,13 +185,18 @@ export component MainWindow inherits Window {
     preferred-width: 480px;
     preferred-height: 600px;
 
-    // ── Top-level layout (Phase 6 cosmetic polish) ──────────────────────
+    // ── Top-level layout (Phase 6 cosmetic polish + scroll fix) ─────────
     //
     // Three vertical bands:
     //   1. Optional ViewSwitcher tab strip at the top (height 40 px) when
-    //      the dashboard has ≥ 2 views.
-    //   2. Section-driven content area: each visible section renders a
-    //      title header followed by a 4-column grid of its tiles.
+    //      the dashboard has ≥ 2 views — fixed, NOT inside the scroll
+    //      viewport so the tabs stay visible while scrolling content.
+    //   2. Scroll viewport wrapping the section-driven content area.
+    //      Each visible section renders a title header followed by a
+    //      4-column grid of its tiles. The ScrollView gives the dashboard
+    //      a scrollbar when total content height exceeds the window —
+    //      previously a 600px window silently clipped the lower sections
+    //      (founder smoke run May 2026, fix per task/phase6-layout-multiview-fix).
     //   3. Legacy flat per-kind path (when `sections` is empty): preserves
     //      pre-polish behaviour for callers that have not yet called
     //      `wire_dashboard_layout`. The headless wire_window tests use this
@@ -218,8 +224,22 @@ export component MainWindow inherits Window {
             }
         }
 
-        // 2) Section-driven layout. Each section renders only when its
-        //    `view-index` matches the active view. Each section gets:
+        // 2) Scroll viewport for the section-driven layout. The ScrollView
+        //    sizes its inner viewport to the natural height of the content
+        //    (sum of section heights), and the outer ScrollView clamps to
+        //    the available window height — anything above the cap becomes
+        //    a scrollable overflow. No animations in this container; the
+        //    ScrollView's built-in scroll-bar is a static affordance.
+        //    Animation capped at DEFAULT_PROFILE.animation_framerate_cap
+        //    per PHASES.md performance budgets — N/A here (no animation).
+        ScrollView {
+            // The viewport holds one VerticalLayout containing every
+            // section. The layout's height drives the scroll-bar range.
+            VerticalLayout {
+                spacing: Theme.space-2;
+
+        // Each section renders only when its `view-index` matches the
+        //    active view. Each section gets:
         //    - a title header (Text)
         //    - a content area sized to `num-rows * grid-row-height`,
         //      containing absolute-positioned tiles whose (col, row,
@@ -498,6 +518,8 @@ export component MainWindow inherits Window {
                 }
             }
         }
+            }   // close scroll-viewport VerticalLayout
+        }       // close ScrollView
 
         // 3) Legacy flat-per-kind fallback. Renders only when no sections
         //    are configured (e.g. `wire_window`-only test paths). Keeping
