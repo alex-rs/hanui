@@ -5455,7 +5455,7 @@ mod tests {
                 icon_id: "mdi:window-shutter-open".into(),
                 preferred_columns: 2,
                 preferred_rows: 2,
-                placement: placement.clone(),
+                placement,
                 pending: false,
             }),
             TileVM::Fan(FanTileVM {
@@ -5469,7 +5469,7 @@ mod tests {
                 icon_id: "mdi:fan".into(),
                 preferred_columns: 2,
                 preferred_rows: 2,
-                placement: placement.clone(),
+                placement,
                 pending: false,
             }),
             TileVM::Lock(LockTileVM {
@@ -5479,7 +5479,7 @@ mod tests {
                 icon_id: "mdi:lock".into(),
                 preferred_columns: 2,
                 preferred_rows: 2,
-                placement: placement.clone(),
+                placement,
                 pending: false,
             }),
             TileVM::Alarm(AlarmTileVM {
@@ -5491,7 +5491,7 @@ mod tests {
                 icon_id: "mdi:shield-home".into(),
                 preferred_columns: 2,
                 preferred_rows: 2,
-                placement: placement.clone(),
+                placement,
                 pending: false,
             }),
             TileVM::History(HistoryGraphTileVM {
@@ -5502,7 +5502,7 @@ mod tests {
                 icon_id: "mdi:chart-line".into(),
                 preferred_columns: 2,
                 preferred_rows: 2,
-                placement: placement.clone(),
+                placement,
                 pending: false,
                 path_commands: "M 0 0 L 1 1".into(),
             }),
@@ -5515,7 +5515,7 @@ mod tests {
                 icon_id: "mdi:cctv".into(),
                 preferred_columns: 2,
                 preferred_rows: 2,
-                placement: placement.clone(),
+                placement,
                 pending: false,
             }),
             TileVM::Climate(ClimateTileVM {
@@ -5527,7 +5527,7 @@ mod tests {
                 icon_id: "mdi:thermostat".into(),
                 preferred_columns: 2,
                 preferred_rows: 2,
-                placement: placement.clone(),
+                placement,
                 pending: false,
             }),
             TileVM::MediaPlayer(MediaPlayerTileVM {
@@ -5540,7 +5540,7 @@ mod tests {
                 icon_id: "mdi:speaker".into(),
                 preferred_columns: 2,
                 preferred_rows: 2,
-                placement: placement.clone(),
+                placement,
                 pending: false,
             }),
             TileVM::PowerFlow(PowerFlowTileVM {
@@ -5688,7 +5688,7 @@ mod tests {
                 icon_id: "mdi:thermostat".into(),
                 preferred_columns: 2,
                 preferred_rows: 2,
-                placement: placement.clone(),
+                placement,
                 pending: false,
             }),
             TileVM::MediaPlayer(MediaPlayerTileVM {
@@ -5701,7 +5701,7 @@ mod tests {
                 icon_id: "mdi:speaker".into(),
                 preferred_columns: 2,
                 preferred_rows: 2,
-                placement: placement.clone(),
+                placement,
                 pending: false,
             }),
             TileVM::PowerFlow(PowerFlowTileVM {
