@@ -476,7 +476,7 @@ mod tests {
             let img = resolve(id);
             let img_pixels = img
                 .to_rgba8()
-                .unwrap_or_else(|| panic!("{id}: image must have rgba8 pixel data"));
+                .expect("phase6 icon: image must have rgba8 pixel data");
             assert_ne!(
                 img_pixels.as_bytes(),
                 fb_pixels.as_bytes(),
