@@ -38,8 +38,11 @@
 //!
 //! # Licensing
 //!
-//! The embedded icons (`lightbulb`, `thermometer`, `help-circle`) are sourced
-//! from the Material Design Icons project
+//! The embedded icons (`lightbulb`, `thermometer`, `help-circle`, plus the
+//! Phase 6 expansion: `fan`, `door-closed-lock`, `garage`, `shield-home`,
+//! `lightning-bolt`, `lightning-bolt-circle`, `camera`, `ceiling-light`,
+//! `thermostat`, `television-play`, `window-shutter`, `home-assistant`,
+//! `motion-sensor`) are sourced from the Material Design Icons project
 //! (<https://github.com/Templarian/MaterialDesign-SVG>), distributed under the
 //! Apache License 2.0.
 
@@ -60,6 +63,24 @@ use crate::dashboard::profiles::PROFILE_DESKTOP;
 const LIGHTBULB_SVG: &[u8] = include_bytes!("../../assets/icons/mdi/lightbulb.svg");
 const THERMOMETER_SVG: &[u8] = include_bytes!("../../assets/icons/mdi/thermometer.svg");
 const FALLBACK_SVG: &[u8] = include_bytes!("../../assets/icons/mdi/help-circle.svg");
+
+// Phase 6 expansion: every `mdi:*` identifier referenced by
+// `examples/dashboard.yaml` and `fixture_dashboard()` must resolve to a real
+// asset (non-fallback) per locked_decisions.icon_registry_completeness.
+const FAN_SVG: &[u8] = include_bytes!("../../assets/icons/mdi/fan.svg");
+const DOOR_CLOSED_LOCK_SVG: &[u8] = include_bytes!("../../assets/icons/mdi/door-closed-lock.svg");
+const GARAGE_SVG: &[u8] = include_bytes!("../../assets/icons/mdi/garage.svg");
+const SHIELD_HOME_SVG: &[u8] = include_bytes!("../../assets/icons/mdi/shield-home.svg");
+const LIGHTNING_BOLT_SVG: &[u8] = include_bytes!("../../assets/icons/mdi/lightning-bolt.svg");
+const LIGHTNING_BOLT_CIRCLE_SVG: &[u8] =
+    include_bytes!("../../assets/icons/mdi/lightning-bolt-circle.svg");
+const CAMERA_SVG: &[u8] = include_bytes!("../../assets/icons/mdi/camera.svg");
+const CEILING_LIGHT_SVG: &[u8] = include_bytes!("../../assets/icons/mdi/ceiling-light.svg");
+const THERMOSTAT_SVG: &[u8] = include_bytes!("../../assets/icons/mdi/thermostat.svg");
+const TELEVISION_PLAY_SVG: &[u8] = include_bytes!("../../assets/icons/mdi/television-play.svg");
+const WINDOW_SHUTTER_SVG: &[u8] = include_bytes!("../../assets/icons/mdi/window-shutter.svg");
+const HOME_ASSISTANT_SVG: &[u8] = include_bytes!("../../assets/icons/mdi/home-assistant.svg");
+const MOTION_SENSOR_SVG: &[u8] = include_bytes!("../../assets/icons/mdi/motion-sensor.svg");
 
 // ---------------------------------------------------------------------------
 // Thread-safety wrapper
@@ -126,6 +147,63 @@ pub fn init() {
         map.insert(
             "mdi:help-circle",
             Arc::new(SyncImage(rasterize(FALLBACK_SVG, max_px))),
+        );
+
+        // Phase 6 expansion. Every `mdi:*` referenced by
+        // `examples/dashboard.yaml` and `fixture_dashboard()` is registered
+        // here so that no widget falls back to the question-mark glyph.
+        // Adding a new identifier: drop the SVG under `assets/icons/mdi/`,
+        // add an `include_bytes!` constant above, and append a `map.insert`
+        // call here. Each rasterization is one-shot (during `init`) and
+        // produces a `SharedPixelBuffer`-backed `Image` (Send + Sync).
+        map.insert("mdi:fan", Arc::new(SyncImage(rasterize(FAN_SVG, max_px))));
+        map.insert(
+            "mdi:door-closed-lock",
+            Arc::new(SyncImage(rasterize(DOOR_CLOSED_LOCK_SVG, max_px))),
+        );
+        map.insert(
+            "mdi:garage",
+            Arc::new(SyncImage(rasterize(GARAGE_SVG, max_px))),
+        );
+        map.insert(
+            "mdi:shield-home",
+            Arc::new(SyncImage(rasterize(SHIELD_HOME_SVG, max_px))),
+        );
+        map.insert(
+            "mdi:lightning-bolt",
+            Arc::new(SyncImage(rasterize(LIGHTNING_BOLT_SVG, max_px))),
+        );
+        map.insert(
+            "mdi:lightning-bolt-circle",
+            Arc::new(SyncImage(rasterize(LIGHTNING_BOLT_CIRCLE_SVG, max_px))),
+        );
+        map.insert(
+            "mdi:camera",
+            Arc::new(SyncImage(rasterize(CAMERA_SVG, max_px))),
+        );
+        map.insert(
+            "mdi:ceiling-light",
+            Arc::new(SyncImage(rasterize(CEILING_LIGHT_SVG, max_px))),
+        );
+        map.insert(
+            "mdi:thermostat",
+            Arc::new(SyncImage(rasterize(THERMOSTAT_SVG, max_px))),
+        );
+        map.insert(
+            "mdi:television-play",
+            Arc::new(SyncImage(rasterize(TELEVISION_PLAY_SVG, max_px))),
+        );
+        map.insert(
+            "mdi:window-shutter",
+            Arc::new(SyncImage(rasterize(WINDOW_SHUTTER_SVG, max_px))),
+        );
+        map.insert(
+            "mdi:home-assistant",
+            Arc::new(SyncImage(rasterize(HOME_ASSISTANT_SVG, max_px))),
+        );
+        map.insert(
+            "mdi:motion-sensor",
+            Arc::new(SyncImage(rasterize(MOTION_SENSOR_SVG, max_px))),
         );
         map
     });
@@ -360,6 +438,50 @@ mod tests {
         ensure_init();
         for id in &["mdi:lightbulb", "mdi:thermometer", "mdi:help-circle"] {
             let img = resolve(id);
+            assert!(img.size().width > 0, "{id}: width must be > 0");
+            assert!(img.size().height > 0, "{id}: height must be > 0");
+        }
+    }
+
+    /// Phase 6 dashboard icon-registry expansion regression guard.
+    ///
+    /// Every `mdi:*` identifier referenced by `examples/dashboard.yaml` /
+    /// `fixture_dashboard()` MUST resolve to a real (non-fallback) raster.
+    /// Previously the bridge fell back to `mdi:help-circle` for any name
+    /// other than the three Phase 1 icons, producing a question-mark glyph
+    /// on every Phase 6 tile. This test pins each name to a distinct raster.
+    #[test]
+    fn phase6_mdi_icons_all_resolve_to_non_fallback_rasters() {
+        ensure_init();
+        let fallback = resolve("mdi:help-circle");
+        let fb_pixels = fallback
+            .to_rgba8()
+            .expect("fallback icon must have rgba8 pixel data");
+
+        for id in &[
+            "mdi:fan",
+            "mdi:door-closed-lock",
+            "mdi:garage",
+            "mdi:shield-home",
+            "mdi:lightning-bolt",
+            "mdi:lightning-bolt-circle",
+            "mdi:camera",
+            "mdi:ceiling-light",
+            "mdi:thermostat",
+            "mdi:television-play",
+            "mdi:window-shutter",
+            "mdi:home-assistant",
+            "mdi:motion-sensor",
+        ] {
+            let img = resolve(id);
+            let img_pixels = img
+                .to_rgba8()
+                .expect("phase6 icon: image must have rgba8 pixel data");
+            assert_ne!(
+                img_pixels.as_bytes(),
+                fb_pixels.as_bytes(),
+                "{id} must resolve to a real raster, not the help-circle fallback"
+            );
             assert!(img.size().width > 0, "{id}: width must be > 0");
             assert!(img.size().height > 0, "{id}: height must be > 0");
         }

@@ -44,6 +44,7 @@ import { CameraSnapshotTile, CameraTileVM, CameraTilePlacement } from "camera_sn
 import { ClimateTile, ClimateTileVM, ClimateTilePlacement } from "climate_tile.slint";
 import { MediaPlayerTile, MediaPlayerTileVM, MediaPlayerTilePlacement } from "media_player_tile.slint";
 import { PowerFlowTile, PowerFlowTileVM, PowerFlowTilePlacement } from "power_flow_tile.slint";
+import { ViewSwitcher, ViewMeta } from "view_switcher.slint";
 import { GestureConfigGlobal } from "gesture_config.slint";
 import { ViewRouterGlobal } from "view_router.slint";
 import { MoreInfoModal, ModalRowVM } from "more_info.slint";
@@ -53,6 +54,46 @@ export { AnimationBudget } from "card_base.slint";
 export { GestureConfigGlobal } from "gesture_config.slint";
 export { ViewRouterGlobal } from "view_router.slint";
 export { ModalRowVM } from "more_info.slint";
+export { ViewMeta } from "view_switcher.slint";
+
+// SectionVM — Phase-6-cosmetic-polish: per-section metadata produced once
+// at dashboard load by the Rust bridge (`compute_dashboard_layout`).
+//
+// `view-index` lets MainWindow filter sections by the active view without
+// rebuilding the per-kind tile arrays — Slint's `if section.view-index ==
+// active-view-index` inside the section `for` is the gate.
+//
+// `num-rows` is the packer's height computation for the section (number of
+// 1-unit grid rows occupied by all of its widgets after the simple greedy
+// 4-column pack). Used to size the per-section content rectangle so absolute
+// positioning of tiles (taken from each tile VM's `placement` field) renders
+// at the correct height.
+//
+// All fields are immutable for the lifetime of the dashboard load — neither
+// per-frame nor per-flush. View switching just changes `active-view-index`.
+export struct SectionVM {
+    title: string,
+    columns: int,
+    gap: length,
+    view-index: int,
+    num-rows: int,
+}
+
+// TileSlot — Phase-6-cosmetic-polish: flat-list pointer from the section
+// renderer back into the per-kind tile arrays.
+//
+// One slot per widget in document order across all views. The Slint side
+// iterates sections, and within each section iterates `tile-slots` filtered
+// by `section-index`. The slot's `kind` discriminator + `kind-index` then
+// reach into the matching per-kind model for the actual tile data. This
+// keeps the per-kind models (which the live-bridge updates per-flush via
+// `set_row_data`) untouched by layout changes.
+export struct TileSlot {
+    view-index: int,
+    section-index: int,
+    kind: string,
+    kind-index: int,
+}
 
 // MainWindow — the top-level Phase 1 window. Exposes three array properties
 // (one per tile kind) that `wire_window` writes from the typed VM slices,
@@ -88,6 +129,30 @@ export component MainWindow inherits Window {
     in property <[ClimateTileVM]> climate-tiles;
     in property <[MediaPlayerTileVM]> media-player-tiles;
     in property <[PowerFlowTileVM]> power-flow-tiles;
+
+    // ── Phase 6 cosmetic-polish: section + view-switcher properties ─────
+    //
+    // Written ONCE per dashboard load by the Rust bridge
+    // (`compute_dashboard_layout` + `wire_dashboard_layout`). Per-flush
+    // refreshes never touch these; only `light-tiles` / `sensor-tiles` /
+    // … per-kind models update at 12.5 Hz. Switching between views just
+    // mutates `active-view-index`; the bridge does not rebuild any model.
+    //
+    // `views` may be empty for the legacy fixture path that has not yet
+    // called `wire_dashboard_layout`; the `if views.length >= 2` guard
+    // below suppresses the tab strip in that case so a single-view
+    // dashboard does not show a degenerate one-tab strip.
+    in property <[ViewMeta]> views;
+    in property <int> active-view-index: 0;
+    in property <[SectionVM]> sections;
+    in property <[TileSlot]> tile-slots;
+    in property <length> grid-row-height: 96px;
+
+    // Emitted when the user taps a different view tab (or in the future
+    // swipes between views). The Rust bridge updates `active-view-index`
+    // in response. No per-frame work; rebuild is O(sections+slots) and
+    // happens off the per-flush hot path.
+    callback view-changed(int);
     in property <bool> status-banner-visible: false;
 
     // ── More-info modal (TASK-066) ──────────────────────────────────────
@@ -119,51 +184,340 @@ export component MainWindow inherits Window {
     preferred-width: 480px;
     preferred-height: 600px;
 
+    // ── Top-level layout (Phase 6 cosmetic polish) ──────────────────────
+    //
+    // Three vertical bands:
+    //   1. Optional ViewSwitcher tab strip at the top (height 40 px) when
+    //      the dashboard has ≥ 2 views.
+    //   2. Section-driven content area: each visible section renders a
+    //      title header followed by a 4-column grid of its tiles.
+    //   3. Legacy flat per-kind path (when `sections` is empty): preserves
+    //      pre-polish behaviour for callers that have not yet called
+    //      `wire_dashboard_layout`. The headless wire_window tests use this
+    //      branch so they don't need a Dashboard reference.
+    //
+    // Animation capped at DEFAULT_PROFILE.animation_framerate_cap per
+    // PHASES.md performance budgets. No animation lives in this top layout
+    // itself; all motion is inside the per-tile components (CardBase press
+    // feedback, power-flow particles, etc.) which honour AnimationBudget.
     VerticalLayout {
         padding: Theme.space-3;
         spacing: Theme.space-2;
 
-        for tile[i] in root.light-tiles : LightTile {
-            view-model: tile;
+        // 1) View switcher tab strip — only when ≥ 2 views.
+        //    A single-view dashboard hides the strip entirely (no element
+        //    in the Slint tree). Wired via the `view-changed` callback.
+        if root.views.length >= 2 : ViewSwitcher {
+            height: 40px;
+            views: root.views;
+            active-view-index: root.active-view-index;
+            density: "regular";
+            touch-input: false;
+            view-changed(idx) => {
+                root.view-changed(idx);
+            }
         }
-        for tile[i] in root.sensor-tiles : SensorTile {
-            view-model: tile;
+
+        // 2) Section-driven layout. Each section renders only when its
+        //    `view-index` matches the active view. Each section gets:
+        //    - a title header (Text)
+        //    - a content area sized to `num-rows * grid-row-height`,
+        //      containing absolute-positioned tiles whose (col, row,
+        //      span-cols, span-rows) come from the per-kind tile VM's
+        //      `placement` field, packed by the Rust bridge per section.
+        for section[s] in root.sections : Rectangle {
+            // Suppress non-active-view sections by setting height 0; the
+            // Slint `if` cannot live at the top level of a `for`-iterated
+            // child easily, so we collapse the rectangle instead.
+            height: section.view-index == root.active-view-index
+                ? Theme.space-5 + section.num-rows * root.grid-row-height
+                : 0px;
+            visible: section.view-index == root.active-view-index;
+            background: transparent;
+
+            VerticalLayout {
+                spacing: Theme.space-2;
+
+                // Section title header.
+                Text {
+                    text: section.title;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-lg;
+                    font-weight: Theme.font-weight-bold;
+                }
+
+                // Section grid area. Tiles are absolute-positioned within
+                // this rectangle using the (col, row, span-cols, span-rows)
+                // packed by the Rust bridge into each tile VM's placement.
+                Rectangle {
+                    height: section.num-rows * root.grid-row-height;
+                    background: transparent;
+
+                    // Per-section tile dispatch via tile-slots. Each slot
+                    // names a per-kind model index; the slot's `kind`
+                    // discriminator selects which tile component to render.
+                    // Slots whose `section-index` does not match this
+                    // section emit a zero-size placeholder Rectangle (the
+                    // outer wrapper is created for every iteration but the
+                    // inner conditional-`if` content is suppressed).
+                    for slot[i] in root.tile-slots : Rectangle {
+                        background: transparent;
+                        // Visibility flag — `slot.section-index == s` and
+                        // `slot.view-index == active-view-index`.
+                        property <bool> in-section: slot.section-index == s
+                            && slot.view-index == root.active-view-index;
+
+                        // ── Light dispatch ────────────────────────────
+                        if in-section && slot.kind == "light" : LightTile {
+                            x: root.light-tiles[slot.kind-index].placement.col
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                + section.gap / 2;
+                            y: root.light-tiles[slot.kind-index].placement.row
+                                * root.grid-row-height
+                                + section.gap / 2;
+                            width: root.light-tiles[slot.kind-index].placement.span-cols
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                - section.gap;
+                            height: root.light-tiles[slot.kind-index].placement.span-rows
+                                * root.grid-row-height
+                                - section.gap;
+                            view-model: root.light-tiles[slot.kind-index];
+                        }
+
+                        // ── Sensor dispatch ───────────────────────────
+                        if in-section && slot.kind == "sensor" : SensorTile {
+                            x: root.sensor-tiles[slot.kind-index].placement.col
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                + section.gap / 2;
+                            y: root.sensor-tiles[slot.kind-index].placement.row
+                                * root.grid-row-height
+                                + section.gap / 2;
+                            width: root.sensor-tiles[slot.kind-index].placement.span-cols
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                - section.gap;
+                            height: root.sensor-tiles[slot.kind-index].placement.span-rows
+                                * root.grid-row-height
+                                - section.gap;
+                            view-model: root.sensor-tiles[slot.kind-index];
+                        }
+
+                        // ── Entity dispatch ───────────────────────────
+                        if in-section && slot.kind == "entity" : EntityTile {
+                            x: root.entity-tiles[slot.kind-index].placement.col
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                + section.gap / 2;
+                            y: root.entity-tiles[slot.kind-index].placement.row
+                                * root.grid-row-height
+                                + section.gap / 2;
+                            width: root.entity-tiles[slot.kind-index].placement.span-cols
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                - section.gap;
+                            height: root.entity-tiles[slot.kind-index].placement.span-rows
+                                * root.grid-row-height
+                                - section.gap;
+                            view-model: root.entity-tiles[slot.kind-index];
+                        }
+
+                        // ── Cover dispatch ────────────────────────────
+                        if in-section && slot.kind == "cover" : CoverTile {
+                            x: root.cover-tiles[slot.kind-index].placement.col
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                + section.gap / 2;
+                            y: root.cover-tiles[slot.kind-index].placement.row
+                                * root.grid-row-height
+                                + section.gap / 2;
+                            width: root.cover-tiles[slot.kind-index].placement.span-cols
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                - section.gap;
+                            height: root.cover-tiles[slot.kind-index].placement.span-rows
+                                * root.grid-row-height
+                                - section.gap;
+                            view-model: root.cover-tiles[slot.kind-index];
+                        }
+
+                        // ── Fan dispatch ──────────────────────────────
+                        if in-section && slot.kind == "fan" : FanTile {
+                            x: root.fan-tiles[slot.kind-index].placement.col
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                + section.gap / 2;
+                            y: root.fan-tiles[slot.kind-index].placement.row
+                                * root.grid-row-height
+                                + section.gap / 2;
+                            width: root.fan-tiles[slot.kind-index].placement.span-cols
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                - section.gap;
+                            height: root.fan-tiles[slot.kind-index].placement.span-rows
+                                * root.grid-row-height
+                                - section.gap;
+                            view-model: root.fan-tiles[slot.kind-index];
+                        }
+
+                        // ── Lock dispatch ─────────────────────────────
+                        if in-section && slot.kind == "lock" : LockTile {
+                            x: root.lock-tiles[slot.kind-index].placement.col
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                + section.gap / 2;
+                            y: root.lock-tiles[slot.kind-index].placement.row
+                                * root.grid-row-height
+                                + section.gap / 2;
+                            width: root.lock-tiles[slot.kind-index].placement.span-cols
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                - section.gap;
+                            height: root.lock-tiles[slot.kind-index].placement.span-rows
+                                * root.grid-row-height
+                                - section.gap;
+                            view-model: root.lock-tiles[slot.kind-index];
+                        }
+
+                        // ── Alarm dispatch ────────────────────────────
+                        if in-section && slot.kind == "alarm" : AlarmPanelTile {
+                            x: root.alarm-tiles[slot.kind-index].placement.col
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                + section.gap / 2;
+                            y: root.alarm-tiles[slot.kind-index].placement.row
+                                * root.grid-row-height
+                                + section.gap / 2;
+                            width: root.alarm-tiles[slot.kind-index].placement.span-cols
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                - section.gap;
+                            height: root.alarm-tiles[slot.kind-index].placement.span-rows
+                                * root.grid-row-height
+                                - section.gap;
+                            view-model: root.alarm-tiles[slot.kind-index];
+                        }
+
+                        // ── History dispatch ──────────────────────────
+                        if in-section && slot.kind == "history" : HistoryGraphTile {
+                            x: root.history-tiles[slot.kind-index].placement.col
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                + section.gap / 2;
+                            y: root.history-tiles[slot.kind-index].placement.row
+                                * root.grid-row-height
+                                + section.gap / 2;
+                            width: root.history-tiles[slot.kind-index].placement.span-cols
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                - section.gap;
+                            height: root.history-tiles[slot.kind-index].placement.span-rows
+                                * root.grid-row-height
+                                - section.gap;
+                            view-model: root.history-tiles[slot.kind-index];
+                        }
+
+                        // ── Camera dispatch ───────────────────────────
+                        if in-section && slot.kind == "camera" : CameraSnapshotTile {
+                            x: root.camera-tiles[slot.kind-index].placement.col
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                + section.gap / 2;
+                            y: root.camera-tiles[slot.kind-index].placement.row
+                                * root.grid-row-height
+                                + section.gap / 2;
+                            width: root.camera-tiles[slot.kind-index].placement.span-cols
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                - section.gap;
+                            height: root.camera-tiles[slot.kind-index].placement.span-rows
+                                * root.grid-row-height
+                                - section.gap;
+                            view-model: root.camera-tiles[slot.kind-index];
+                        }
+
+                        // ── Climate dispatch ──────────────────────────
+                        if in-section && slot.kind == "climate" : ClimateTile {
+                            x: root.climate-tiles[slot.kind-index].placement.col
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                + section.gap / 2;
+                            y: root.climate-tiles[slot.kind-index].placement.row
+                                * root.grid-row-height
+                                + section.gap / 2;
+                            width: root.climate-tiles[slot.kind-index].placement.span-cols
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                - section.gap;
+                            height: root.climate-tiles[slot.kind-index].placement.span-rows
+                                * root.grid-row-height
+                                - section.gap;
+                            view-model: root.climate-tiles[slot.kind-index];
+                        }
+
+                        // ── Media-player dispatch ─────────────────────
+                        if in-section && slot.kind == "media_player" : MediaPlayerTile {
+                            x: root.media-player-tiles[slot.kind-index].placement.col
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                + section.gap / 2;
+                            y: root.media-player-tiles[slot.kind-index].placement.row
+                                * root.grid-row-height
+                                + section.gap / 2;
+                            width: root.media-player-tiles[slot.kind-index].placement.span-cols
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                - section.gap;
+                            height: root.media-player-tiles[slot.kind-index].placement.span-rows
+                                * root.grid-row-height
+                                - section.gap;
+                            view-model: root.media-player-tiles[slot.kind-index];
+                        }
+
+                        // ── Power-flow dispatch ───────────────────────
+                        if in-section && slot.kind == "power_flow" : PowerFlowTile {
+                            x: root.power-flow-tiles[slot.kind-index].placement.col
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                + section.gap / 2;
+                            y: root.power-flow-tiles[slot.kind-index].placement.row
+                                * root.grid-row-height
+                                + section.gap / 2;
+                            width: root.power-flow-tiles[slot.kind-index].placement.span-cols
+                                * (parent.width - section.gap)
+                                / max(1, section.columns)
+                                - section.gap;
+                            height: root.power-flow-tiles[slot.kind-index].placement.span-rows
+                                * root.grid-row-height
+                                - section.gap;
+                            view-model: root.power-flow-tiles[slot.kind-index];
+                        }
+                    }
+                }
+            }
         }
-        for tile[i] in root.entity-tiles : EntityTile {
-            view-model: tile;
-        }
-        // Phase 6 per-kind tile renderers. Each iterates its dedicated
-        // model array; the tile components themselves wrap CardBase and
-        // honour AnimationBudget per their own per-tile docs (cover_tile.slint,
-        // fan_tile.slint, lock_tile.slint, alarm_panel_tile.slint,
-        // history_graph_tile.slint, camera_snapshot_tile.slint,
-        // climate_tile.slint, media_player_tile.slint, power_flow_tile.slint).
-        for tile[i] in root.cover-tiles : CoverTile {
-            view-model: tile;
-        }
-        for tile[i] in root.fan-tiles : FanTile {
-            view-model: tile;
-        }
-        for tile[i] in root.lock-tiles : LockTile {
-            view-model: tile;
-        }
-        for tile[i] in root.alarm-tiles : AlarmPanelTile {
-            view-model: tile;
-        }
-        for tile[i] in root.history-tiles : HistoryGraphTile {
-            view-model: tile;
-        }
-        for tile[i] in root.camera-tiles : CameraSnapshotTile {
-            view-model: tile;
-        }
-        for tile[i] in root.climate-tiles : ClimateTile {
-            view-model: tile;
-        }
-        for tile[i] in root.media-player-tiles : MediaPlayerTile {
-            view-model: tile;
-        }
-        for tile[i] in root.power-flow-tiles : PowerFlowTile {
-            view-model: tile;
+
+        // 3) Legacy flat-per-kind fallback. Renders only when no sections
+        //    are configured (e.g. `wire_window`-only test paths). Keeping
+        //    this path intact preserves backwards compatibility with
+        //    headless tests and any future caller that opts out of the
+        //    section/view layout.
+        if root.sections.length == 0 : VerticalLayout {
+            spacing: Theme.space-2;
+            for tile[i] in root.light-tiles : LightTile { view-model: tile; }
+            for tile[i] in root.sensor-tiles : SensorTile { view-model: tile; }
+            for tile[i] in root.entity-tiles : EntityTile { view-model: tile; }
+            for tile[i] in root.cover-tiles : CoverTile { view-model: tile; }
+            for tile[i] in root.fan-tiles : FanTile { view-model: tile; }
+            for tile[i] in root.lock-tiles : LockTile { view-model: tile; }
+            for tile[i] in root.alarm-tiles : AlarmPanelTile { view-model: tile; }
+            for tile[i] in root.history-tiles : HistoryGraphTile { view-model: tile; }
+            for tile[i] in root.camera-tiles : CameraSnapshotTile { view-model: tile; }
+            for tile[i] in root.climate-tiles : ClimateTile { view-model: tile; }
+            for tile[i] in root.media-player-tiles : MediaPlayerTile { view-model: tile; }
+            for tile[i] in root.power-flow-tiles : PowerFlowTile { view-model: tile; }
         }
     }
 

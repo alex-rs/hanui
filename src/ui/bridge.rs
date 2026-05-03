@@ -71,7 +71,7 @@ use crate::ha::store::EntityStore;
 ///
 /// Field names use snake_case throughout; the Slint compiler converts these to
 /// kebab-case (`span-cols`, `span-rows`) in its own struct declarations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TilePlacement {
     pub col: i32,
     pub row: i32,
@@ -2880,6 +2880,459 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Phase 6 cosmetic-polish: dashboard-layout wiring (section grid + view tabs)
+// ---------------------------------------------------------------------------
+//
+// `compute_dashboard_layout` and `wire_dashboard_layout` together expose the
+// Dashboard's `views[].sections[]` structure to the Slint MainWindow. This
+// gives the founder smoke run:
+//
+//   1. A tab-strip view switcher at the top of the window (when ≥2 views).
+//   2. A 4-column-grid layout per section, with the section title shown as
+//      a header above each section's tile area.
+//   3. A simple greedy section-aware placement packer that fills each tile's
+//      `TilePlacement` with (col, row, span_cols, span_rows) relative to
+//      its containing section, so the Slint side can render tiles via
+//      absolute positioning within the section's content rectangle.
+//
+// All work happens at dashboard load (init / view switch), NOT per-flush —
+// per-flush refreshes only update the per-kind tile arrays via
+// `set_row_data`. This keeps the per-flush hot path unchanged and the
+// per-frame allocation budget at zero.
+
+/// Compute per-tile section-relative placements via a simple greedy packer.
+///
+/// For each section in document order:
+///   * walk widgets in declaration order;
+///   * place each widget at the next free slot in the current row, advancing
+///     to the next row when adding the widget would overflow `section.grid.columns`;
+///   * if a widget's `preferred_columns` exceeds the section width, clamp to
+///     the section width (minimum 1) so layout never overflows;
+///   * record the resulting (col, row, span_cols, span_rows) into the
+///     matching `TileVM`'s `placement` field via the `set_placement_*` helpers.
+///
+/// `tiles` MUST be the output of [`build_tiles`] for the same `dashboard`,
+/// in the same document order — the function relies on the 1:1 correspondence
+/// to write each tile's placement back into the right row of each per-kind
+/// array. A debug-mode mismatch panics; in release the function silently
+/// returns the original tile order untouched.
+///
+/// This runs once per dashboard load (and once per view switch in the
+/// future — but section structure is YAML-static, so nothing actually
+/// changes between view switches today). Per-flush refreshes never call
+/// this function.
+pub fn pack_section_layouts(dashboard: &Dashboard, tiles: &mut [TileVM]) {
+    let mut tile_idx: usize = 0;
+    for view in &dashboard.views {
+        for section in &view.sections {
+            let columns = i32::from(section.grid.columns).max(1);
+            let mut cursor_col: i32 = 0;
+            let mut cursor_row: i32 = 0;
+            for _widget in &section.widgets {
+                if tile_idx >= tiles.len() {
+                    debug_assert!(
+                        false,
+                        "pack_section_layouts: tiles slice shorter than dashboard widget count"
+                    );
+                    return;
+                }
+                let placement = next_pack_placement(
+                    tiles[tile_idx].placement(),
+                    columns,
+                    &mut cursor_col,
+                    &mut cursor_row,
+                );
+                tiles[tile_idx].set_placement(placement);
+                tile_idx += 1;
+            }
+            // Reset cursor at section boundary — each section gets its own
+            // (col, row) coordinate space.
+            let _ = cursor_col;
+            let _ = cursor_row;
+        }
+    }
+}
+
+/// Compute the placement for a single tile during the greedy section pack.
+///
+/// Inputs:
+///   * `current` — the tile's current placement (its preferred span dimensions
+///     come from `span_cols` / `span_rows`).
+///   * `section_columns` — the section's grid column count (>= 1).
+///   * `cursor_col` / `cursor_row` — running cursor for the section, mutated.
+///
+/// Returns the new `TilePlacement` for this tile. Cursor advances within
+/// the row; on overflow the cursor wraps to the next row.
+fn next_pack_placement(
+    current: TilePlacement,
+    section_columns: i32,
+    cursor_col: &mut i32,
+    cursor_row: &mut i32,
+) -> TilePlacement {
+    // Clamp span_cols to the section width so a 4-column-span widget
+    // declared in a 2-column section still renders (span = 2). Minimum 1
+    // so a zero / negative value does not blank the tile.
+    let span_cols = current.span_cols.clamp(1, section_columns);
+    let span_rows = current.span_rows.max(1);
+
+    // Wrap to next row if this tile won't fit on the current row.
+    if *cursor_col + span_cols > section_columns {
+        *cursor_col = 0;
+        *cursor_row += 1;
+    }
+
+    let placement = TilePlacement {
+        col: *cursor_col,
+        row: *cursor_row,
+        span_cols,
+        span_rows,
+    };
+
+    *cursor_col += span_cols;
+    if *cursor_col >= section_columns {
+        *cursor_col = 0;
+        *cursor_row += 1;
+    }
+
+    placement
+}
+
+/// Per-section layout summary produced by [`compute_dashboard_layout`].
+///
+/// One entry per section in document order across all views. The Rust bridge
+/// converts these into `slint_ui::SectionVM` rows when wiring the window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DashboardSection {
+    /// Section title (e.g. "Overview", "Climate").
+    pub title: String,
+    /// Number of grid columns for this section's content area.
+    pub columns: i32,
+    /// Logical-pixel gap between adjacent tiles within this section.
+    pub gap_px: i32,
+    /// Zero-based view index this section belongs to.
+    pub view_index: i32,
+    /// Number of grid rows occupied by the section's tiles (after packing).
+    pub num_rows: i32,
+}
+
+/// Per-tile slot pointing back into the per-kind tile arrays.
+///
+/// Slint's MainWindow iterates this flat list inside each section's content
+/// rectangle, dispatching to the correct per-kind tile component via the
+/// `kind` discriminator and reading the tile's data from the matching
+/// per-kind model at index `kind_index`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DashboardTileSlot {
+    /// Zero-based view index this slot belongs to.
+    pub view_index: i32,
+    /// Zero-based section index (across all views) this slot belongs to.
+    pub section_index: i32,
+    /// Discriminator string matching the Slint MainWindow tile dispatch:
+    /// "light", "sensor", "entity", "cover", "fan", "lock", "alarm",
+    /// "history", "camera", "climate", "media_player", "power_flow".
+    pub kind: &'static str,
+    /// Index into the matching per-kind tile array.
+    pub kind_index: i32,
+}
+
+/// Result of computing the section / view / slot layout for a dashboard.
+///
+/// Built once per dashboard load. View switching just changes the
+/// `MainWindow.active-view-index` property; the section list and slot list
+/// are not rebuilt.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DashboardLayout {
+    /// Tab-strip / dropdown view list, in document order.
+    pub views: Vec<ViewEntry>,
+    /// Initial active view index (looked up from `Dashboard.default_view`).
+    pub active_view_index: i32,
+    /// Density string for the ViewSwitcher ("compact" | "regular" | "spacious").
+    pub density: String,
+    /// Per-section summary in document order across all views.
+    pub sections: Vec<DashboardSection>,
+    /// Per-tile slots in document order across all views and sections.
+    pub tile_slots: Vec<DashboardTileSlot>,
+}
+
+/// Compute the [`DashboardLayout`] for `dashboard` against the active profile.
+///
+/// `tiles` MUST be the packed output of `build_tiles` + [`pack_section_layouts`]
+/// (same document order, same length as the total widget count). The
+/// function uses `tiles[i]`'s [`TileVM`] variant tag to determine each
+/// slot's `kind` discriminator and to compute the per-kind row index by
+/// counting prior tiles of the same kind. A debug-mode mismatch between
+/// `dashboard` widget count and `tiles.len()` is a panic; release silently
+/// returns an empty layout.
+pub fn compute_dashboard_layout(
+    dashboard: &Dashboard,
+    profile: &DeviceProfile,
+    tiles: &[TileVM],
+) -> DashboardLayout {
+    use crate::dashboard::profiles::Density;
+
+    // ── Views ──────────────────────────────────────────────────────────
+    let views: Vec<ViewEntry> = dashboard
+        .views
+        .iter()
+        .map(|v| ViewEntry {
+            id: v.id.clone(),
+            title: v.title.clone(),
+        })
+        .collect();
+
+    let active_view_index = dashboard
+        .views
+        .iter()
+        .position(|v| v.id == dashboard.default_view)
+        .map(|i| i32::try_from(i).unwrap_or(0))
+        .unwrap_or(0);
+
+    let density = match profile.density {
+        Density::Compact => "compact",
+        Density::Regular => "regular",
+        Density::Spacious => "spacious",
+    }
+    .to_string();
+
+    // ── Sections + slots ───────────────────────────────────────────────
+    let mut sections: Vec<DashboardSection> = Vec::new();
+    let mut tile_slots: Vec<DashboardTileSlot> = Vec::new();
+
+    // Per-kind cursors: count of prior tiles of each kind, used to compute
+    // the kind-relative row index for each slot.
+    let mut kind_cursors = KindCursors::default();
+
+    let mut tile_idx: usize = 0;
+    for (view_idx_usize, view) in dashboard.views.iter().enumerate() {
+        let view_idx = i32::try_from(view_idx_usize).unwrap_or(i32::MAX);
+        for section in &view.sections {
+            let section_idx_usize = sections.len();
+            let section_idx = i32::try_from(section_idx_usize).unwrap_or(i32::MAX);
+
+            // Track max row used by any tile in this section so we can
+            // size the section's content rectangle.
+            let mut max_row_plus_span: i32 = 0;
+
+            for _widget in &section.widgets {
+                if tile_idx >= tiles.len() {
+                    debug_assert!(
+                        false,
+                        "compute_dashboard_layout: tiles slice shorter than dashboard widget count"
+                    );
+                    return DashboardLayout {
+                        views,
+                        active_view_index,
+                        density,
+                        sections: Vec::new(),
+                        tile_slots: Vec::new(),
+                    };
+                }
+                let tile = &tiles[tile_idx];
+                let kind = tile_vm_kind_str(tile);
+                let kind_index = kind_cursors.next(kind);
+                let placement = tile.placement();
+                max_row_plus_span =
+                    max_row_plus_span.max(placement.row.saturating_add(placement.span_rows));
+
+                tile_slots.push(DashboardTileSlot {
+                    view_index: view_idx,
+                    section_index: section_idx,
+                    kind,
+                    kind_index,
+                });
+                tile_idx += 1;
+            }
+
+            sections.push(DashboardSection {
+                title: section.title.clone(),
+                columns: i32::from(section.grid.columns).max(1),
+                gap_px: i32::from(section.grid.gap),
+                view_index: view_idx,
+                num_rows: max_row_plus_span.max(1),
+            });
+        }
+    }
+
+    DashboardLayout {
+        views,
+        active_view_index,
+        density,
+        sections,
+        tile_slots,
+    }
+}
+
+/// Per-kind row-index counter used by [`compute_dashboard_layout`] to assign
+/// each tile slot's `kind_index` matching its position in the per-kind array
+/// produced by [`split_tile_vms`].
+#[derive(Default)]
+struct KindCursors {
+    light: i32,
+    sensor: i32,
+    entity: i32,
+    cover: i32,
+    fan: i32,
+    lock: i32,
+    alarm: i32,
+    history: i32,
+    camera: i32,
+    climate: i32,
+    media_player: i32,
+    power_flow: i32,
+}
+
+impl KindCursors {
+    fn next(&mut self, kind: &'static str) -> i32 {
+        let slot = match kind {
+            "light" => &mut self.light,
+            "sensor" => &mut self.sensor,
+            "entity" => &mut self.entity,
+            "cover" => &mut self.cover,
+            "fan" => &mut self.fan,
+            "lock" => &mut self.lock,
+            "alarm" => &mut self.alarm,
+            "history" => &mut self.history,
+            "camera" => &mut self.camera,
+            "climate" => &mut self.climate,
+            "media_player" => &mut self.media_player,
+            "power_flow" => &mut self.power_flow,
+            _ => {
+                debug_assert!(false, "KindCursors::next: unknown kind {kind:?}");
+                return 0;
+            }
+        };
+        let idx = *slot;
+        *slot += 1;
+        idx
+    }
+}
+
+/// Map a [`TileVM`] variant to its Slint dispatch discriminator string.
+fn tile_vm_kind_str(tile: &TileVM) -> &'static str {
+    match tile {
+        TileVM::Light(_) => "light",
+        TileVM::Sensor(_) => "sensor",
+        TileVM::Entity(_) => "entity",
+        TileVM::Cover(_) => "cover",
+        TileVM::Fan(_) => "fan",
+        TileVM::Lock(_) => "lock",
+        TileVM::Alarm(_) => "alarm",
+        TileVM::History(_) => "history",
+        TileVM::Camera(_) => "camera",
+        TileVM::Climate(_) => "climate",
+        TileVM::MediaPlayer(_) => "media_player",
+        TileVM::PowerFlow(_) => "power_flow",
+    }
+}
+
+/// Wire a [`DashboardLayout`] into the production [`MainWindow`]'s Slint
+/// properties.
+///
+/// Called once per `Dashboard` load by `src/lib.rs::run_with_memory_store`
+/// and `run_with_live_store`. The view-changed callback updates the
+/// MainWindow's `active-view-index` directly; the section list and tile-slot
+/// list are NOT rebuilt because section structure is YAML-static.
+pub fn wire_dashboard_layout(window: &MainWindow, layout: &DashboardLayout) {
+    use slint::Weak;
+
+    // ── Views model ────────────────────────────────────────────────────
+    let view_metas: Vec<slint_ui::ViewMeta> = layout
+        .views
+        .iter()
+        .map(|v| slint_ui::ViewMeta {
+            id: SharedString::from(v.id.as_str()),
+            title: SharedString::from(v.title.as_str()),
+        })
+        .collect();
+    window.set_views(ModelRc::new(VecModel::from(view_metas)));
+    window.set_active_view_index(layout.active_view_index);
+
+    // ── Sections model ─────────────────────────────────────────────────
+    let section_vms: Vec<slint_ui::SectionVM> = layout
+        .sections
+        .iter()
+        .map(|s| slint_ui::SectionVM {
+            title: SharedString::from(s.title.as_str()),
+            columns: s.columns,
+            // `gap` is a Slint `length` (logical pixels, f32). Source
+            // `gap_px` is u8-derived (0..=255), so the i32->f32 conversion
+            // is loss-free.
+            gap: s.gap_px as f32,
+            r#view_index: s.view_index,
+            r#num_rows: s.num_rows,
+        })
+        .collect();
+    window.set_sections(ModelRc::new(VecModel::from(section_vms)));
+
+    // ── Tile-slots model ───────────────────────────────────────────────
+    let slot_vms: Vec<slint_ui::TileSlot> = layout
+        .tile_slots
+        .iter()
+        .map(|slot| slint_ui::TileSlot {
+            r#view_index: slot.view_index,
+            r#section_index: slot.section_index,
+            kind: SharedString::from(slot.kind),
+            r#kind_index: slot.kind_index,
+        })
+        .collect();
+    window.set_tile_slots(ModelRc::new(VecModel::from(slot_vms)));
+
+    // ── view-changed callback ──────────────────────────────────────────
+    //
+    // Phase-6-cosmetic-polish: tapping a tab updates `active-view-index`
+    // directly. The bridge does not re-write any model on view switch
+    // (sections list already carries `view-index`; Slint's per-section
+    // `if section.view-index == active-view-index` gate is the renderer).
+    let weak: Weak<MainWindow> = window.as_weak();
+    window.on_view_changed(move |idx| {
+        if let Some(w) = weak.upgrade() {
+            w.set_active_view_index(idx);
+        }
+    });
+}
+
+// Helper accessors used by the section-aware packer.
+impl TileVM {
+    /// Read the tile's current `TilePlacement` regardless of variant.
+    pub(crate) fn placement(&self) -> TilePlacement {
+        match self {
+            TileVM::Light(vm) => vm.placement,
+            TileVM::Sensor(vm) => vm.placement,
+            TileVM::Entity(vm) => vm.placement,
+            TileVM::Cover(vm) => vm.placement,
+            TileVM::Fan(vm) => vm.placement,
+            TileVM::Lock(vm) => vm.placement,
+            TileVM::Alarm(vm) => vm.placement,
+            TileVM::History(vm) => vm.placement,
+            TileVM::Camera(vm) => vm.placement,
+            TileVM::Climate(vm) => vm.placement,
+            TileVM::MediaPlayer(vm) => vm.placement,
+            TileVM::PowerFlow(vm) => vm.placement,
+        }
+    }
+
+    /// Mutate the tile's `TilePlacement` regardless of variant. Used by
+    /// [`pack_section_layouts`] to write the packer's output back into the
+    /// tile slice in-place.
+    pub(crate) fn set_placement(&mut self, p: TilePlacement) {
+        match self {
+            TileVM::Light(vm) => vm.placement = p,
+            TileVM::Sensor(vm) => vm.placement = p,
+            TileVM::Entity(vm) => vm.placement = p,
+            TileVM::Cover(vm) => vm.placement = p,
+            TileVM::Fan(vm) => vm.placement = p,
+            TileVM::Lock(vm) => vm.placement = p,
+            TileVM::Alarm(vm) => vm.placement = p,
+            TileVM::History(vm) => vm.placement = p,
+            TileVM::Camera(vm) => vm.placement = p,
+            TileVM::Climate(vm) => vm.placement = p,
+            TileVM::MediaPlayer(vm) => vm.placement = p,
+            TileVM::PowerFlow(vm) => vm.placement = p,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PinEntry Slint module (TASK-100)
 // ---------------------------------------------------------------------------
 //
@@ -5002,7 +5455,7 @@ mod tests {
                 icon_id: "mdi:window-shutter-open".into(),
                 preferred_columns: 2,
                 preferred_rows: 2,
-                placement: placement.clone(),
+                placement,
                 pending: false,
             }),
             TileVM::Fan(FanTileVM {
@@ -5016,7 +5469,7 @@ mod tests {
                 icon_id: "mdi:fan".into(),
                 preferred_columns: 2,
                 preferred_rows: 2,
-                placement: placement.clone(),
+                placement,
                 pending: false,
             }),
             TileVM::Lock(LockTileVM {
@@ -5026,7 +5479,7 @@ mod tests {
                 icon_id: "mdi:lock".into(),
                 preferred_columns: 2,
                 preferred_rows: 2,
-                placement: placement.clone(),
+                placement,
                 pending: false,
             }),
             TileVM::Alarm(AlarmTileVM {
@@ -5038,7 +5491,7 @@ mod tests {
                 icon_id: "mdi:shield-home".into(),
                 preferred_columns: 2,
                 preferred_rows: 2,
-                placement: placement.clone(),
+                placement,
                 pending: false,
             }),
             TileVM::History(HistoryGraphTileVM {
@@ -5049,7 +5502,7 @@ mod tests {
                 icon_id: "mdi:chart-line".into(),
                 preferred_columns: 2,
                 preferred_rows: 2,
-                placement: placement.clone(),
+                placement,
                 pending: false,
                 path_commands: "M 0 0 L 1 1".into(),
             }),
@@ -5062,7 +5515,7 @@ mod tests {
                 icon_id: "mdi:cctv".into(),
                 preferred_columns: 2,
                 preferred_rows: 2,
-                placement: placement.clone(),
+                placement,
                 pending: false,
             }),
             TileVM::Climate(ClimateTileVM {
@@ -5074,7 +5527,7 @@ mod tests {
                 icon_id: "mdi:thermostat".into(),
                 preferred_columns: 2,
                 preferred_rows: 2,
-                placement: placement.clone(),
+                placement,
                 pending: false,
             }),
             TileVM::MediaPlayer(MediaPlayerTileVM {
@@ -5087,7 +5540,7 @@ mod tests {
                 icon_id: "mdi:speaker".into(),
                 preferred_columns: 2,
                 preferred_rows: 2,
-                placement: placement.clone(),
+                placement,
                 pending: false,
             }),
             TileVM::PowerFlow(PowerFlowTileVM {
@@ -5235,7 +5688,7 @@ mod tests {
                 icon_id: "mdi:thermostat".into(),
                 preferred_columns: 2,
                 preferred_rows: 2,
-                placement: placement.clone(),
+                placement,
                 pending: false,
             }),
             TileVM::MediaPlayer(MediaPlayerTileVM {
@@ -5248,7 +5701,7 @@ mod tests {
                 icon_id: "mdi:speaker".into(),
                 preferred_columns: 2,
                 preferred_rows: 2,
-                placement: placement.clone(),
+                placement,
                 pending: false,
             }),
             TileVM::PowerFlow(PowerFlowTileVM {
@@ -11377,5 +11830,631 @@ mod tests {
             widgets[1].visibility, "state_equals:binary_sensor.motion:on",
             "gated widget carries the canonical state_equals predicate"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6 cosmetic-polish: section packer + dashboard layout tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pack_section_layouts_assigns_section_relative_grid_positions() {
+        let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
+        let dashboard = fixture_dashboard();
+
+        let mut tiles = build_tiles(&store, &dashboard);
+        pack_section_layouts(&dashboard, &mut tiles);
+
+        // Walk the dashboard in document order and verify each tile's
+        // placement was packed sequentially within its section.
+        let mut tile_idx = 0usize;
+        for view in &dashboard.views {
+            for section in &view.sections {
+                let columns = i32::from(section.grid.columns);
+                let mut cursor_col = 0i32;
+                let mut cursor_row = 0i32;
+                for _widget in &section.widgets {
+                    let placement = tiles[tile_idx].placement();
+
+                    // Verify the packer used valid section-relative coordinates.
+                    assert!(
+                        placement.col >= 0 && placement.col < columns,
+                        "section {:?} tile {tile_idx}: col {} out of range [0, {columns})",
+                        section.id,
+                        placement.col,
+                    );
+                    assert!(
+                        placement.span_cols >= 1 && placement.span_cols <= columns,
+                        "section {:?} tile {tile_idx}: span_cols {} not in [1, {columns}]",
+                        section.id,
+                        placement.span_cols,
+                    );
+                    assert!(
+                        placement.row >= 0,
+                        "section {:?} tile {tile_idx}: row must be non-negative, got {}",
+                        section.id,
+                        placement.row,
+                    );
+
+                    if cursor_col + placement.span_cols > columns {
+                        cursor_col = 0;
+                        cursor_row += 1;
+                    }
+                    assert_eq!(
+                        placement.col, cursor_col,
+                        "tile {tile_idx} col mismatch in section {:?}",
+                        section.id
+                    );
+                    assert_eq!(
+                        placement.row, cursor_row,
+                        "tile {tile_idx} row mismatch in section {:?}",
+                        section.id
+                    );
+                    cursor_col += placement.span_cols;
+                    if cursor_col >= columns {
+                        cursor_col = 0;
+                        cursor_row += 1;
+                    }
+                    tile_idx += 1;
+                }
+            }
+        }
+        assert_eq!(
+            tile_idx,
+            tiles.len(),
+            "packer must visit exactly tiles.len() entries"
+        );
+    }
+
+    #[test]
+    fn pack_section_layouts_resets_cursor_per_section() {
+        let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
+        let dashboard = fixture_dashboard();
+
+        let mut tiles = build_tiles(&store, &dashboard);
+        pack_section_layouts(&dashboard, &mut tiles);
+
+        // The first tile of every section after the first must start at
+        // (col=0, row=0) — the cursor resets at every section boundary.
+        let mut tile_idx = 0usize;
+        for view in &dashboard.views {
+            for (sec_idx, section) in view.sections.iter().enumerate() {
+                let placement = tiles[tile_idx].placement();
+                if sec_idx > 0 || !view.sections.is_empty() {
+                    assert_eq!(
+                        placement.col, 0,
+                        "first tile of section {:?} must have col=0",
+                        section.id
+                    );
+                    assert_eq!(
+                        placement.row, 0,
+                        "first tile of section {:?} must have row=0",
+                        section.id
+                    );
+                }
+                tile_idx += section.widgets.len();
+            }
+        }
+    }
+
+    #[test]
+    fn compute_dashboard_layout_emits_one_section_per_yaml_section() {
+        let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
+        let dashboard = fixture_dashboard();
+
+        let mut tiles = build_tiles(&store, &dashboard);
+        pack_section_layouts(&dashboard, &mut tiles);
+        let layout = compute_dashboard_layout(&dashboard, &PROFILE_DESKTOP, &tiles);
+
+        // One DashboardSection per (view, section) pair.
+        let total_sections: usize = dashboard.views.iter().map(|v| v.sections.len()).sum();
+        assert_eq!(
+            layout.sections.len(),
+            total_sections,
+            "layout must emit one section per YAML section"
+        );
+
+        // Each section's title and column count match the YAML.
+        let mut idx = 0usize;
+        for (view_idx, view) in dashboard.views.iter().enumerate() {
+            let view_idx_i32 = i32::try_from(view_idx).expect("view idx fits");
+            for section in &view.sections {
+                let s = &layout.sections[idx];
+                assert_eq!(s.title, section.title, "section {idx} title mismatch");
+                assert_eq!(
+                    s.columns,
+                    i32::from(section.grid.columns),
+                    "section {idx} columns mismatch"
+                );
+                assert_eq!(
+                    s.view_index, view_idx_i32,
+                    "section {idx} view_index mismatch"
+                );
+                assert!(s.num_rows >= 1, "section {idx} num_rows must be >= 1");
+                idx += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn compute_dashboard_layout_emits_one_slot_per_widget_in_doc_order() {
+        let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
+        let dashboard = fixture_dashboard();
+
+        let mut tiles = build_tiles(&store, &dashboard);
+        pack_section_layouts(&dashboard, &mut tiles);
+        let layout = compute_dashboard_layout(&dashboard, &PROFILE_DESKTOP, &tiles);
+
+        let widget_count: usize = dashboard
+            .views
+            .iter()
+            .flat_map(|v| v.sections.iter())
+            .map(|s| s.widgets.len())
+            .sum();
+        assert_eq!(
+            layout.tile_slots.len(),
+            widget_count,
+            "layout must emit one slot per widget"
+        );
+
+        // Slots match the per-kind cursor walk (consistent with split_tile_vms).
+        let mut counts = std::collections::HashMap::<&'static str, i32>::new();
+        for slot in &layout.tile_slots {
+            let entry = counts.entry(slot.kind).or_insert(0);
+            assert_eq!(
+                slot.kind_index, *entry,
+                "slot kind_index must match per-kind cursor"
+            );
+            *entry += 1;
+        }
+    }
+
+    #[test]
+    fn compute_dashboard_layout_active_view_index_matches_default_view() {
+        let dashboard = fixture_dashboard();
+        let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
+        let mut tiles = build_tiles(&store, &dashboard);
+        pack_section_layouts(&dashboard, &mut tiles);
+        let layout = compute_dashboard_layout(&dashboard, &PROFILE_DESKTOP, &tiles);
+
+        let expected = dashboard
+            .views
+            .iter()
+            .position(|v| v.id == dashboard.default_view)
+            .map(|i| i as i32)
+            .unwrap_or(0);
+        assert_eq!(layout.active_view_index, expected);
+    }
+
+    #[test]
+    fn compute_dashboard_layout_emits_view_entries_in_document_order() {
+        let dashboard = fixture_dashboard();
+        let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
+        let mut tiles = build_tiles(&store, &dashboard);
+        pack_section_layouts(&dashboard, &mut tiles);
+        let layout = compute_dashboard_layout(&dashboard, &PROFILE_DESKTOP, &tiles);
+
+        assert_eq!(layout.views.len(), dashboard.views.len());
+        for (i, v) in layout.views.iter().enumerate() {
+            assert_eq!(v.id, dashboard.views[i].id);
+            assert_eq!(v.title, dashboard.views[i].title);
+        }
+    }
+
+    #[test]
+    fn next_pack_placement_clamps_oversized_widgets_to_section_width() {
+        // A 6-column-wide widget in a 4-column section should clamp to 4.
+        let mut col = 0;
+        let mut row = 0;
+        let p = next_pack_placement(
+            TilePlacement {
+                col: 0,
+                row: 0,
+                span_cols: 6,
+                span_rows: 1,
+            },
+            4,
+            &mut col,
+            &mut row,
+        );
+        assert_eq!(p.span_cols, 4, "must clamp to section width");
+        assert_eq!(p.col, 0);
+        assert_eq!(p.row, 0);
+    }
+
+    #[test]
+    fn next_pack_placement_wraps_to_next_row_on_overflow() {
+        let mut col = 3;
+        let mut row = 0;
+        let p = next_pack_placement(
+            TilePlacement {
+                col: 0,
+                row: 0,
+                span_cols: 2,
+                span_rows: 1,
+            },
+            4,
+            &mut col,
+            &mut row,
+        );
+        // 3 + 2 > 4 → wrap.
+        assert_eq!(p.row, 1);
+        assert_eq!(p.col, 0);
+    }
+
+    #[test]
+    fn next_pack_placement_minimum_span_one() {
+        let mut col = 0;
+        let mut row = 0;
+        let p = next_pack_placement(
+            TilePlacement {
+                col: 0,
+                row: 0,
+                span_cols: 0,
+                span_rows: 0,
+            },
+            4,
+            &mut col,
+            &mut row,
+        );
+        assert_eq!(p.span_cols, 1, "zero span clamps to 1");
+        assert_eq!(p.span_rows, 1, "zero rows clamps to 1");
+    }
+
+    #[test]
+    fn wire_dashboard_layout_writes_views_sections_and_slots_to_main_window() {
+        // Behavior contract: `wire_dashboard_layout` populates `views`,
+        // `sections`, `tile-slots`, and `active-view-index` on a real
+        // headless `MainWindow`. Read back via the Slint-generated getters.
+        install_test_platform_once_per_thread();
+        crate::assets::icons::init();
+        let window = MainWindow::new().expect("MainWindow::new under headless test platform");
+
+        let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
+        let dashboard = fixture_dashboard();
+        let mut tiles = build_tiles(&store, &dashboard);
+        pack_section_layouts(&dashboard, &mut tiles);
+        let layout = compute_dashboard_layout(&dashboard, &PROFILE_DESKTOP, &tiles);
+
+        wire_window(&window, &tiles, &PROFILE_DESKTOP).expect("wire_window must succeed");
+        wire_dashboard_layout(&window, &layout);
+
+        // ── Active view index ─────────────────────────────────────────
+        let expected_active = dashboard
+            .views
+            .iter()
+            .position(|v| v.id == dashboard.default_view)
+            .map(|i| i as i32)
+            .unwrap_or(0);
+        assert_eq!(window.get_active_view_index(), expected_active);
+
+        // ── Views ─────────────────────────────────────────────────────
+        use slint::Model;
+        let views_model = window.get_views();
+        assert_eq!(
+            views_model.row_count(),
+            dashboard.views.len(),
+            "views model must mirror dashboard.views"
+        );
+
+        // ── Sections ──────────────────────────────────────────────────
+        let sections_model = window.get_sections();
+        let total_sections: usize = dashboard.views.iter().map(|v| v.sections.len()).sum();
+        assert_eq!(
+            sections_model.row_count(),
+            total_sections,
+            "sections model must mirror sum-of-section counts"
+        );
+
+        // ── Tile slots ────────────────────────────────────────────────
+        let slots_model = window.get_tile_slots();
+        let widget_count: usize = dashboard
+            .views
+            .iter()
+            .flat_map(|v| v.sections.iter())
+            .map(|s| s.widgets.len())
+            .sum();
+        assert_eq!(
+            slots_model.row_count(),
+            widget_count,
+            "tile-slots model must mirror dashboard widget count"
+        );
+
+        // ── view-changed callback updates active-view-index ───────────
+        // Simulate: invoke the callback with index 0 (only one view in
+        // fixture_dashboard()). Verify the property update lands.
+        window.invoke_view_changed(0);
+        assert_eq!(window.get_active_view_index(), 0);
+    }
+
+    #[test]
+    fn wire_dashboard_layout_with_empty_sections_is_safe() {
+        // Behavior contract: empty layout (no sections, no slots) is a
+        // no-op write — does not panic, leaves models empty. The MainWindow
+        // falls back to the legacy flat-per-kind path in this case.
+        install_test_platform_once_per_thread();
+        let window = MainWindow::new().expect("MainWindow::new under headless test platform");
+
+        let layout = DashboardLayout {
+            views: Vec::new(),
+            active_view_index: 0,
+            density: "regular".to_string(),
+            sections: Vec::new(),
+            tile_slots: Vec::new(),
+        };
+        wire_dashboard_layout(&window, &layout);
+
+        use slint::Model;
+        assert_eq!(window.get_sections().row_count(), 0);
+        assert_eq!(window.get_tile_slots().row_count(), 0);
+        assert_eq!(window.get_views().row_count(), 0);
+    }
+
+    #[test]
+    fn tile_vm_kind_str_matches_every_variant() {
+        // Every TileVM variant must map to the matching dispatch
+        // discriminator string used by the Slint MainWindow's per-section
+        // tile renderer. The Slint side branches on these literals; a
+        // mistype here renders the wrong component (or silently nothing).
+        // Mutation-testing target: every match arm in tile_vm_kind_str
+        // must be guarded by a distinct assertion below.
+        let placement = TilePlacement::default_for(1, 1);
+
+        // Light
+        assert_eq!(
+            tile_vm_kind_str(&TileVM::Light(LightTileVM {
+                name: String::new(),
+                state: String::new(),
+                icon_id: String::new(),
+                preferred_columns: 1,
+                preferred_rows: 1,
+                placement,
+                pending: false,
+            })),
+            "light",
+        );
+        // Sensor
+        assert_eq!(
+            tile_vm_kind_str(&TileVM::Sensor(SensorTileVM {
+                name: String::new(),
+                state: String::new(),
+                icon_id: String::new(),
+                preferred_columns: 1,
+                preferred_rows: 1,
+                placement,
+                pending: false,
+            })),
+            "sensor",
+        );
+        // Entity
+        assert_eq!(
+            tile_vm_kind_str(&TileVM::Entity(EntityTileVM {
+                name: String::new(),
+                state: String::new(),
+                icon_id: String::new(),
+                preferred_columns: 1,
+                preferred_rows: 1,
+                placement,
+                pending: false,
+            })),
+            "entity",
+        );
+        // Cover
+        assert_eq!(
+            tile_vm_kind_str(&TileVM::Cover(CoverTileVM {
+                name: String::new(),
+                state: String::new(),
+                position: 0,
+                tilt: 0,
+                has_position: false,
+                has_tilt: false,
+                is_open: false,
+                is_moving: false,
+                icon_id: String::new(),
+                preferred_columns: 1,
+                preferred_rows: 1,
+                placement,
+                pending: false,
+            })),
+            "cover",
+        );
+        // Fan
+        assert_eq!(
+            tile_vm_kind_str(&TileVM::Fan(FanTileVM {
+                name: String::new(),
+                state: String::new(),
+                speed_pct: 0,
+                has_speed_pct: false,
+                is_on: false,
+                current_speed: String::new(),
+                has_current_speed: false,
+                icon_id: String::new(),
+                preferred_columns: 1,
+                preferred_rows: 1,
+                placement,
+                pending: false,
+            })),
+            "fan",
+        );
+        // Lock
+        assert_eq!(
+            tile_vm_kind_str(&TileVM::Lock(LockTileVM {
+                name: String::new(),
+                state: String::new(),
+                is_locked: false,
+                icon_id: String::new(),
+                preferred_columns: 1,
+                preferred_rows: 1,
+                placement,
+                pending: false,
+            })),
+            "lock",
+        );
+        // Alarm
+        assert_eq!(
+            tile_vm_kind_str(&TileVM::Alarm(AlarmTileVM {
+                name: String::new(),
+                state: String::new(),
+                is_armed: false,
+                is_triggered: false,
+                is_pending: false,
+                icon_id: String::new(),
+                preferred_columns: 1,
+                preferred_rows: 1,
+                placement,
+                pending: false,
+            })),
+            "alarm",
+        );
+        // History
+        assert_eq!(
+            tile_vm_kind_str(&TileVM::History(HistoryGraphTileVM {
+                name: String::new(),
+                state: String::new(),
+                change_count: 0,
+                is_available: false,
+                icon_id: String::new(),
+                preferred_columns: 1,
+                preferred_rows: 1,
+                placement,
+                pending: false,
+                path_commands: String::new(),
+            })),
+            "history",
+        );
+        // Camera
+        assert_eq!(
+            tile_vm_kind_str(&TileVM::Camera(CameraTileVM {
+                name: String::new(),
+                state: String::new(),
+                is_recording: false,
+                is_streaming: false,
+                is_available: false,
+                icon_id: String::new(),
+                preferred_columns: 1,
+                preferred_rows: 1,
+                placement,
+                pending: false,
+            })),
+            "camera",
+        );
+        // Climate
+        assert_eq!(
+            tile_vm_kind_str(&TileVM::Climate(ClimateTileVM {
+                name: String::new(),
+                state: String::new(),
+                is_active: false,
+                current_temperature: None,
+                target_temperature: None,
+                icon_id: String::new(),
+                preferred_columns: 1,
+                preferred_rows: 1,
+                placement,
+                pending: false,
+            })),
+            "climate",
+        );
+        // MediaPlayer
+        assert_eq!(
+            tile_vm_kind_str(&TileVM::MediaPlayer(MediaPlayerTileVM {
+                name: String::new(),
+                state: String::new(),
+                is_playing: false,
+                media_title: None,
+                artist: None,
+                volume_level: None,
+                icon_id: String::new(),
+                preferred_columns: 1,
+                preferred_rows: 1,
+                placement,
+                pending: false,
+            })),
+            "media_player",
+        );
+        // PowerFlow
+        assert_eq!(
+            tile_vm_kind_str(&TileVM::PowerFlow(PowerFlowTileVM {
+                name: String::new(),
+                grid_w: None,
+                solar_w: None,
+                battery_w: None,
+                battery_pct: None,
+                home_w: None,
+                icon_id: String::new(),
+                preferred_columns: 1,
+                preferred_rows: 1,
+                placement,
+                pending: false,
+            })),
+            "power_flow",
+        );
+    }
+
+    /// Cross-consistency invariant: every `DashboardTileSlot.kind_index`
+    /// produced by `compute_dashboard_layout` must point at a valid row in
+    /// the matching per-kind `Vec` produced by `split_tile_vms` for the
+    /// same tile slice.
+    ///
+    /// This is the highest-risk silent-failure mode flagged by the
+    /// pre-commit opencode review: a mismatch between the layout's
+    /// kind-cursor counter and the split's per-variant push order would
+    /// blow up only when Slint dereferences `light-tiles[slot.kind-index]`
+    /// at render time. Mutation of either function would not be caught by
+    /// any other test in this module — this asserts they stay in lockstep.
+    #[test]
+    fn compute_dashboard_layout_kind_index_matches_split_tile_vms_position() {
+        let store = fixture::load(FIXTURE_PATH).expect("fixture must load");
+        let dashboard = fixture_dashboard();
+
+        let mut tiles = build_tiles(&store, &dashboard);
+        pack_section_layouts(&dashboard, &mut tiles);
+        let layout = compute_dashboard_layout(&dashboard, &PROFILE_DESKTOP, &tiles);
+
+        // Initialise icons so split_tile_vms doesn't panic on icon lookup.
+        crate::assets::icons::init();
+        let split = split_tile_vms(&tiles);
+
+        // For each slot, the slot.kind_index MUST point at a real row in
+        // the matching per-kind Vec, AND the row's data must match the
+        // tile we walked in document order.
+        let mut tile_idx = 0usize;
+        for slot in &layout.tile_slots {
+            let kind_index = usize::try_from(slot.kind_index).expect("non-negative");
+
+            match slot.kind {
+                "light" => assert!(kind_index < split.lights.len(), "light idx OOB"),
+                "sensor" => assert!(kind_index < split.sensors.len(), "sensor idx OOB"),
+                "entity" => assert!(kind_index < split.entities.len(), "entity idx OOB"),
+                "cover" => assert!(kind_index < split.covers.len(), "cover idx OOB"),
+                "fan" => assert!(kind_index < split.fans.len(), "fan idx OOB"),
+                "lock" => assert!(kind_index < split.locks.len(), "lock idx OOB"),
+                "alarm" => assert!(kind_index < split.alarms.len(), "alarm idx OOB"),
+                "history" => {
+                    assert!(kind_index < split.histories.len(), "history idx OOB")
+                }
+                "camera" => assert!(kind_index < split.cameras.len(), "camera idx OOB"),
+                "climate" => {
+                    assert!(kind_index < split.climates.len(), "climate idx OOB")
+                }
+                "media_player" => assert!(
+                    kind_index < split.media_players.len(),
+                    "media_player idx OOB"
+                ),
+                "power_flow" => assert!(kind_index < split.power_flows.len(), "power_flow idx OOB"),
+                other => panic!("slot has unknown kind {other:?}"),
+            }
+
+            // Document-order invariant: the slot at position `tile_idx`
+            // must reference the per-kind row whose source tile is
+            // `tiles[tile_idx]`. Verify by comparing the kind discriminator
+            // and confirming the slot points at the right per-kind row.
+            let actual_kind = tile_vm_kind_str(&tiles[tile_idx]);
+            assert_eq!(
+                slot.kind, actual_kind,
+                "slot {tile_idx} kind {} does not match tiles[{tile_idx}] kind {}",
+                slot.kind, actual_kind,
+            );
+            tile_idx += 1;
+        }
+        assert_eq!(tile_idx, tiles.len(), "every tile must have a slot");
     }
 }

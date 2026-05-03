@@ -50,7 +50,10 @@ use crate::ha::live_store::LiveStore;
 use crate::ha::store::EntityStore;
 use crate::platform::config::Config;
 use crate::platform::status::{self, ConnectionState};
-use crate::ui::bridge::{build_tiles, split_tile_vms, wire_window, LiveBridge, MainWindow};
+use crate::ui::bridge::{
+    build_tiles, compute_dashboard_layout, pack_section_layouts, split_tile_vms,
+    wire_dashboard_layout, wire_window, LiveBridge, MainWindow,
+};
 
 /// Top-level orchestration entry point called by `main.rs`.
 ///
@@ -394,11 +397,21 @@ fn run_with_memory_store(path: &str, profile: &'static DeviceProfile) -> Result<
     info!(entity_count = ?store_entity_count(&store), fixture = %path, "fixture loaded");
 
     let dashboard = fixture_dashboard();
-    let tiles = build_tiles(&store, &dashboard);
+    let mut tiles = build_tiles(&store, &dashboard);
+    // Phase 6 cosmetic-polish: pack each tile's `placement` into the
+    // section-relative (col, row, span_cols, span_rows) coordinates the
+    // Slint MainWindow needs for the per-section 4-column grid layout.
+    // Runs once at init; per-flush refreshes do not re-pack.
+    pack_section_layouts(&dashboard, &mut tiles);
     info!(tile_count = tiles.len(), "tiles built");
 
     let window = MainWindow::new()?;
     wire_window(&window, &tiles, profile)?;
+    // Phase 6 cosmetic-polish: wire the dashboard's section + view list
+    // into the MainWindow once. View switching just toggles
+    // `active-view-index` — no model rebuild.
+    let layout = compute_dashboard_layout(&dashboard, profile, &tiles);
+    wire_dashboard_layout(&window, &layout);
 
     arm_smoke_exit_timer(&window);
 
@@ -492,7 +505,10 @@ fn run_with_live_store(
     // `state="unavailable"` until the first `get_states` reply lands.  The
     // bridge's Reconnecting/Failed → Live transition fires a full resync that
     // overwrites these placeholders the moment the connection becomes Live.
-    let initial_tiles = build_tiles(&*store_for_bridge, &dashboard);
+    let mut initial_tiles = build_tiles(&*store_for_bridge, &dashboard);
+    // Phase 6 cosmetic-polish: pack section-relative placements before
+    // first render. Identical contract to the fixture path above.
+    pack_section_layouts(&dashboard, &mut initial_tiles);
     info!(
         tile_count = initial_tiles.len(),
         "initial tiles built (pre-snapshot)"
@@ -500,6 +516,11 @@ fn run_with_live_store(
 
     let window = MainWindow::new()?;
     wire_window(&window, &initial_tiles, profile)?;
+    // Phase 6 cosmetic-polish: wire dashboard layout (views + sections +
+    // tile-slots) into MainWindow once at startup. View switching is then
+    // a property write, not a model rebuild.
+    let layout = compute_dashboard_layout(&dashboard, profile, &initial_tiles);
+    wire_dashboard_layout(&window, &layout);
     arm_smoke_exit_timer(&window);
 
     // Production sink: hops onto the Slint UI thread for every property write.
